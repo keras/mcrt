@@ -23,12 +23,12 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Render a texture to the screen via a full-screen triangle/quad so we can later display compute shader output.
 
-- [ ] Create a storage texture (RGBA32Float or RGBA8Unorm) matching window size
-- [ ] Write a vertex shader that generates a full-screen triangle (no vertex buffer)
-- [ ] Write a fragment shader that samples the storage texture
-- [ ] Set up the render pipeline (vertex + fragment shaders, bind group with texture + sampler)
-- [ ] Recreate texture on window resize
-- [ ] Verify by filling the texture with a gradient from the CPU side
+- [x] Create a storage texture (RGBA32Float or RGBA8Unorm) matching window size
+- [x] Write a vertex shader that generates a full-screen triangle (no vertex buffer)
+- [x] Write a fragment shader that samples the storage texture
+- [x] Set up the render pipeline (vertex + fragment shaders, bind group with texture + sampler)
+- [x] Recreate texture on window resize
+- [x] Verify by filling the texture with a gradient from the CPU side
 
 **Output:** A gradient displayed on screen, sourced from a GPU texture.
 

@@ -2,9 +2,15 @@ use std::sync::Arc;
 
 use log::info;
 use wgpu::{
-    Color, CommandEncoderDescriptor, DeviceDescriptor, InstanceDescriptor, LoadOp, Operations,
-    PowerPreference, RenderPassColorAttachment, RenderPassDescriptor, RequestAdapterOptions,
-    StoreOp, SurfaceError,
+    AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, CommandEncoderDescriptor, DeviceDescriptor,
+    Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
+    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, SurfaceError,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
+    TextureViewDimension, VertexState,
 };
 use winit::{
     application::ApplicationHandler,
@@ -12,6 +18,81 @@ use winit::{
     event_loop::{ActiveEventLoop, EventLoop},
     window::{Window, WindowId},
 };
+
+// ---------------------------------------------------------------------------
+// Helper: create the display texture and its default view
+// ---------------------------------------------------------------------------
+
+/// Creates an `Rgba8Unorm` texture that we write gradient pixels into from the
+/// CPU (Phase 2) and will later be replaced by compute-shader writes (Phase 3+).
+fn create_display_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("display texture"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        // TEXTURE_BINDING  — the fragment shader samples this texture.
+        // COPY_DST         — the CPU fills it via queue.write_texture() (Phase 2).
+        // STORAGE_BINDING  — the compute shader will write to it in Phase 3+.
+        usage: TextureUsages::TEXTURE_BINDING
+            | TextureUsages::COPY_DST
+            | TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+
+    let view = texture.create_view(&TextureViewDescriptor::default());
+    (texture, view)
+}
+
+// ---------------------------------------------------------------------------
+// Helper: fill the display texture with a CPU-generated gradient
+// ---------------------------------------------------------------------------
+
+/// Writes an RGBA gradient into `texture`:
+///   R = x / width,  G = y / height,  B = 0.5,  A = 255.
+/// This verifies the texture sampling pipeline end-to-end before any compute
+/// work is added in Phase 3.
+fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32) {
+    // Cast to usize before multiplying to avoid u32 overflow at large resolutions.
+    let mut pixels: Vec<u8> = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height {
+        for x in 0..width {
+            let r = ((x as f32 / width as f32) * 255.0) as u8;
+            let g = ((y as f32 / height as f32) * 255.0) as u8;
+            pixels.extend_from_slice(&[r, g, 128, 255]);
+        }
+    }
+
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &pixels,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * width),
+            rows_per_image: None, // only meaningful for 3D/array textures
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+}
 
 // ---------------------------------------------------------------------------
 // GPU state — created inside `resumed()`, lives for the rest of the session.
@@ -27,30 +108,28 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     window: Arc<Window>,
+
+    // Phase 2: display texture pipeline
+    display_texture: wgpu::Texture,
+    display_texture_view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// Kept so the bind group can be cheaply recreated on resize.
+    bind_group_layout: wgpu::BindGroupLayout,
+    bind_group: wgpu::BindGroup,
+    render_pipeline: wgpu::RenderPipeline,
 }
 
 impl GpuState {
     fn new(window: Arc<Window>) -> Self {
-        // The surface borrows from the Arc's heap allocation which lives as
-        // long as the Arc itself. Casting to 'static is safe here because:
-        //   1. `surface` and `window` (the Arc) are stored together in the
-        //      same struct, so the Arc (and its heap data) is always alive.
-        //   2. We never expose the surface outside this struct.
         // Instance is only needed for adapter/device creation; wgpu ref-counts
         // the adapter and device internally so the instance can be dropped here.
         let instance = wgpu::Instance::new(&InstanceDescriptor::default());
 
-        // SAFETY: we hold an `Arc<Window>`; the surface is stored alongside
-        // the Arc in the same struct, and `surface` is declared before `window`
-        // in `GpuState`, so the window data is guaranteed to outlive the surface.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(
-                    wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
-                        .expect("window has no valid raw window handle"),
-                )
-                .expect("failed to create surface")
-        };
+        // `Arc<Window>: 'static`, so the safe create_surface() API can hold
+        // the Arc internally and guarantee the window outlives the surface.
+        let surface = instance
+            .create_surface(Arc::clone(&window))
+            .expect("failed to create surface");
 
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
@@ -61,20 +140,121 @@ impl GpuState {
 
         info!("Adapter: {}", adapter.get_info().name);
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &DeviceDescriptor {
-                label: Some("mcrt device"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("mcrt device"),
+            ..Default::default()
+        }))
         .expect("failed to create device");
 
         let size = window.inner_size();
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface not supported by adapter");
 
+        // Lock to vsync so we don't spin the GPU harder than the display rate.
+        config.present_mode = wgpu::PresentMode::Fifo;
         surface.configure(&device, &config);
+
+        // ---- display texture -----------------------------------------------
+        let (display_texture, display_texture_view) =
+            create_display_texture(&device, config.width, config.height);
+
+        // ---- sampler -------------------------------------------------------
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("display sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // ---- bind group layout --------------------------------------------
+        let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("display bgl"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        // ---- bind group ----------------------------------------------------
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("display bg"),
+            layout: &bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&display_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        // ---- shader --------------------------------------------------------
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("display shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/display.wgsl").into()),
+        });
+
+        // ---- render pipeline -----------------------------------------------
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("display pipeline layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            ..Default::default()
+        });
+
+        let render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("display pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[], // positions generated in the shader
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None, // single oversized triangle — culling unnecessary
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // ---- seed the texture with the initial gradient -------------------
+        fill_gradient(&queue, &display_texture, config.width, config.height);
 
         Self {
             surface,
@@ -82,6 +262,12 @@ impl GpuState {
             queue,
             config,
             window,
+            display_texture,
+            display_texture_view,
+            sampler,
+            bind_group_layout,
+            bind_group,
+            render_pipeline,
         }
     }
 
@@ -93,6 +279,29 @@ impl GpuState {
         self.config.width = new_width;
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
+
+        // Recreate display texture at the new size.
+        let (tex, view) = create_display_texture(&self.device, new_width, new_height);
+        self.display_texture = tex;
+        self.display_texture_view = view;
+
+        // Bind group must reference the new texture view.
+        self.bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("display bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&self.display_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&self.sampler),
+                },
+            ],
+        });
+
+        fill_gradient(&self.queue, &self.display_texture, new_width, new_height);
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
@@ -108,20 +317,15 @@ impl GpuState {
             });
 
         {
-            let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("clear pass"),
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("display pass"),
                 multiview_mask: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Clear(wgpu::Color::BLACK),
                         store: StoreOp::Store,
                     },
                 })],
@@ -129,7 +333,10 @@ impl GpuState {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            // Render pass ends here when `_pass` is dropped.
+
+            pass.set_pipeline(&self.render_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1); // full-screen triangle — no vertex buffer
         }
 
         self.queue.submit([encoder.finish()]);
