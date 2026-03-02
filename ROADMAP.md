@@ -292,6 +292,50 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - Regression testing: save reference images for comparison after refactors
 - Platform testing: verify on at least two GPU vendors (NVIDIA, AMD, or Intel)
 
+### Modularity & Long-Term Maintainability
+
+**Interface Design:**
+- Define clear, minimal public APIs for each module—hide implementation details
+- Use traits for abstractions that may have multiple implementations (e.g., `Primitive` trait for spheres, triangles, meshes)
+- Keep interfaces stable; add new methods rather than changing signatures when possible
+- Document preconditions, postconditions, and invariants for public functions
+
+**Dependency Management:**
+- Minimize coupling—modules should depend on abstractions, not concrete types
+- Avoid circular dependencies; restructure if they emerge
+- Use dependency injection: pass resources (device, queue) explicitly rather than storing globally
+- Consider builder patterns for complex configuration (camera setup, render pipeline creation)
+
+**Configuration Over Hardcoding:**
+- Externalize constants that might change (scene files, render settings, shader parameters)
+- Use configuration structs passed at initialization rather than scattered literals
+- Support runtime reconfiguration where feasible (resolution, quality presets)
+- Document default values and valid ranges
+
+**Composability:**
+- Design small, single-purpose components that can be combined
+- Prefer pure functions where possible—deterministic, easier to test and reason about
+- Use composition over inheritance (Rust's trait system encourages this)
+- Each module should be independently testable without full system setup
+
+**State Management:**
+- Minimize shared mutable state; prefer message passing or explicit ownership transfer
+- Keep GPU resource lifetime tied to clear ownership (avoid `Rc<RefCell<>>` for wgpu resources)
+- Document state transitions (e.g., when accumulation resets, when buffers are recreated)
+- Use type states to enforce valid state transitions at compile time where appropriate
+
+**Evolution Strategy:**
+- Design for extension: anticipate adding new material types, primitive types, post-effects
+- Use enums with non-exhaustive patterns where appropriate (`#[non_exhaustive]`)
+- Version breaking changes thoughtfully; document migration paths in commit messages
+- Keep experimental features behind feature flags (`#[cfg(feature = "experimental")]`)
+
+**Documentation Practices:**
+- Each module should have a top-level doc comment explaining its purpose and usage
+- Document *why* decisions were made, not just *what* the code does
+- Keep a CHANGELOG or update commit messages with rationale for architectural changes
+- Use examples in doc comments for complex APIs
+
 ### Git Workflow
 
 - **Commit per phase:** Each ROADMAP phase = one or more commits
