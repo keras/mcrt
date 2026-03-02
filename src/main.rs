@@ -18,11 +18,15 @@ use winit::{
 // ---------------------------------------------------------------------------
 
 struct GpuState {
-    window: Arc<Window>,
+    // `surface` must be declared before `window` so it is dropped first.
+    // Rust drops fields in declaration order; if `window` (the Arc) were
+    // dropped before `surface`, the raw window handle the surface holds
+    // could become a dangling pointer during `Surface` drop.
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    window: Arc<Window>,
 }
 
 impl GpuState {
@@ -32,14 +36,18 @@ impl GpuState {
         //   1. `surface` and `window` (the Arc) are stored together in the
         //      same struct, so the Arc (and its heap data) is always alive.
         //   2. We never expose the surface outside this struct.
+        // Instance is only needed for adapter/device creation; wgpu ref-counts
+        // the adapter and device internally so the instance can be dropped here.
         let instance = wgpu::Instance::new(&InstanceDescriptor::default());
 
         // SAFETY: we hold an `Arc<Window>`; the surface is stored alongside
-        // the Arc in the same struct, so the window data outlives the surface.
+        // the Arc in the same struct, and `surface` is declared before `window`
+        // in `GpuState`, so the window data is guaranteed to outlive the surface.
         let surface = unsafe {
             instance
                 .create_surface_unsafe(
-                    wgpu::SurfaceTargetUnsafe::from_window(window.as_ref()).unwrap(),
+                    wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
+                        .expect("window has no valid raw window handle"),
                 )
                 .expect("failed to create surface")
         };
@@ -69,11 +77,11 @@ impl GpuState {
         surface.configure(&device, &config);
 
         Self {
-            window,
             surface,
             device,
             queue,
             config,
+            window,
         }
     }
 
@@ -167,7 +175,7 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        _window_id: WindowId, // single window — no need to dispatch by ID
         event: WindowEvent,
     ) {
         let Some(state) = self.state.as_mut() else {

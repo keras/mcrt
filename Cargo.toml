@@ -8,7 +8,7 @@ rust-version = "1.92"
 wgpu = "28"
 winit = "0.30"
 pollster = "0.4"
-bytemuck = { version = "1.25", features = ["derive"] }
-glam = "0.32"
+bytemuck = { version = "1.25", features = ["derive"] } # GPU struct casting — used from Phase 2 onward
+glam = "0.32" # Math (vec3, mat4, etc.) — used from Phase 3 onward
 env_logger = "0.11"
 log = "0.4"
