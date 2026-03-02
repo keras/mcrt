@@ -206,40 +206,13 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 ## Code Structure & Best Practices
 
-### Project Layout
-
-```
-mcrt/
-├── src/
-│   ├── main.rs              — Entry point, window loop, high-level orchestration
-│   ├── renderer.rs          — wgpu device/queue/surface setup, render/compute passes
-│   ├── camera.rs            — Camera struct, input handling, uniform updates
-│   ├── scene.rs             — Scene definition, primitive/material management
-│   ├── bvh.rs               — BVH construction and flattening (Phase 9+)
-│   ├── mesh.rs              — Mesh loading, vertex/index buffer management (Phase 10+)
-│   ├── texture.rs           — Texture loading and GPU upload (Phase 11+)
-│   ├── ui.rs                — egui integration (Phase 14)
-│   └── lib.rs               — Re-exports, shared types, utilities
-├── shaders/
-│   ├── path_trace.wgsl      — Main compute shader (ray tracing kernel)
-│   ├── display.wgsl         — Full-screen quad vertex + fragment shaders
-│   └── tonemap.wgsl         — Post-processing shaders (Phase 13)
-├── assets/
-│   ├── models/              — OBJ/glTF files
-│   ├── textures/            — PNG/JPG textures
-│   └── hdri/                — HDR environment maps
-├── Cargo.toml
-├── ROADMAP.md
-└── README.md
-```
-
-### Rust Conventions
+### Architecture Principles
 
 **Separation of Concerns:**
-- `main.rs` handles only window events, frame timing, and orchestration
-- `renderer.rs` owns all wgpu resources (device, pipelines, buffers, textures)
-- `camera.rs` is stateful but pure logic—no wgpu dependencies
-- `scene.rs` defines scene data structures; upload logic lives in `renderer.rs`
+- Entry point handles only window events, frame timing, and high-level orchestration
+- Isolate wgpu resource management (device, pipelines, buffers, textures) in dedicated modules
+- Keep domain logic (camera, scene) independent of GPU APIs where possible
+- Scene data structures should be separate from GPU upload logic
 
 **GPU Data Alignment:**
 - Use `#[repr(C)]` for all GPU-bound structs
@@ -286,6 +259,38 @@ mcrt/
 - Output debug colors (e.g., visualize normals as RGB) during development
 - Use `storageBarrier()` when needed between dependent compute dispatches
 - Test shaders incrementally—verify each phase before moving on
+
+### Code Quality Expectations
+
+**Correctness:**
+- Compile without warnings (`cargo build --release` should be clean)
+- All GPU data structures must respect WGSL alignment rules—test on multiple platforms
+- Validate shader compilation errors provide actionable feedback
+- No unsafe code unless absolutely necessary; if used, document safety invariants
+
+**Readability:**
+- Use descriptive names for functions, variables, and types
+- Add doc comments (`///`) for public APIs and non-obvious algorithms
+- Keep functions focused and short; extract complex logic into helper functions
+- Use `rustfmt` for consistent formatting; use `clippy` for idiomatic Rust
+
+**Maintainability:**
+- Avoid "magic numbers"—use named constants for important values (max bounces, workgroup sizes)
+- Group related functionality into modules; avoid monolithic files
+- Refactor when adding features exposes poor abstractions
+- Keep shader code modular with clear section boundaries (comments)
+
+**Performance Awareness:**
+- Profile before optimizing—don't prematurely sacrifice clarity for speed
+- Document performance-critical code paths and assumptions
+- Minimize allocations in hot loops (frame updates, input handling)
+- Balance GPU parallelism with memory bandwidth (consider workgroup sizes, cache coherency)
+
+**Testing Strategy:**
+- Visual validation: each phase should produce verifiable output
+- Unit test pure functions (BVH construction, ray-sphere intersection math on CPU)
+- Regression testing: save reference images for comparison after refactors
+- Platform testing: verify on at least two GPU vendors (NVIDIA, AMD, or Intel)
 
 ### Git Workflow
 
