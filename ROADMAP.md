@@ -8,12 +8,12 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Minimal wgpu application that opens a window and clears to a solid color.
 
-- [ ] Initialize Cargo project with dependencies (`wgpu`, `winit`, `pollster`, `bytemuck`, `glam`)
-- [ ] Create a window with `winit` event loop
-- [ ] Initialize wgpu adapter, device, queue, and surface
-- [ ] Configure surface with preferred format
-- [ ] Render loop that clears the surface to a solid color
-- [ ] Handle resize and close events
+- [x] Initialize Cargo project with dependencies
+- [x] Create a window with event loop
+- [x] Initialize wgpu adapter, device, queue, and surface
+- [x] Configure surface with preferred format
+- [x] Render loop that clears the surface to a solid color
+- [x] Handle resize and close events
 
 **Output:** A colored window that stays open and responds to resize.
 
@@ -402,21 +402,6 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - Self-review before requesting review (walk through your own diff)
 - Respond to all feedback even if not making suggested changes
 - Update based on feedback promptly; re-request review when ready
-
----
-
-## Dependency Summary
-
-```
-wgpu        — GPU abstraction (WebGPU API)
-winit       — Window creation and input handling
-pollster    — Block on async wgpu initialization
-bytemuck    — Safe casting of structs to byte slices for GPU upload
-glam        — Math library (vec3, mat4, etc.) for camera and scene on CPU
-image       — Image loading (textures, environment maps) and PNG export
-egui + egui-wgpu — Immediate-mode GUI (Phase 14)
-tobj / gltf — Mesh loading (Phase 10)
-```
 
 ---
 
