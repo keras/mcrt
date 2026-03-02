@@ -1,4 +1,4 @@
-# Path Tracer — Rust + wgpu Roadmap
+****# Path Tracer — Rust + wgpu Roadmap
 
 A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shaders.
 
@@ -201,6 +201,98 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - [ ] Save rendered image to PNG
 
 **Output:** A usable interactive path tracer with parameter tweaking.
+
+---
+
+## Code Structure & Best Practices
+
+### Project Layout
+
+```
+mcrt/
+├── src/
+│   ├── main.rs              — Entry point, window loop, high-level orchestration
+│   ├── renderer.rs          — wgpu device/queue/surface setup, render/compute passes
+│   ├── camera.rs            — Camera struct, input handling, uniform updates
+│   ├── scene.rs             — Scene definition, primitive/material management
+│   ├── bvh.rs               — BVH construction and flattening (Phase 9+)
+│   ├── mesh.rs              — Mesh loading, vertex/index buffer management (Phase 10+)
+│   ├── texture.rs           — Texture loading and GPU upload (Phase 11+)
+│   ├── ui.rs                — egui integration (Phase 14)
+│   └── lib.rs               — Re-exports, shared types, utilities
+├── shaders/
+│   ├── path_trace.wgsl      — Main compute shader (ray tracing kernel)
+│   ├── display.wgsl         — Full-screen quad vertex + fragment shaders
+│   └── tonemap.wgsl         — Post-processing shaders (Phase 13)
+├── assets/
+│   ├── models/              — OBJ/glTF files
+│   ├── textures/            — PNG/JPG textures
+│   └── hdri/                — HDR environment maps
+├── Cargo.toml
+├── ROADMAP.md
+└── README.md
+```
+
+### Rust Conventions
+
+**Separation of Concerns:**
+- `main.rs` handles only window events, frame timing, and orchestration
+- `renderer.rs` owns all wgpu resources (device, pipelines, buffers, textures)
+- `camera.rs` is stateful but pure logic—no wgpu dependencies
+- `scene.rs` defines scene data structures; upload logic lives in `renderer.rs`
+
+**GPU Data Alignment:**
+- Use `#[repr(C)]` for all GPU-bound structs
+- Derive `bytemuck::Pod` and `bytemuck::Zeroable` for safe casting
+- Respect WGSL alignment rules:
+  - `vec3` is 16-byte aligned (pad to `vec4` or use explicit padding)
+  - Struct fields must align to their natural size
+- Use `wgpu::util::DeviceExt::create_buffer_init` for small one-time uploads
+
+**Shader Loading:**
+- Embed shaders at compile time: `include_str!("../shaders/path_trace.wgsl")`
+- Use `ShaderModuleDescriptor` with source as a string
+- For hot-reload during development, optionally read from disk and watch for changes
+
+**Error Handling:**
+- Propagate wgpu errors with `Result` and `?` where possible
+- Use `pollster::block_on` or `env_logger` for async wgpu initialization
+- Log pipeline validation errors clearly; wgpu provides detailed messages
+
+**Performance:**
+- Minimize CPU-GPU synchronization; avoid `queue.submit()` + immediate read-back
+- Reuse buffers and textures across frames (reallocate only on resize)
+- Use storage buffers (not uniforms) for large arrays (BVH nodes, primitives)
+- Keep compute workgroup size at 8×8 or 16×16 for typical GPUs
+
+### WGSL Conventions
+
+**Naming:**
+- `snake_case` for functions and variables (WGSL standard)
+- `PascalCase` for struct types
+- `SCREAMING_CASE` for constants
+
+**Modularity:**
+- Group related functions (e.g., `ray_sphere_intersect`, `ray_triangle_intersect`)
+- Use comments to delimit sections: `// === Ray Intersection ===`
+- Keep the main kernel function (`@compute fn path_trace(...)`) concise
+
+**Shared Code:**
+- Define shared structs (Ray, Hit, Material) consistently between CPU and GPU
+- Use `const` for compile-time values (max bounces, workgroup size)
+- Avoid excessive branching; prefer branchless math where possible (GPU performance)
+
+**Debugging:**
+- Output debug colors (e.g., visualize normals as RGB) during development
+- Use `storageBarrier()` when needed between dependent compute dispatches
+- Test shaders incrementally—verify each phase before moving on
+
+### Git Workflow
+
+- **Commit per phase:** Each ROADMAP phase = one or more commits
+- **Tag milestones:** `git tag phase-3-ray-generation` after completing a phase
+- **Branch for experiments:** Use feature branches for risky changes (e.g., BVH refactor)
+- **Keep commits atomic:** One logical change per commit (e.g., "Add sphere intersection")
 
 ---
 
