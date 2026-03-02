@@ -38,13 +38,13 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Replace the CPU-filled texture with a compute shader that generates rays and writes a basic sky gradient.
 
-- [ ] Write a compute shader (`path_trace.wgsl`) that:
+- [x] Write a compute shader (`path_trace.wgsl`) that:
   - Derives pixel coordinates from `global_invocation_id`
   - Computes a camera ray (origin + direction) per pixel using a simple pinhole model
   - Writes a sky-gradient color based on ray direction to the output texture
-- [ ] Create the compute pipeline and bind group (output texture as `storage` binding)
-- [ ] Dispatch the compute shader each frame before the render pass
-- [ ] Pass camera parameters (origin, look-at, FOV, aspect ratio) via a uniform buffer
+- [x] Create the compute pipeline and bind group (output texture as `storage` binding)
+- [x] Dispatch the compute shader each frame before the render pass
+- [x] Pass camera parameters (origin, look-at, FOV, aspect ratio) via a uniform buffer
 
 **Output:** A sky gradient rendered entirely on the GPU.
 

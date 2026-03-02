@@ -1,16 +1,20 @@
+use std::mem::size_of;
 use std::sync::Arc;
 
+use bytemuck;
+use glam::Vec3;
 use log::info;
 use wgpu::{
     AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, CommandEncoderDescriptor, DeviceDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
     Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
     Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
     RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
-    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, SurfaceError,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
-    TextureViewDimension, VertexState,
+    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
+    StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{
     application::ApplicationHandler,
@@ -60,8 +64,9 @@ fn create_display_texture(
 
 /// Writes an RGBA gradient into `texture`:
 ///   R = x / width,  G = y / height,  B = 0.5,  A = 255.
-/// This verifies the texture sampling pipeline end-to-end before any compute
-/// work is added in Phase 3.
+/// Used in Phase 2 to verify the display pipeline end-to-end.
+/// Retained for debugging; superseded by the compute shader in Phase 3+.
+#[allow(dead_code)]
 fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32) {
     // Cast to usize before multiplying to avoid u32 overflow at large resolutions.
     let mut pixels: Vec<u8> = Vec::with_capacity(width as usize * height as usize * 4);
@@ -95,6 +100,62 @@ fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, heigh
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: camera uniform
+// ---------------------------------------------------------------------------
+
+/// GPU-side camera layout.  All fields are vec4 so the struct is naturally
+/// 16-byte aligned without any padding — safe to cast directly with bytemuck.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    /// Eye position in world space.  `.w` is unused padding.
+    origin: [f32; 4],
+    /// Lower-left corner of the virtual screen in world space.  `.w` unused.
+    lower_left: [f32; 4],
+    /// Full horizontal extent of the virtual screen (right − left).  `.w` unused.
+    horizontal: [f32; 4],
+    /// Full vertical extent of the virtual screen (top − bottom).  `.w` unused.
+    vertical: [f32; 4],
+}
+
+/// Compute the camera uniform for a pinhole camera.
+///
+/// - `look_from`: eye position
+/// - `look_at`:   focus point
+/// - `vfov`:      vertical field of view in degrees
+/// - `aspect`:    viewport width / height
+fn compute_camera(width: u32, height: u32) -> CameraUniform {
+    let aspect = width as f32 / height as f32;
+
+    let look_from = Vec3::new(0.0, 1.0, 3.0);
+    let look_at = Vec3::new(0.0, 0.0, 0.0);
+    let vup = Vec3::new(0.0, 1.0, 0.0);
+    let vfov_rad = 60.0_f32.to_radians();
+
+    // Half-height of the near plane at unit distance from the eye.
+    let h = (vfov_rad * 0.5).tan();
+    let viewport_height = 2.0 * h;
+    let viewport_width = aspect * viewport_height;
+
+    // Orthonormal camera basis (right-handed, Z points toward the viewer).
+    let w = (look_from - look_at).normalize(); // backward
+    let u = vup.cross(w).normalize(); // right
+    let v = w.cross(u); // up
+
+    let horizontal = viewport_width * u;
+    let vertical = viewport_height * v;
+    // Lower-left corner of the virtual screen in world space.
+    let lower_left = look_from - horizontal * 0.5 - vertical * 0.5 - w;
+
+    CameraUniform {
+        origin: look_from.extend(0.0).to_array(),
+        lower_left: lower_left.extend(0.0).to_array(),
+        horizontal: horizontal.extend(0.0).to_array(),
+        vertical: vertical.extend(0.0).to_array(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GPU state — created inside `resumed()`, lives for the rest of the session.
 // ---------------------------------------------------------------------------
 
@@ -117,6 +178,13 @@ struct GpuState {
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
+
+    // Phase 3: compute (path tracer)
+    camera_buffer: wgpu::Buffer,
+    /// Kept for cheap bind-group recreation on resize.
+    compute_bind_group_layout: wgpu::BindGroupLayout,
+    compute_bind_group: wgpu::BindGroup,
+    compute_pipeline: wgpu::ComputePipeline,
 }
 
 impl GpuState {
@@ -253,8 +321,84 @@ impl GpuState {
             cache: None,
         });
 
-        // ---- seed the texture with the initial gradient -------------------
-        fill_gradient(&queue, &display_texture, config.width, config.height);
+        // ---- camera buffer -------------------------------------------------
+        // Sized to hold one CameraUniform; updated whenever the viewport changes.
+        let camera_uniform = compute_camera(config.width, config.height);
+        let camera_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("camera buffer"),
+            size: size_of::<CameraUniform>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+
+        // ---- compute bind group layout ------------------------------------
+        let compute_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("compute bgl"),
+                entries: &[
+                    // binding 0: write-only storage texture (the output image)
+                    BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::StorageTexture {
+                            access: StorageTextureAccess::WriteOnly,
+                            format: TextureFormat::Rgba8Unorm,
+                            view_dimension: TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    // binding 1: camera parameters uniform
+                    BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // ---- compute bind group -------------------------------------------
+        let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("compute bg"),
+            layout: &compute_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&display_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // ---- compute shader -----------------------------------------------
+        let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("path trace shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/path_trace.wgsl").into()),
+        });
+
+        // ---- compute pipeline ---------------------------------------------
+        let compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("compute pipeline layout"),
+            bind_group_layouts: &[&compute_bind_group_layout],
+            ..Default::default()
+        });
+
+        let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("path trace pipeline"),
+            layout: Some(&compute_pipeline_layout),
+            module: &compute_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         Self {
             surface,
@@ -268,6 +412,10 @@ impl GpuState {
             bind_group_layout,
             bind_group,
             render_pipeline,
+            camera_buffer,
+            compute_bind_group_layout,
+            compute_bind_group,
+            compute_pipeline,
         }
     }
 
@@ -301,7 +449,26 @@ impl GpuState {
             ],
         });
 
-        fill_gradient(&self.queue, &self.display_texture, new_width, new_height);
+        // Update camera aspect ratio for the new viewport size.
+        let camera_uniform = compute_camera(new_width, new_height);
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+
+        // Compute bind group also references the (new) texture view.
+        self.compute_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("compute bg"),
+            layout: &self.compute_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&self.display_texture_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
@@ -316,6 +483,21 @@ impl GpuState {
                 label: Some("frame encoder"),
             });
 
+        // ---- compute pass: path tracer writes into the display texture ----
+        {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("path trace pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.compute_pipeline);
+            cpass.set_bind_group(0, &self.compute_bind_group, &[]);
+            // Ceil-divide so every pixel is covered even for non-multiple-of-8 sizes.
+            let wg_x = self.config.width.div_ceil(8);
+            let wg_y = self.config.height.div_ceil(8);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // ---- render pass: blit the texture to the swap-chain surface -------
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("display pass"),
