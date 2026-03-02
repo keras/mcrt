@@ -343,6 +343,66 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - **Branch for experiments:** Use feature branches for risky changes (e.g., BVH refactor)
 - **Keep commits atomic:** One logical change per commit (e.g., "Add sphere intersection")
 
+### Code Review Process
+
+**Review Guidelines:**
+- Review code incrementally—each phase completion triggers a review checkpoint
+- Focus on correctness first, then readability, then performance
+- Verify visual output matches expectations for the phase (screenshots/recordings)
+- Check that code compiles without warnings and passes `clippy` lints
+
+**Review Checklist:**
+
+*Correctness & Safety:*
+- [ ] GPU data structures use `#[repr(C)]` and bytemuck derives
+- [ ] WGSL alignment rules are respected (vec3 padding, struct alignment)
+- [ ] Buffer sizes match shader bindings (group/binding numbers are consistent)
+- [ ] No unsafe code without clear safety documentation
+- [ ] Error handling is present for fallible operations
+
+*Architecture & Design:*
+- [ ] Changes follow separation of concerns (domain logic vs GPU API)
+- [ ] New abstractions have clear, documented interfaces
+- [ ] Dependencies are minimal and explicit
+- [ ] State management is clear and ownership is obvious
+
+*GPU-Specific Concerns:*
+- [ ] Workgroup sizes are appropriate for target GPUs (multiples of 32/64)
+- [ ] No unnecessary CPU-GPU synchronization points
+- [ ] Buffers/textures are reused across frames when possible
+- [ ] Shader code avoids excessive branching in hot paths
+
+*Code Quality:*
+- [ ] Names are descriptive and follow Rust conventions
+- [ ] Complex algorithms have explanatory comments
+- [ ] Public APIs have doc comments with usage examples
+- [ ] No "magic numbers"—important constants are named
+
+*Testing & Validation:*
+- [ ] Phase output visually matches expected result
+- [ ] Pure functions have unit tests where appropriate
+- [ ] Changes have been tested on resize/window events
+- [ ] Accumulation resets correctly when scene/camera changes
+
+**Feedback Culture:**
+- Be specific: "This buffer allocation happens every frame" not "This is slow"
+- Suggest alternatives: "Consider caching this computation" with code example
+- Ask questions: "Why did you choose this approach?" to understand intent
+- Acknowledge good patterns: Call out clever solutions or clean abstractions
+- Prioritize feedback: Critical (correctness) > Important (maintainability) > Nice-to-have (style)
+
+**Reviewer Responsibilities:**
+- Test the branch locally and verify visual output
+- Run `cargo clippy` and `cargo fmt --check` before approving
+- If suggesting major changes, explain the reasoning and long-term benefit
+- Approve when changes meet quality bar, even if minor improvements remain (open follow-up issues)
+
+**Author Responsibilities:**
+- Provide context in PR description: what changed, why, what was tested
+- Self-review before requesting review (walk through your own diff)
+- Respond to all feedback even if not making suggested changes
+- Update based on feedback promptly; re-request review when ready
+
 ---
 
 ## Dependency Summary
