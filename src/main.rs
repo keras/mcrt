@@ -1,7 +1,8 @@
 use std::mem::size_of;
 use std::sync::Arc;
+use std::time::Instant;
 
-use bytemuck;
+use bytemuck::{bytes_of, Zeroable};
 use glam::Vec3;
 use log::info;
 use wgpu::{
@@ -108,7 +109,8 @@ fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, heigh
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    /// Eye position in world space.  `.w` is unused padding.
+    /// Eye position in world space.  `.w` carries the monotonic `frame_count`
+    /// (cast to `f32`) so the compute shader can seed a PRNG in Phase 5.
     origin: [f32; 4],
     /// Lower-left corner of the virtual screen in world space.  `.w` unused.
     lower_left: [f32; 4],
@@ -120,31 +122,34 @@ struct CameraUniform {
 
 /// Compute the camera uniform for a pinhole camera.
 ///
-/// - `look_from`: eye position
-/// - `look_at`:   focus point
-/// - `vfov`:      vertical field of view in degrees
-/// - `aspect`:    viewport width / height
-fn compute_camera(width: u32, height: u32) -> CameraUniform {
+/// - `width` / `height`: viewport dimensions (used to derive aspect ratio)
+/// - `look_from`: eye position in world space
+/// - `look_at`:   point the camera is aimed at
+///
+/// `vup` (world up) and `vfov` (60°) are fixed; they will become parameters
+/// in Phase 8 when interactive camera controls are added.
+fn compute_camera(width: u32, height: u32, look_from: Vec3, look_at: Vec3) -> CameraUniform {
     let aspect = width as f32 / height as f32;
-
-    let look_from = Vec3::new(0.0, 1.0, 3.0);
-    let look_at = Vec3::new(0.0, 0.0, 0.0);
     let vup = Vec3::new(0.0, 1.0, 0.0);
     let vfov_rad = 60.0_f32.to_radians();
 
-    // Half-height of the near plane at unit distance from the eye.
+    // Half-height of the near plane at unit focal distance.
     let h = (vfov_rad * 0.5).tan();
     let viewport_height = 2.0 * h;
     let viewport_width = aspect * viewport_height;
 
     // Orthonormal camera basis (right-handed, Z points toward the viewer).
     let w = (look_from - look_at).normalize(); // backward
+    // Guard: if vup is parallel to w the cross product is zero → NaN.
+    debug_assert!(
+        vup.cross(w).length_squared() > 1e-10,
+        "camera vup is parallel to view direction (gimbal lock)"
+    );
     let u = vup.cross(w).normalize(); // right
-    let v = w.cross(u); // up
+    let v = w.cross(u);               // up (already unit: w⊥u, both unit)
 
     let horizontal = viewport_width * u;
     let vertical = viewport_height * v;
-    // Lower-left corner of the virtual screen in world space.
     let lower_left = look_from - horizontal * 0.5 - vertical * 0.5 - w;
 
     CameraUniform {
@@ -153,6 +158,72 @@ fn compute_camera(width: u32, height: u32) -> CameraUniform {
         horizontal: horizontal.extend(0.0).to_array(),
         vertical: vertical.extend(0.0).to_array(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4: scene data types
+// ---------------------------------------------------------------------------
+
+/// Maximum number of spheres that can be stored in a `GpuSceneData` buffer.
+/// Must match `array<Sphere, 8>` in path_trace.wgsl.
+const MAX_SPHERES: usize = 8;
+
+/// Radius of the auto-orbit circle (world units).  Mirrored in `render()`.
+const ORBIT_RADIUS: f32 = 3.5;
+/// Eye height above the world origin during the orbit.
+const ORBIT_HEIGHT: f32 = 1.0;
+
+/// GPU-side sphere layout.  Packing centre + radius into one `[f32; 4]` ensures
+/// identical alignment in Rust (`repr(C)`) and WGSL (`vec4<f32>`).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuSphere {
+    /// xyz = world-space centre, w = radius.
+    center_r: [f32; 4],
+    /// x = material index, yzw = padding.
+    mat_and_pad: [u32; 4],
+}
+
+/// Full scene uploaded to the GPU.  Size = 16 + 8 × 32 = 272 bytes.
+/// Must stay ≤ the minimum guaranteed uniform buffer size (64 KiB).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuSceneData {
+    sphere_count: u32,
+    _pad: [u32; 3],
+    spheres: [GpuSphere; MAX_SPHERES],
+}
+
+/// Construct the initial scene:
+/// a large ground sphere and three smaller spheres clustered around the origin.
+fn build_scene() -> GpuSceneData {
+    let raw: &[GpuSphere] = &[
+        // Ground plane as a huge sphere.
+        GpuSphere {
+            center_r: [0.0, -100.5, 0.0, 100.0],
+            mat_and_pad: [0, 0, 0, 0],
+        },
+        // Centre sphere.
+        GpuSphere {
+            center_r: [0.0, 0.0, 0.0, 0.5],
+            mat_and_pad: [1, 0, 0, 0],
+        },
+        // Left sphere.
+        GpuSphere {
+            center_r: [-1.2, 0.0, 0.0, 0.5],
+            mat_and_pad: [2, 0, 0, 0],
+        },
+        // Right sphere.
+        GpuSphere {
+            center_r: [1.2, 0.0, 0.0, 0.5],
+            mat_and_pad: [3, 0, 0, 0],
+        },
+    ];
+
+    let mut data = GpuSceneData::zeroed();
+    data.sphere_count = raw.len() as u32;
+    data.spheres[..raw.len()].copy_from_slice(raw);
+    data
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +256,14 @@ struct GpuState {
     compute_bind_group_layout: wgpu::BindGroupLayout,
     compute_bind_group: wgpu::BindGroup,
     compute_pipeline: wgpu::ComputePipeline,
+
+    // Phase 4: sphere scene
+    scene_buffer: wgpu::Buffer,
+    /// Wall-clock time at initialisation; used to drive the auto-orbit.
+    start_time: Instant,
+    /// Monotonically increasing frame index; packed into `camera.origin.w` so
+    /// the compute shader can seed a per-frame PRNG in Phase 5.
+    frame_count: u32,
 }
 
 impl GpuState {
@@ -322,15 +401,26 @@ impl GpuState {
         });
 
         // ---- camera buffer -------------------------------------------------
-        // Sized to hold one CameraUniform; updated whenever the viewport changes.
-        let camera_uniform = compute_camera(config.width, config.height);
+        // Sized to hold one CameraUniform; updated every frame for the orbit.
+        // The initial contents are overwritten on the very first render() call
+        // (elapsed ≈ 0 → identical position), so no explicit upload is needed.
         let camera_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("camera buffer"),
             size: size_of::<CameraUniform>() as u64,
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        queue.write_buffer(&camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
+
+        // ---- scene buffer --------------------------------------------------
+        let scene_data = build_scene();
+        let scene_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("scene buffer"),
+            size: size_of::<GpuSceneData>() as u64,
+            // COPY_DST reserved for future dynamic scene updates (Phase 6+).
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&scene_buffer, 0, bytes_of(&scene_data));
 
         // ---- compute bind group layout ------------------------------------
         let compute_bind_group_layout =
@@ -355,7 +445,22 @@ impl GpuState {
                         ty: BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
-                            min_binding_size: None,
+                            min_binding_size: wgpu::BufferSize::new(
+                                size_of::<CameraUniform>() as u64,
+                            ),
+                        },
+                        count: None,
+                    },
+                    // binding 2: scene (spheres) uniform
+                    BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                size_of::<GpuSceneData>() as u64,
+                            ),
                         },
                         count: None,
                     },
@@ -374,6 +479,10 @@ impl GpuState {
                 BindGroupEntry {
                     binding: 1,
                     resource: camera_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: scene_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -416,6 +525,9 @@ impl GpuState {
             compute_bind_group_layout,
             compute_bind_group,
             compute_pipeline,
+            scene_buffer,
+            start_time: Instant::now(),
+            frame_count: 0,
         }
     }
 
@@ -449,11 +561,6 @@ impl GpuState {
             ],
         });
 
-        // Update camera aspect ratio for the new viewport size.
-        let camera_uniform = compute_camera(new_width, new_height);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera_uniform));
-
         // Compute bind group also references the (new) texture view.
         self.compute_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("compute bg"),
@@ -467,11 +574,26 @@ impl GpuState {
                     binding: 1,
                     resource: self.camera_buffer.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: self.scene_buffer.as_entire_binding(),
+                },
             ],
         });
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
+        // Orbit the camera around the scene based on elapsed wall-clock time.
+        let elapsed = self.start_time.elapsed().as_secs_f32();
+        let angle = elapsed * 0.5; // radians / second
+        let look_from = Vec3::new(angle.sin() * ORBIT_RADIUS, ORBIT_HEIGHT, angle.cos() * ORBIT_RADIUS);
+        let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
+        // Pack the frame counter into the unused origin.w so the shader can seed
+        // a per-pixel PRNG without a separate uniform in Phase 5.
+        cam.origin[3] = self.frame_count as f32;
+        self.frame_count = self.frame_count.wrapping_add(1);
+        self.queue.write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
+
         let frame = self.surface.get_current_texture()?;
         let view = frame
             .texture
@@ -588,6 +710,10 @@ impl ApplicationHandler for App {
                     Err(SurfaceError::Lost | SurfaceError::Outdated) => {
                         let (w, h) = (state.config.width, state.config.height);
                         state.resize(w, h);
+                    }
+                    // GPU timed out: transient; just request the next frame.
+                    Err(SurfaceError::Timeout) => {
+                        state.window.request_redraw();
                     }
                     // Out of memory — not recoverable.
                     Err(SurfaceError::OutOfMemory) => {

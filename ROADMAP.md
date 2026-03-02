@@ -54,12 +54,12 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Trace rays against hardcoded spheres in the compute shader.
 
-- [ ] Implement ray-sphere intersection in WGSL
-- [ ] Hardcode a small scene (2–3 spheres + ground plane) directly in the shader
-- [ ] Color pixels by surface normal on hit (normal mapping visualization)
-- [ ] Introduce a `Scene` uniform/storage buffer to pass sphere data from CPU
+- [x] Implement ray-sphere intersection in WGSL
+- [x] Hardcode a small scene (2–3 spheres + ground plane) directly in the shader
+- [x] Color pixels by surface normal on hit (normal mapping visualization)
+- [x] Introduce a `Scene` uniform/storage buffer to pass sphere data from CPU
   - Struct: center (vec3f), radius (f32), material index (u32)
-- [ ] Verify correct intersection by orbiting the camera
+- [x] Verify correct intersection by orbiting the camera
 
 **Output:** Shaded spheres visible on screen with normal-based coloring.
 
