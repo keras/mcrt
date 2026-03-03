@@ -797,9 +797,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             let palette_count = name_to_idx.len();
             let total = gpu_mats.len();
             // Build reverse map: index → name for palette materials.
-            let mut names: Vec<String> = (0..total)
-                .map(|i| format!("inline-{i}"))
-                .collect();
+            let mut names: Vec<String> = (0..total).map(|i| format!("inline-{i}")).collect();
             for (name, &idx) in &name_to_idx {
                 names[idx as usize] = name.clone();
             }

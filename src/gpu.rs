@@ -1255,7 +1255,7 @@ impl GpuState {
         // Keep the CPU mirror and material names in sync so the UI panel
         // reflects the hot-reloaded values and slider edits don't re-upload stale data.
         self.material_data_cpu = loaded.materials;
-        self.material_names    = loaded.material_names;
+        self.material_names = loaded.material_names;
 
         // Recreate emissive buffer (count may have changed after hot-reload).
         let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
@@ -1342,7 +1342,10 @@ impl GpuState {
     pub fn render(&mut self) -> Result<(), SurfaceError> {
         // ---- FPS estimation (Phase 15) ------------------------------------
         let now = std::time::Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32().max(1e-6);
+        let dt = now
+            .duration_since(self.last_frame_time)
+            .as_secs_f32()
+            .max(1e-6);
         self.last_frame_time = now;
         // Exponential moving average: α = 0.05 (smooths over ~20 frames).
         let inst_fps = 1.0 / dt;
@@ -1473,8 +1476,8 @@ impl GpuState {
 
             // Run the UI build; collect mutation flags as locals to avoid
             // overlapping borrows on `self`.
-            let mut cam_changed  = false;
-            let mut mat_changed  = false;
+            let mut cam_changed = false;
+            let mut mat_changed = false;
             let mut save_request = false;
 
             let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -1489,8 +1492,8 @@ impl GpuState {
                     self.frame_count,
                     self.fps_smooth,
                 );
-                cam_changed  = cc;
-                mat_changed  = mc;
+                cam_changed = cc;
+                mat_changed = mc;
                 save_request = sr;
             });
 
@@ -1501,15 +1504,19 @@ impl GpuState {
                 self.frame_count = 0;
             }
             if mat_changed {
-                self.queue
-                    .write_buffer(&self.material_buffer, 0, bytes_of(&self.material_data_cpu));
+                self.queue.write_buffer(
+                    &self.material_buffer,
+                    0,
+                    bytes_of(&self.material_data_cpu),
+                );
                 self.frame_count = 0;
                 // The camera uniform was already written this frame with a non-zero
                 // frame_count.  Re-upload it with frame_count = 0 so the compute pass
                 // treats this as the first accumulation sample and discards stale pixels
                 // from the previous material, preventing a one-frame blend artifact.
                 cam.frame_count = 0;
-                self.queue.write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
+                self.queue
+                    .write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
             }
             if save_request {
                 self.save_screenshot();
@@ -1527,8 +1534,13 @@ impl GpuState {
             let clipped = self
                 .egui_ctx
                 .tessellate(full_output.shapes, pixels_per_point);
-            self.egui_renderer
-                .update_buffers(&self.device, &self.queue, &mut encoder, &clipped, &screen_desc);
+            self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &clipped,
+                &screen_desc,
+            );
 
             // Render egui on top of the swapchain image.
             {
@@ -1540,7 +1552,7 @@ impl GpuState {
                             resolve_target: None,
                             depth_slice: None,
                             ops: Operations {
-                                load:  LoadOp::Load, // preserve path tracer output
+                                load: LoadOp::Load, // preserve path tracer output
                                 store: StoreOp::Store,
                             },
                         })],
@@ -1549,7 +1561,8 @@ impl GpuState {
                         timestamp_writes: None,
                     })
                     .forget_lifetime();
-                self.egui_renderer.render(&mut egui_pass, &clipped, &screen_desc);
+                self.egui_renderer
+                    .render(&mut egui_pass, &clipped, &screen_desc);
             }
         }
 
@@ -1674,7 +1687,10 @@ impl GpuState {
     /// Returns `true` if egui consumed the event; the caller should skip
     /// camera / orbit handling in that case so the UI receives exclusive input.
     pub fn handle_window_event_egui(&mut self, event: &winit::event::WindowEvent) -> bool {
-        let consumed = self.egui_state.on_window_event(&self.window, event).consumed;
+        let consumed = self
+            .egui_state
+            .on_window_event(&self.window, event)
+            .consumed;
         // If egui claims this event (e.g. a slider drag starts), release all held WASD
         // keys so the camera doesn't drift when the key-release event is swallowed.
         if consumed {
@@ -1694,7 +1710,7 @@ impl GpuState {
     /// working directory.  The call blocks for one frame while the GPU finishes
     /// and the buffer is mapped — acceptable for an infrequent user action.
     fn save_screenshot(&self) {
-        let width  = self.config.width;
+        let width = self.config.width;
         let height = self.config.height;
 
         // Read from the denoised output when the denoiser is on; otherwise
@@ -1710,43 +1726,54 @@ impl GpuState {
         // Each Rgba32Float pixel = 16 bytes.
         let bytes_per_pixel: u32 = 16;
         let unpadded_row = width * bytes_per_pixel;
-        let padded_row   = unpadded_row.div_ceil(256) * 256;
-        let buf_size     = (padded_row * height) as u64;
+        let padded_row = unpadded_row.div_ceil(256) * 256;
+        let buf_size = (padded_row * height) as u64;
 
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("screenshot staging"),
-            size:               buf_size,
-            usage:              BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            label: Some("screenshot staging"),
+            size: buf_size,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("screenshot encoder"),
-        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("screenshot encoder"),
+            });
         enc.copy_texture_to_buffer(
             TexelCopyTextureInfo {
-                texture:   src_tex,
+                texture: src_tex,
                 mip_level: 0,
-                origin:    Origin3d::ZERO,
-                aspect:    TextureAspect::All,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
                 layout: TexelCopyBufferLayout {
-                    offset:          0,
-                    bytes_per_row:   Some(padded_row),
-                    rows_per_image:  Some(height),
+                    offset: 0,
+                    bytes_per_row: Some(padded_row),
+                    rows_per_image: Some(height),
                 },
             },
-            Extent3d { width, height, depth_or_array_layers: 1 },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit([enc.finish()]);
 
         // Map synchronously: submit above, poll until done, then read.
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
-        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
 
         match rx.recv() {
             Ok(Ok(())) => {} // mapping succeeded — proceed with readback
@@ -1763,8 +1790,8 @@ impl GpuState {
             for col in 0..width as usize {
                 let off = row_off + col * 16;
                 // Each channel is a little-endian f32.
-                let r = f32::from_le_bytes(raw[off    ..off + 4 ].try_into().unwrap());
-                let g = f32::from_le_bytes(raw[off + 4..off + 8 ].try_into().unwrap());
+                let r = f32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+                let g = f32::from_le_bytes(raw[off + 4..off + 8].try_into().unwrap());
                 let b = f32::from_le_bytes(raw[off + 8..off + 12].try_into().unwrap());
                 // Sanitise before tone-map.
                 let r = if r.is_finite() { r } else { 0.0 };
@@ -1787,8 +1814,8 @@ impl GpuState {
 
         match image::RgbaImage::from_raw(width, height, pixels) {
             Some(img) => match img.save(&filename) {
-                Ok(())  => info!("Screenshot saved → '{filename}'"),
-                Err(e)  => log::error!("Screenshot save failed: {e}"),
+                Ok(()) => info!("Screenshot saved → '{filename}'"),
+                Err(e) => log::error!("Screenshot save failed: {e}"),
             },
             None => log::error!("Screenshot: image buffer construction failed"),
         }
@@ -1991,8 +2018,8 @@ fn build_ui_panels(
 ) -> (bool, bool, bool) {
     use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};
 
-    let mut cam_changed  = false;
-    let mut mat_changed  = false;
+    let mut cam_changed = false;
+    let mut mat_changed = false;
     let mut save_request = false;
 
     egui::SidePanel::right("mcrt_panel")
@@ -2059,10 +2086,7 @@ fn build_ui_panels(
                     .changed();
                 ui.add_space(2.0);
                 cam_changed |= ui
-                    .add(
-                        egui::Slider::new(&mut camera.focus_dist, 0.1..=50.0)
-                            .text("Focus dist"),
-                    )
+                    .add(egui::Slider::new(&mut camera.focus_dist, 0.1..=50.0).text("Focus dist"))
                     .changed();
                 ui.add_space(8.0);
 
@@ -2071,14 +2095,17 @@ fn build_ui_panels(
                 ui.separator();
                 let mat_count = material_data.mat_count as usize;
                 for i in 0..mat_count {
-                    let name = material_names.get(i).map(String::as_str).unwrap_or("material");
+                    let name = material_names
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("material");
                     let mat_type = material_data.materials[i].type_pad[0];
                     let type_label = match mat_type {
                         MAT_LAMBERTIAN => "Lambertian",
-                        MAT_METAL      => "Metal",
+                        MAT_METAL => "Metal",
                         MAT_DIELECTRIC => "Dielectric",
-                        MAT_EMISSIVE   => "Emissive",
-                        _              => "?",
+                        MAT_EMISSIVE => "Emissive",
+                        _ => "?",
                     };
                     egui::CollapsingHeader::new(format!("{i}: {name}  [{type_label}]"))
                         .id_salt(i)
@@ -2167,9 +2194,15 @@ fn aces_channel_cpu(x: f32) -> f32 {
 /// Linear → sRGB transfer function (IEC 61966-2-1) for a single channel.
 #[inline]
 fn linear_to_srgb_cpu(c: f32) -> f32 {
-    if c <= 0.0        { return 0.0; }
-    if c <= 0.003_130_8 { return (c * 12.92).min(1.0); }
-    if c < 1.0         { return (1.055 * c.powf(1.0 / 2.4) - 0.055).clamp(0.0, 1.0); }
+    if c <= 0.0 {
+        return 0.0;
+    }
+    if c <= 0.003_130_8 {
+        return (c * 12.92).min(1.0);
+    }
+    if c < 1.0 {
+        return (1.055 * c.powf(1.0 / 2.4) - 0.055).clamp(0.0, 1.0);
+    }
     1.0
 }
 
