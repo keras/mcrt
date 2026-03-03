@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.92"
 
 [dependencies]
-wgpu = "28"
+wgpu = "27"
 winit = "0.30"
 pollster = "0.4"
 bytemuck = { version = "1.25", features = ["derive"] }
@@ -17,3 +17,6 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 indexmap = { version = "2", features = ["serde"] }
 notify = "7"
+egui = "0.33"
+egui-wgpu = "0.33"
+egui-winit = "0.33"

@@ -80,6 +80,11 @@ impl ApplicationHandler for App {
     ) {
         let Some(state) = self.state.as_mut() else { return };
 
+        // Phase 15: feed the event to egui's platform layer first.
+        // If egui consumes it (e.g. click on a UI widget), skip the camera
+        // and orbit handlers so the UI receives exclusive input.
+        let egui_consumed = state.handle_window_event_egui(&event);
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("Close requested — exiting");
@@ -112,20 +117,22 @@ impl ApplicationHandler for App {
             }
 
             // ---- orbit interaction ----------------------------------------
+            // These are gated on `!egui_consumed` so that mouse clicks and
+            // drags on the egui panel don't accidentally move the camera.
 
-            WindowEvent::MouseInput { button, state: btn_state, .. } => {
+            WindowEvent::MouseInput { button, state: btn_state, .. } if !egui_consumed => {
                 state.handle_mouse_button(button, btn_state);
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if !egui_consumed => {
                 state.handle_cursor_moved(position);
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed => {
                 state.handle_mouse_wheel(delta);
             }
 
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !egui_consumed => {
                 state.handle_key(event.physical_key, event.state == ElementState::Pressed);
             }
 

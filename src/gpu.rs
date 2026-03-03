@@ -30,6 +30,9 @@ use winit::{
     window::Window,
 };
 
+// Phase 15: egui immediate-mode GUI.
+use egui_wgpu::ScreenDescriptor;
+
 use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
@@ -185,7 +188,10 @@ fn create_storage_texture(
         sample_count: 1,
         dimension: TextureDimension::D2,
         format: TextureFormat::Rgba32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
+        // COPY_SRC enables GPU → CPU readback for the screenshot feature (Phase 15).
+        usage: TextureUsages::TEXTURE_BINDING
+            | TextureUsages::STORAGE_BINDING
+            | TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
@@ -302,6 +308,25 @@ pub struct GpuState {
     _scene_watcher: Option<notify::RecommendedWatcher>,
     /// Receives events from `_scene_watcher`; polled with `try_recv` each frame.
     scene_change_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
+
+    // ---- Phase 15: egui UI -----------------------------------------------
+    /// egui context — persistent across frames (holds font atlas, style, etc.).
+    egui_ctx: egui::Context,
+    /// egui ↔ winit platform bridge: translates OS events into egui input.
+    egui_state: egui_winit::State,
+    /// wgpu-side renderer for egui tessellated geometry.
+    egui_renderer: egui_wgpu::Renderer,
+    /// When `true` the egui side-panel is visible.  Toggle with the 'H' key.
+    show_ui: bool,
+    /// CPU copy of the material table — mutated by the UI and re-uploaded on change.
+    material_data_cpu: GpuMaterialData,
+    /// Human-readable material names (palette YAML keys; inline materials get "inline-N").
+    /// Same index order as `material_data_cpu.materials`.
+    material_names: Vec<String>,
+    /// Timestamp of the previous frame — used for FPS estimation.
+    last_frame_time: std::time::Instant,
+    /// Exponentially-smoothed frames-per-second estimate (α = 0.05 per frame).
+    fps_smooth: f32,
 }
 
 impl GpuState {
@@ -400,7 +425,7 @@ impl GpuState {
             },
             depth_stencil: None,
             multisample: MultisampleState::default(),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 
@@ -640,6 +665,9 @@ impl GpuState {
         // ---- material buffer -----------------------------------------------
         // Use the material table parsed from the YAML scene file.
         let material_data = loaded.materials;
+        // Keep a CPU copy for the Phase 15 UI material editor.
+        let material_data_cpu = material_data;
+        let material_names = loaded.material_names;
         let material_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("material buffer"),
             size: size_of::<GpuMaterialData>() as u64,
@@ -981,6 +1009,22 @@ impl GpuState {
         let display_bg_denoised =
             make_display_bg_denoised(&device, &bind_group_layout, &denoise_output_view);
 
+        // ---- Phase 15: egui initialisation --------------------------------
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None, // theme — None = use egui default
+            None, // max_texture_side — None = use device limit
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         Self {
             surface,
             device,
@@ -1023,6 +1067,14 @@ impl GpuState {
             scene_path: scene_path_str.to_string(),
             _scene_watcher,
             scene_change_rx,
+            egui_ctx,
+            egui_state,
+            egui_renderer,
+            show_ui: true,
+            material_data_cpu,
+            material_names,
+            last_frame_time: std::time::Instant::now(),
+            fps_smooth: 60.0,
         }
     }
 
@@ -1200,6 +1252,10 @@ impl GpuState {
         // Material buffer has a fixed GPU layout — just overwrite in place.
         self.queue
             .write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
+        // Keep the CPU mirror and material names in sync so the UI panel
+        // reflects the hot-reloaded values and slider edits don't re-upload stale data.
+        self.material_data_cpu = loaded.materials;
+        self.material_names    = loaded.material_names;
 
         // Recreate emissive buffer (count may have changed after hot-reload).
         let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
@@ -1284,6 +1340,14 @@ impl GpuState {
     /// Advance the camera lerp, upload the camera uniform, then dispatch the
     /// compute path tracer and the display (tone-map) render pass.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
+        // ---- FPS estimation (Phase 15) ------------------------------------
+        let now = std::time::Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32().max(1e-6);
+        self.last_frame_time = now;
+        // Exponential moving average: α = 0.05 (smooths over ~20 frames).
+        let inst_fps = 1.0 / dt;
+        self.fps_smooth = self.fps_smooth * 0.95 + inst_fps * 0.05;
+
         // ---- hot-reload: check if scene file has changed on disk ----------
         if self.poll_scene_changed() {
             self.reload_scene();
@@ -1377,7 +1441,6 @@ impl GpuState {
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("display pass"),
-                multiview_mask: None,
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1396,14 +1459,104 @@ impl GpuState {
             pass.draw(0..3, 0..1); // full-screen triangle
         }
 
+        // ---- egui UI pass (Phase 15) -------------------------------------
+        // Runs after the display pass so the UI overlays the path-traced image.
+        // LoadOp::Load preserves whatever the display pass wrote to the swapchain.
+        if self.show_ui {
+            let pixels_per_point = self.window.scale_factor() as f32;
+            let screen_desc = ScreenDescriptor {
+                size_in_pixels: [self.config.width, self.config.height],
+                pixels_per_point,
+            };
+
+            let raw_input = self.egui_state.take_egui_input(&self.window);
+
+            // Run the UI build; collect mutation flags as locals to avoid
+            // overlapping borrows on `self`.
+            let mut cam_changed  = false;
+            let mut mat_changed  = false;
+            let mut save_request = false;
+
+            let full_output = self.egui_ctx.run(raw_input, |ctx| {
+                let (cc, mc, sr) = build_ui_panels(
+                    ctx,
+                    &mut self.camera,
+                    &mut self.denoise_enabled,
+                    &mut self.material_data_cpu,
+                    &self.material_names,
+                    self.config.width,
+                    self.config.height,
+                    self.frame_count,
+                    self.fps_smooth,
+                );
+                cam_changed  = cc;
+                mat_changed  = mc;
+                save_request = sr;
+            });
+
+            self.egui_state
+                .handle_platform_output(&self.window, full_output.platform_output);
+
+            if cam_changed {
+                self.frame_count = 0;
+            }
+            if mat_changed {
+                self.queue
+                    .write_buffer(&self.material_buffer, 0, bytes_of(&self.material_data_cpu));
+                self.frame_count = 0;
+                // The camera uniform was already written this frame with a non-zero
+                // frame_count.  Re-upload it with frame_count = 0 so the compute pass
+                // treats this as the first accumulation sample and discards stale pixels
+                // from the previous material, preventing a one-frame blend artifact.
+                cam.frame_count = 0;
+                self.queue.write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
+            }
+            if save_request {
+                self.save_screenshot();
+            }
+
+            // Upload any new / changed egui font textures.
+            for (id, delta) in &full_output.textures_delta.set {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
+            for id in &full_output.textures_delta.free {
+                self.egui_renderer.free_texture(id);
+            }
+
+            let clipped = self
+                .egui_ctx
+                .tessellate(full_output.shapes, pixels_per_point);
+            self.egui_renderer
+                .update_buffers(&self.device, &self.queue, &mut encoder, &clipped, &screen_desc);
+
+            // Render egui on top of the swapchain image.
+            {
+                let mut egui_pass = encoder
+                    .begin_render_pass(&RenderPassDescriptor {
+                        label: Some("egui pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: Operations {
+                                load:  LoadOp::Load, // preserve path tracer output
+                                store: StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        occlusion_query_set: None,
+                        timestamp_writes: None,
+                    })
+                    .forget_lifetime();
+                self.egui_renderer.render(&mut egui_pass, &clipped, &screen_desc);
+            }
+        }
+
         self.queue.submit([encoder.finish()]);
         frame.present();
         Ok(())
     }
-
-    // -----------------------------------------------------------------------
-    // Input handling — called from App event handlers
-    // -----------------------------------------------------------------------
 
     pub fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         if button == MouseButton::Left {
@@ -1463,6 +1616,16 @@ impl GpuState {
                     );
                 }
             }
+            PhysicalKey::Code(KeyCode::KeyH) => {
+                // Toggle the egui UI panel (Phase 15).
+                if pressed {
+                    self.show_ui = !self.show_ui;
+                    info!(
+                        "UI: {}  (press H to toggle)",
+                        if self.show_ui { "visible" } else { "hidden" }
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1500,6 +1663,135 @@ impl GpuState {
     /// Current surface height (used by App to re-issue correct resize).
     pub fn surface_height(&self) -> u32 {
         self.config.height
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 15: egui input bridge
+    // -----------------------------------------------------------------------
+
+    /// Forward a winit `WindowEvent` to egui's platform layer.
+    ///
+    /// Returns `true` if egui consumed the event; the caller should skip
+    /// camera / orbit handling in that case so the UI receives exclusive input.
+    pub fn handle_window_event_egui(&mut self, event: &winit::event::WindowEvent) -> bool {
+        let consumed = self.egui_state.on_window_event(&self.window, event).consumed;
+        // If egui claims this event (e.g. a slider drag starts), release all held WASD
+        // keys so the camera doesn't drift when the key-release event is swallowed.
+        if consumed {
+            self.input.wasd_held = [false; 4];
+        }
+        consumed
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 15: screenshot saving
+    // -----------------------------------------------------------------------
+
+    /// Read back the current accumulation (or denoised) texture from the GPU,
+    /// apply ACES tone-mapping and sRGB gamma, and write the result as a PNG.
+    ///
+    /// The file is named `render_<unix_seconds>.png` and placed in the current
+    /// working directory.  The call blocks for one frame while the GPU finishes
+    /// and the buffer is mapped — acceptable for an infrequent user action.
+    fn save_screenshot(&self) {
+        let width  = self.config.width;
+        let height = self.config.height;
+
+        // Read from the denoised output when the denoiser is on; otherwise
+        // from the last-written accumulation texture.
+        let src_tex: &wgpu::Texture = if self.denoise_enabled {
+            &self._denoise_output_tex
+        } else {
+            let last_written = self.frame_count.wrapping_sub(1) as usize % 2;
+            &self.accum_textures[last_written]
+        };
+
+        // Row stride must be a multiple of 256 bytes for `copy_texture_to_buffer`.
+        // Each Rgba32Float pixel = 16 bytes.
+        let bytes_per_pixel: u32 = 16;
+        let unpadded_row = width * bytes_per_pixel;
+        let padded_row   = unpadded_row.div_ceil(256) * 256;
+        let buf_size     = (padded_row * height) as u64;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("screenshot staging"),
+            size:               buf_size,
+            usage:              BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut enc = self.device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("screenshot encoder"),
+        });
+        enc.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture:   src_tex,
+                mip_level: 0,
+                origin:    Origin3d::ZERO,
+                aspect:    TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: TexelCopyBufferLayout {
+                    offset:          0,
+                    bytes_per_row:   Some(padded_row),
+                    rows_per_image:  Some(height),
+                },
+            },
+            Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([enc.finish()]);
+
+        // Map synchronously: submit above, poll until done, then read.
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+
+        match rx.recv() {
+            Ok(Ok(())) => {} // mapping succeeded — proceed with readback
+            _ => {
+                log::error!("screenshot: GPU buffer mapping failed");
+                return;
+            }
+        }
+
+        let raw = slice.get_mapped_range();
+        let mut pixels: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
+        for row in 0..height as usize {
+            let row_off = row * padded_row as usize;
+            for col in 0..width as usize {
+                let off = row_off + col * 16;
+                // Each channel is a little-endian f32.
+                let r = f32::from_le_bytes(raw[off    ..off + 4 ].try_into().unwrap());
+                let g = f32::from_le_bytes(raw[off + 4..off + 8 ].try_into().unwrap());
+                let b = f32::from_le_bytes(raw[off + 8..off + 12].try_into().unwrap());
+                // Sanitise before tone-map.
+                let r = if r.is_finite() { r } else { 0.0 };
+                let g = if g.is_finite() { g } else { 0.0 };
+                let b = if b.is_finite() { b } else { 0.0 };
+                pixels.push(screenshot_to_u8(r));
+                pixels.push(screenshot_to_u8(g));
+                pixels.push(screenshot_to_u8(b));
+                pixels.push(255);
+            }
+        }
+        drop(raw);
+        staging.unmap();
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let filename = format!("render_{ts}.png");
+
+        match image::RgbaImage::from_raw(width, height, pixels) {
+            Some(img) => match img.save(&filename) {
+                Ok(())  => info!("Screenshot saved → '{filename}'"),
+                Err(e)  => log::error!("Screenshot save failed: {e}"),
+            },
+            None => log::error!("Screenshot: image buffer construction failed"),
+        }
     }
 }
 
@@ -1671,4 +1963,218 @@ fn make_display_bg_denoised(
             resource: BindingResource::TextureView(denoise_output_view),
         }],
     })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 15: egui UI panel
+// ---------------------------------------------------------------------------
+
+/// Build the right-side egui panel for the current frame.
+///
+/// Returns `(camera_changed, materials_changed, save_screenshot_requested)`.
+/// Returning `true` for either of the first two causes the accumulation buffer
+/// to reset so the path tracer re-converges from the updated parameters.
+///
+/// This is a free function (not a method) so the borrow checker can split
+/// `GpuState` fields; `egui::Context::run` holds an immutable borrow on
+/// `egui_ctx` while the closure takes mutable borrows on other fields.
+fn build_ui_panels(
+    ctx: &egui::Context,
+    camera: &mut CameraState,
+    denoise_enabled: &mut bool,
+    material_data: &mut GpuMaterialData,
+    material_names: &[String],
+    width: u32,
+    height: u32,
+    frame_count: u32,
+    fps: f32,
+) -> (bool, bool, bool) {
+    use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};
+
+    let mut cam_changed  = false;
+    let mut mat_changed  = false;
+    let mut save_request = false;
+
+    egui::SidePanel::right("mcrt_panel")
+        .resizable(true)
+        .min_width(240.0)
+        .default_width(270.0)
+        .show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // ── Render Stats ──────────────────────────────────────────
+                ui.add_space(4.0);
+                ui.heading("Render Stats");
+                ui.separator();
+                egui::Grid::new("stats_grid")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Resolution:");
+                        ui.label(format!("{width} × {height}"));
+                        ui.end_row();
+                        ui.label("Samples (SPP):");
+                        ui.label(format!("{frame_count}"));
+                        ui.end_row();
+                        ui.label("FPS:");
+                        ui.label(format!("{fps:.1}"));
+                        ui.end_row();
+                        ui.label("MPix/s:");
+                        let mpx = fps * (width as f32 * height as f32) / 1_000_000.0;
+                        ui.label(format!("{mpx:.1}"));
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+
+                // ── Post-process ──────────────────────────────────────────
+                ui.heading("Post-process");
+                ui.separator();
+                let was_denoise = *denoise_enabled;
+                ui.checkbox(denoise_enabled, "Joint bilateral denoiser  (N)");
+                if *denoise_enabled != was_denoise {
+                    info!(
+                        "Denoiser: {} (UI)",
+                        if *denoise_enabled { "ON" } else { "OFF" }
+                    );
+                }
+                ui.add_space(4.0);
+                if ui.button("💾  Save PNG").clicked() {
+                    save_request = true;
+                }
+                ui.add_space(8.0);
+
+                // ── Camera ────────────────────────────────────────────────
+                ui.heading("Camera");
+                ui.separator();
+                cam_changed |= ui
+                    .add(egui::Slider::new(&mut camera.vfov, 10.0..=120.0).text("FOV (°)"))
+                    .changed();
+                ui.add_space(2.0);
+                cam_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut camera.aperture, 0.0..=2.0)
+                            .step_by(0.01)
+                            .text("Aperture"),
+                    )
+                    .changed();
+                ui.add_space(2.0);
+                cam_changed |= ui
+                    .add(
+                        egui::Slider::new(&mut camera.focus_dist, 0.1..=50.0)
+                            .text("Focus dist"),
+                    )
+                    .changed();
+                ui.add_space(8.0);
+
+                // ── Materials ─────────────────────────────────────────────
+                ui.heading("Materials");
+                ui.separator();
+                let mat_count = material_data.mat_count as usize;
+                for i in 0..mat_count {
+                    let name = material_names.get(i).map(String::as_str).unwrap_or("material");
+                    let mat_type = material_data.materials[i].type_pad[0];
+                    let type_label = match mat_type {
+                        MAT_LAMBERTIAN => "Lambertian",
+                        MAT_METAL      => "Metal",
+                        MAT_DIELECTRIC => "Dielectric",
+                        MAT_EMISSIVE   => "Emissive",
+                        _              => "?",
+                    };
+                    egui::CollapsingHeader::new(format!("{i}: {name}  [{type_label}]"))
+                        .id_salt(i)
+                        .show(ui, |ui| {
+                            let mat = &mut material_data.materials[i];
+                            match mat_type {
+                                MAT_LAMBERTIAN | MAT_METAL | MAT_EMISSIVE => {
+                                    // Albedo / emission colour picker.
+                                    let mut col = [
+                                        mat.albedo_fuzz[0],
+                                        mat.albedo_fuzz[1],
+                                        mat.albedo_fuzz[2],
+                                    ];
+                                    ui.horizontal(|ui| {
+                                        ui.label("Albedo:");
+                                        if ui.color_edit_button_rgb(&mut col).changed() {
+                                            mat.albedo_fuzz[0] = col[0];
+                                            mat.albedo_fuzz[1] = col[1];
+                                            mat.albedo_fuzz[2] = col[2];
+                                            mat_changed = true;
+                                        }
+                                    });
+                                    if mat_type == MAT_METAL {
+                                        mat_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut mat.albedo_fuzz[3],
+                                                    0.0..=1.0,
+                                                )
+                                                .text("Fuzz"),
+                                            )
+                                            .changed();
+                                    }
+                                    if mat_type == MAT_EMISSIVE {
+                                        mat_changed |= ui
+                                            .add(
+                                                egui::Slider::new(
+                                                    &mut mat.ior_pad[0],
+                                                    0.1..=100_000.0,
+                                                )
+                                                .logarithmic(true)
+                                                .text("Strength"),
+                                            )
+                                            .changed();
+                                    }
+                                }
+                                MAT_DIELECTRIC => {
+                                    mat_changed |= ui
+                                        .add(
+                                            egui::Slider::new(&mut mat.ior_pad[0], 1.0..=3.0)
+                                                .step_by(0.01)
+                                                .text("IOR"),
+                                        )
+                                        .changed();
+                                }
+                                _ => {
+                                    ui.label("(no editable parameters)");
+                                }
+                            }
+                        });
+                }
+                ui.add_space(4.0);
+                ui.small("Press H to hide/show this panel");
+            });
+        });
+
+    (cam_changed, mat_changed, save_request)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 15: screenshot tone-mapping helpers
+// ---------------------------------------------------------------------------
+
+/// ACES filmic tone-map for a single HDR channel (Narkowicz 2016).
+#[inline]
+fn aces_channel_cpu(x: f32) -> f32 {
+    let x = x.max(0.0);
+    const A: f32 = 2.51;
+    const B: f32 = 0.03;
+    const C: f32 = 2.43;
+    const D: f32 = 0.59;
+    const E: f32 = 0.14;
+    ((x * (A * x + B)) / (x * (C * x + D) + E)).clamp(0.0, 1.0)
+}
+
+/// Linear → sRGB transfer function (IEC 61966-2-1) for a single channel.
+#[inline]
+fn linear_to_srgb_cpu(c: f32) -> f32 {
+    if c <= 0.0        { return 0.0; }
+    if c <= 0.003_130_8 { return (c * 12.92).min(1.0); }
+    if c < 1.0         { return (1.055 * c.powf(1.0 / 2.4) - 0.055).clamp(0.0, 1.0); }
+    1.0
+}
+
+/// Apply ACES tone-map + sRGB and quantise to `u8` for PNG output.
+#[inline]
+fn screenshot_to_u8(x: f32) -> u8 {
+    (linear_to_srgb_cpu(aces_channel_cpu(x)) * 255.0 + 0.5) as u8
 }

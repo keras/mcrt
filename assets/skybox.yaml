@@ -2,7 +2,7 @@ camera:
   look_from: [0.0, 2.75,  8.0]
   look_at:   [0.0, 2, 0]
   vfov:      60.0
-  aperture:  1
+  aperture:  0.2
 
 env_map: data/golden_gate_hills_2k.hdr
 

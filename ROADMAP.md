@@ -218,11 +218,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Add a GUI for tweaking scene and render parameters at runtime.
 
-- [ ] Integrate `egui` via `egui-wgpu` for immediate-mode GUI
-- [ ] Expose material parameters (albedo, roughness, IOR) in the UI
-- [ ] Camera settings panel (FOV, aperture, focus distance)
-- [ ] Render stats display (samples/sec, total samples, resolution)
-- [ ] Save rendered image to PNG
+- [x] Integrate `egui` via `egui-wgpu` for immediate-mode GUI
+- [x] Expose material parameters (albedo, roughness, IOR) in the UI
+- [x] Camera settings panel (FOV, aperture, focus distance)
+- [x] Render stats display (samples/sec, total samples, resolution)
+- [x] Save rendered image to PNG
 
 **Output:** A usable interactive path tracer with parameter tweaking.
 

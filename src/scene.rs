@@ -296,6 +296,9 @@ pub struct LoadedScene {
     /// the scene YAML via `env_map: <path>`.  `None` means use the default
     /// fallback chain (`textures/env.hdr` → procedural gradient).
     pub env_map_path: Option<String>,
+    /// Human-readable material names in GPU-index order (Phase 15).
+    /// Palette materials use their YAML key; inline materials use `"inline-{i}"`.
+    pub material_names: Vec<String>,
 }
 
 // Convert a YAML MaterialDesc into a GPU-ready GpuMaterial.
@@ -787,6 +790,22 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         camera,
         emissive_spheres,
         env_map_path: scene.env_map,
+        material_names: {
+            // Palette entries are named; any inline materials added later get
+            // an auto name.  name_to_idx has all palette indices; entries
+            // beyond that range are inline.
+            let palette_count = name_to_idx.len();
+            let total = gpu_mats.len();
+            // Build reverse map: index → name for palette materials.
+            let mut names: Vec<String> = (0..total)
+                .map(|i| format!("inline-{i}"))
+                .collect();
+            for (name, &idx) in &name_to_idx {
+                names[idx as usize] = name.clone();
+            }
+            let _ = palette_count; // suppress warning
+            names
+        },
     }
 }
 
