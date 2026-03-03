@@ -143,11 +143,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Support triangle geometry in addition to spheres.
 
-- [ ] Define vertex buffer (position, normal, UV) and index buffer formats
-- [ ] Implement ray-triangle intersection (Möller–Trumbore)
-- [ ] Integrate triangles into the BVH as leaf primitives
-- [ ] Load a simple OBJ/glTF mesh on the CPU and upload buffers
-- [ ] Interpolate vertex normals for smooth shading
+- [x] Define vertex buffer (position, normal, UV) and index buffer formats
+- [x] Implement ray-triangle intersection (Möller–Trumbore)
+- [x] Integrate triangles into the BVH as leaf primitives
+- [x] Load a simple OBJ/glTF mesh on the CPU and upload buffers
+- [x] Interpolate vertex normals for smooth shading
 
 **Output:** A triangle mesh (e.g., Stanford Bunny) rendered with path tracing.
 

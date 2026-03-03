@@ -29,13 +29,13 @@ use crate::scene::GpuSphere;
 /// **Not a hard upper bound:** when all centroids coincide the SAH returns `None`
 /// and the builder falls back to a leaf regardless of count, so degenerate scenes
 /// may produce leaves larger than this value.
-const BVH_LEAF_MAX: usize = 4;
+pub(crate) const BVH_LEAF_MAX: usize = 4;
 
 /// Number of SAH candidate buckets per axis.
 ///
 /// 8 bins strike a good balance: near-optimal split quality without noticeably
 /// increasing build time.
-const SAH_BINS: usize = 8;
+pub(crate) const SAH_BINS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // GPU types (shared with WGSL, must obey WGSL alignment rules)
@@ -79,11 +79,14 @@ pub struct BvhBuildResult {
 // CPU-only AABB helper
 // ---------------------------------------------------------------------------
 
-/// Axis-aligned bounding box used only during BVH construction on the CPU.
+/// Axis-aligned bounding box used during BVH construction on the CPU.
+///
+/// Exposed as `pub(crate)` so [`crate::mesh`] can reuse it for triangle AABBs
+/// without duplicating the helper methods.
 #[derive(Clone, Copy)]
-struct Aabb {
-    min: [f32; 3],
-    max: [f32; 3],
+pub(crate) struct Aabb {
+    pub(crate) min: [f32; 3],
+    pub(crate) max: [f32; 3],
 }
 
 impl Aabb {
@@ -92,13 +95,37 @@ impl Aabb {
     /// Uses `±INFINITY` rather than `f32::MIN/MAX` so that NaN inputs to [`union`]
     /// propagate visibly instead of silently producing a finite-looking result.
     #[inline]
-    fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self { min: [f32::INFINITY; 3], max: [f32::NEG_INFINITY; 3] }
+    }
+
+    /// A degenerate AABB that contains exactly one point (zero volume).
+    #[inline]
+    pub(crate) fn point(p: [f32; 3]) -> Self {
+        Self { min: p, max: p }
+    }
+
+    /// Tight AABB enclosing three `[f32; 4]` points (`.xyz` used, `.w` ignored).
+    ///
+    /// Intended for computing triangle AABBs from the GPU vertex buffer where
+    /// each position is stored as a `[f32; 4]`.
+    #[inline]
+    pub(crate) fn from_points_3(pts: &[[f32; 4]; 3]) -> Self {
+        let mut aabb = Aabb::empty();
+        for p in pts {
+            aabb.min[0] = aabb.min[0].min(p[0]);
+            aabb.min[1] = aabb.min[1].min(p[1]);
+            aabb.min[2] = aabb.min[2].min(p[2]);
+            aabb.max[0] = aabb.max[0].max(p[0]);
+            aabb.max[1] = aabb.max[1].max(p[1]);
+            aabb.max[2] = aabb.max[2].max(p[2]);
+        }
+        aabb
     }
 
     /// Tight AABB around a sphere with the given centre and radius.
     #[inline]
-    fn from_sphere(center: [f32; 3], radius: f32) -> Self {
+    pub(crate) fn from_sphere(center: [f32; 3], radius: f32) -> Self {
         debug_assert!(radius.is_finite() && radius >= 0.0, "sphere radius must be finite and non-negative, got {radius}");
         Self {
             min: [center[0] - radius, center[1] - radius, center[2] - radius],
@@ -108,7 +135,7 @@ impl Aabb {
 
     /// Smallest AABB that contains both `self` and `other`.
     #[inline]
-    fn union(self, other: &Aabb) -> Aabb {
+    pub(crate) fn union(self, other: &Aabb) -> Aabb {
         Aabb {
             min: [
                 self.min[0].min(other.min[0]),
@@ -128,7 +155,7 @@ impl Aabb {
     /// We always compare SA values in the same SAH expression so the factor of 2
     /// cancels; using half-area keeps the numbers smaller.
     #[inline]
-    fn half_area(&self) -> f32 {
+    pub(crate) fn half_area(&self) -> f32 {
         let d = [
             self.max[0] - self.min[0],
             self.max[1] - self.min[1],
@@ -139,7 +166,7 @@ impl Aabb {
 
     /// Geometric centroid of the AABB.
     #[inline]
-    fn centroid(&self) -> [f32; 3] {
+    pub(crate) fn centroid(&self) -> [f32; 3] {
         [
             (self.min[0] + self.max[0]) * 0.5,
             (self.min[1] + self.max[1]) * 0.5,
@@ -149,7 +176,7 @@ impl Aabb {
 
     /// Convert to the GPU-friendly `[f32; 4]` pair used in `GpuBvhNode`.
     #[inline]
-    fn to_gpu_pair(&self) -> ([f32; 4], [f32; 4]) {
+    pub(crate) fn to_gpu_pair(&self) -> ([f32; 4], [f32; 4]) {
         (
             [self.min[0], self.min[1], self.min[2], 0.0],
             [self.max[0], self.max[1], self.max[2], 0.0],

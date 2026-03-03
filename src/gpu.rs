@@ -32,6 +32,7 @@ use winit::{
 use crate::bvh::{build_bvh, GpuBvhNode};
 use crate::camera::{compute_camera, CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM};
 use crate::material::{build_materials, GpuMaterialData};
+use crate::mesh::{build_mesh_bvh, build_torus_mesh, GpuTriangle, GpuVertex};
 use crate::scene::{build_large_scene, GpuSphere};
 
 // ---------------------------------------------------------------------------
@@ -212,8 +213,15 @@ pub struct GpuState {
     /// BVH-reordered sphere list (storage buffer, binding 2).
     sphere_buffer:              wgpu::Buffer,
     material_buffer:            wgpu::Buffer,
-    /// Flat BVH node array (storage buffer, binding 5).
+    /// Flat sphere BVH node array (storage buffer, binding 5).
     bvh_buffer:                 wgpu::Buffer,
+    // ---- Phase 10: triangle mesh resources --------------------------------
+    /// Vertex positions / normals / UVs (storage buffer, binding 6).
+    vertex_buffer:              wgpu::Buffer,
+    /// BVH-reordered triangle index triples (storage buffer, binding 7).
+    triangle_buffer:            wgpu::Buffer,
+    /// Flat mesh BVH node array (storage buffer, binding 8).
+    mesh_bvh_buffer:            wgpu::Buffer,
 
     /// Monotonically increasing frame index; resets to 0 on camera move / resize.
     frame_count: u32,
@@ -356,6 +364,59 @@ impl GpuState {
             bvh_result.nodes.len()
         );
 
+        // ---- triangle mesh (Phase 10) -------------------------------------
+        // Build a torus mesh and a UV-sphere mesh, merge them, then build a
+        // BVH over the combined triangle set.  Both shapes are placed near the
+        // existing sphere grid so the whole scene is visible from the default
+        // camera position.
+        //
+        // Torus  : centre (-3, 0.7, 0), major_r=0.9, minor_r=0.3, metal (mat 2)
+        // UV-sphere: centre (3.5, 0, 0), radius=0.7, glass (mat 3)
+        let (torus_verts, torus_tris) =
+            build_torus_mesh([-3.0, 0.7, 0.0], 0.9, 0.3, 32, 16, 2);
+        let sphere_mesh_mat = 1u32; // red Lambertian
+        let (sphere_verts, sphere_tris_raw) = crate::mesh::build_uv_sphere_mesh(
+            [3.5, 0.0, 0.0], 0.7, 20, 32, sphere_mesh_mat,
+        );
+
+        // Merge the two meshes: offset sphere vertex indices by torus vertex count.
+        let vert_offset = torus_verts.len() as u32;
+        let mut all_verts = torus_verts;
+        all_verts.extend_from_slice(&sphere_verts);
+
+        let mut all_tris: Vec<GpuTriangle> = torus_tris;
+        for t in &sphere_tris_raw {
+            all_tris.push(GpuTriangle {
+                v: [t.v[0] + vert_offset, t.v[1] + vert_offset, t.v[2] + vert_offset],
+                mat_idx: t.mat_idx,
+            });
+        }
+
+        let mesh_result = build_mesh_bvh(&all_verts, &all_tris);
+
+        info!(
+            "Mesh BVH built: {} triangles, {} vertices → {} nodes",
+            mesh_result.ordered_triangles.len(),
+            mesh_result.vertices.len(),
+            mesh_result.nodes.len()
+        );
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("mesh vertex storage"),
+            contents: bytemuck::cast_slice(&mesh_result.vertices),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("mesh triangle storage"),
+            contents: bytemuck::cast_slice(&mesh_result.ordered_triangles),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+        let mesh_bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("mesh bvh node storage"),
+            contents: bytemuck::cast_slice(&mesh_result.nodes),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+
         // ---- material buffer -----------------------------------------------
         let material_data = build_materials();
         let material_buffer = device.create_buffer(&BufferDescriptor {
@@ -432,9 +493,48 @@ impl GpuState {
                         },
                         count: None,
                     },
-                    // 5: BVH node array storage buffer (runtime-sized array)
+                    // 5: sphere BVH node array storage buffer (runtime-sized array)
                     BindGroupLayoutEntry {
                         binding:    5,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Buffer {
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   wgpu::BufferSize::new(
+                                size_of::<GpuBvhNode>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    // 6: mesh vertex buffer (position, normal, UV; runtime-sized array)
+                    BindGroupLayoutEntry {
+                        binding:    6,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Buffer {
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   wgpu::BufferSize::new(
+                                size_of::<GpuVertex>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    // 7: mesh triangle index buffer (runtime-sized array)
+                    BindGroupLayoutEntry {
+                        binding:    7,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Buffer {
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   wgpu::BufferSize::new(
+                                size_of::<GpuTriangle>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    // 8: mesh BVH node array (runtime-sized array)
+                    BindGroupLayoutEntry {
+                        binding:    8,
                         visibility: ShaderStages::COMPUTE,
                         ty:         BindingType::Buffer {
                             ty:                wgpu::BufferBindingType::Storage { read_only: true },
@@ -484,6 +584,9 @@ impl GpuState {
             &sphere_buffer,
             &material_buffer,
             &bvh_buffer,
+            &vertex_buffer,
+            &triangle_buffer,
+            &mesh_bvh_buffer,
         );
 
         Self {
@@ -504,6 +607,9 @@ impl GpuState {
             sphere_buffer,
             material_buffer,
             bvh_buffer,
+            vertex_buffer,
+            triangle_buffer,
+            mesh_bvh_buffer,
             frame_count: 0,
             camera,
             input: InputState::default(),
@@ -550,6 +656,9 @@ impl GpuState {
             &self.sphere_buffer,
             &self.material_buffer,
             &self.bvh_buffer,
+            &self.vertex_buffer,
+            &self.triangle_buffer,
+            &self.mesh_bvh_buffer,
         );
     }
 
@@ -751,13 +860,16 @@ fn make_display_bind_groups(
 }
 
 fn make_compute_bind_groups(
-    device:          &wgpu::Device,
-    layout:          &wgpu::BindGroupLayout,
-    accum_views:     &[wgpu::TextureView; 2],
-    camera_buffer:   &wgpu::Buffer,
-    sphere_buffer:   &wgpu::Buffer,
-    material_buffer: &wgpu::Buffer,
-    bvh_buffer:      &wgpu::Buffer,
+    device:           &wgpu::Device,
+    layout:           &wgpu::BindGroupLayout,
+    accum_views:      &[wgpu::TextureView; 2],
+    camera_buffer:    &wgpu::Buffer,
+    sphere_buffer:    &wgpu::Buffer,
+    material_buffer:  &wgpu::Buffer,
+    bvh_buffer:       &wgpu::Buffer,
+    vertex_buffer:    &wgpu::Buffer,
+    triangle_buffer:  &wgpu::Buffer,
+    mesh_bvh_buffer:  &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -770,6 +882,9 @@ fn make_compute_bind_groups(
                 BindGroupEntry { binding: 3, resource: BindingResource::TextureView(read_view) },
                 BindGroupEntry { binding: 4, resource: material_buffer.as_entire_binding() },
                 BindGroupEntry { binding: 5, resource: bvh_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 6, resource: vertex_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 7, resource: triangle_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 8, resource: mesh_bvh_buffer.as_entire_binding() },
             ],
         })
     };

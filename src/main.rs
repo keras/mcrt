@@ -6,6 +6,8 @@
 //   scene    — GpuSphere and build_scene / build_large_scene
 //   material — GpuMaterial / GpuMaterialData and build_materials()
 //   bvh      — GpuBvhNode and build_bvh() (Phase 9 SAH acceleration structure)
+//   mesh     — GpuVertex, GpuTriangle, build_mesh_bvh(), UV-sphere / OBJ loader
+//              (Phase 10 triangle mesh support)
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
 
@@ -14,6 +16,7 @@ mod bvh;
 mod camera;
 mod gpu;
 mod material;
+mod mesh;
 mod scene;
 
 use winit::event_loop::EventLoop;

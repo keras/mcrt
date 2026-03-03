@@ -1,6 +1,15 @@
-// path_trace.wgsl — Phase 9: BVH-accelerated path tracer
+// path_trace.wgsl — Phase 10: Triangle mesh path tracer
 //
-// Phase 9 changes over Phase 8:
+// Phase 10 changes over Phase 9:
+//   - A Vertex struct (position/normal/UV) and Triangle struct (v[3] + mat_idx)
+//     are added on bindings 6 and 7 respectively.
+//   - A second BVH (mesh_bvh_nodes, binding 8) is added for the triangle mesh.
+//   - ray_triangle_hit() implements Möller-Trumbore intersection with barycentric
+//     vertex-normal interpolation for smooth shading.
+//   - scene_hit() now traverses BOTH the sphere BVH (binding 5) and the mesh BVH
+//     (binding 8) and returns the closest of the two hits.
+//
+// Phase 9 changes (still present):
 //   - Scene spheres are now in a runtime-sized storage buffer (binding 2)
 //     instead of a fixed-capacity SceneData uniform.  This removes MAX_SPHERES.
 //   - A flat BVH node array is added on binding 5.  Each frame the compute
@@ -103,6 +112,23 @@ struct BvhNode {
     _pad1:           u32,
 }
 
+// ---- mesh vertex buffer --------------------------------------------------
+// Phase 10: vertex positions, normals, and UVs for triangle meshes.
+// Layout must match GpuVertex in mesh.rs (48 bytes / 3 × vec4).
+struct Vertex {
+    position: vec4<f32>,  // .xyz = world-space position, .w = unused
+    normal:   vec4<f32>,  // .xyz = vertex normal (unit length), .w = unused
+    uv:       vec4<f32>,  // .xy = UV coordinates, .zw = unused
+}
+
+// ---- mesh triangle buffer -------------------------------------------------
+// Phase 10: triangles as three vertex indices plus a material slot.
+// Layout must match GpuTriangle in mesh.rs (16 bytes / vec4<u32>).
+struct Triangle {
+    v:       vec3<u32>,  // indices into the vertex buffer
+    mat_idx: u32,        // material slot (same table as sphere materials)
+}
+
 // ---- material buffer -----------------------------------------------------
 
 /// Per-material descriptor; layout must match `GpuMaterial` in main.rs.
@@ -149,6 +175,16 @@ struct MaterialData {
 
 /// Flat BVH node array.  Traversal always starts at index 0 (root).
 @group(0) @binding(5) var<storage, read> bvh_nodes: array<BvhNode>;
+
+/// Mesh vertex buffer (world-space positions, smooth normals, UVs).
+/// Indexed by triangle vertex indices in `mesh_triangles`.
+@group(0) @binding(6) var<storage, read> vertices: array<Vertex>;
+
+/// Mesh triangle index buffer.  BVH-reordered so leaf ranges are contiguous.
+@group(0) @binding(7) var<storage, read> mesh_triangles: array<Triangle>;
+
+/// Flat mesh BVH node array.  Traversal always starts at index 0 (root).
+@group(0) @binding(8) var<storage, read> mesh_bvh_nodes: array<BvhNode>;
 
 // ---- PCG PRNG -------------------------------------------------------------
 //
@@ -216,6 +252,73 @@ fn ray_sphere_hit(r: Ray, sphere: Sphere, t_min: f32, t_max: f32) -> HitRecord {
     // Normal always faces the incident ray (required for refraction in Phase 7).
     hit.normal    = select(-outward_n, outward_n, hit.front_face);
     hit.mat_index = sphere.mat_and_pad.x;
+    return hit;
+}
+
+// ---- ray-triangle intersection (Möller-Trumbore) -------------------------
+
+/// Tests ray `r` against the triangle `tri` using the Möller-Trumbore algorithm.
+///
+/// On hit: returns a `HitRecord` with
+///   - `t`         = intersection distance (t_min < t < t_max)
+///   - `normal`    = barycentric-interpolated vertex normal, front-facing toward ray
+///   - `mat_index` = triangle's material slot
+///
+/// On miss: returns a record with `t = -1`.
+///
+/// Smooth shading is achieved by interpolating the three vertex normals with the
+/// Möller-Trumbore barycentric coordinates (u, v); the third weight w = 1 - u - v.
+/// The interpolated normal is normalised to defend against near-degenerate cases.
+fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord {
+    let p0 = vertices[tri.v.x].position.xyz;
+    let p1 = vertices[tri.v.y].position.xyz;
+    let p2 = vertices[tri.v.z].position.xyz;
+
+    let e1 = p1 - p0;
+    let e2 = p2 - p0;
+
+    // h = cross(r.dir, e2).  `a = dot(e1, h)` is the triple product det.
+    let h = cross(r.dir, e2);
+    let a = dot(e1, h);
+
+    var hit: HitRecord;
+    hit.t = -1.0;
+
+    // Near-zero determinant means ray is parallel to the triangle plane.
+    if abs(a) < 1e-8 { return hit; }
+
+    let f = 1.0 / a;
+    let s = r.origin - p0;
+
+    // Barycentric u coordinate.
+    let u_bary = f * dot(s, h);
+    if u_bary < 0.0 || u_bary > 1.0 { return hit; }
+
+    // Barycentric v coordinate.
+    let q      = cross(s, e1);
+    let v_bary = f * dot(r.dir, q);
+    if v_bary < 0.0 || u_bary + v_bary > 1.0 { return hit; }
+
+    // Ray-plane intersection distance.
+    let t = f * dot(e2, q);
+    if t <= t_min || t >= t_max { return hit; }
+
+    // ---- smooth normal via barycentric interpolation ----------------------
+    // w = 1 - u - v is the weight for vertex 0; u for vertex 1; v for vertex 2.
+    let n0 = vertices[tri.v.x].normal.xyz;
+    let n1 = vertices[tri.v.y].normal.xyz;
+    let n2 = vertices[tri.v.z].normal.xyz;
+    let w = 1.0 - u_bary - v_bary;
+    // normalize() guards against the near-degenerate case where two vertex
+    // normals nearly cancel (obtuse interpolation at a crease).
+    let interp_n = normalize(w * n0 + u_bary * n1 + v_bary * n2);
+
+    hit.t         = t;
+    hit.point     = r.origin + t * r.dir;
+    hit.front_face = dot(r.dir, interp_n) < 0.0;
+    // Normal always faces the incident ray, consistent with ray_sphere_hit.
+    hit.normal    = select(-interp_n, interp_n, hit.front_face);
+    hit.mat_index = tri.mat_idx;
     return hit;
 }
 
@@ -300,6 +403,48 @@ fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
                 stack[u32(sp)] = node.right_or_offset;  // right child
                 sp += 1;
                 stack[u32(sp)] = node_idx + 1u;          // left child (pre-order)
+            }
+        }
+    }
+
+    // ---- Mesh BVH traversal (Phase 10) ------------------------------------
+    // Reuses `closest` already narrowed by any sphere hit above, so the mesh
+    // traversal automatically benefits from early-exit AABB culling.
+    let mesh_count = i32(arrayLength(&mesh_bvh_nodes));
+    if mesh_count > 0 {
+        var mstack: array<u32, 32>;
+        var msp: i32 = 0;
+        mstack[0] = 0u;  // push mesh BVH root
+
+        while msp >= 0 {
+            let midx = mstack[u32(msp)];
+            msp -= 1;
+
+            let mnode = mesh_bvh_nodes[midx];
+
+            if !ray_aabb_hit(r, mnode.aabb_min.xyz, mnode.aabb_max.xyz, t_min, closest) {
+                continue;
+            }
+
+            if mnode.prim_count > 0u {
+                // Leaf: test every triangle in the range.
+                let prim_end = mnode.right_or_offset + mnode.prim_count;
+                for (var i = mnode.right_or_offset; i < prim_end; i++) {
+                    let hit = ray_triangle_hit(r, mesh_triangles[i], t_min, closest);
+                    if hit.t > 0.0 {
+                        best    = hit;
+                        closest = hit.t;
+                    }
+                }
+            } else {
+                // Internal node: same stack-safe push pattern as the sphere traversal.
+                // The guard at msp < 30 leaves room for two pushes (max index = 31).
+                if msp < 30 {
+                    msp += 1;
+                    mstack[u32(msp)] = mnode.right_or_offset;  // right child
+                    msp += 1;
+                    mstack[u32(msp)] = midx + 1u;               // left child (pre-order)
+                }
             }
         }
     }
