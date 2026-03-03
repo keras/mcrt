@@ -126,16 +126,21 @@ pub fn try_load_hdr(path: &str) -> Option<Vec<f32>> {
     let resized = img.resize_exact(
         ENV_MAP_WIDTH,
         ENV_MAP_HEIGHT,
-        image::imageops::FilterType::Lanczos3,
+        // Nearest-neighbour avoids Lanczos negative lobes around extreme HDR
+        // highlights (sun disk), which would otherwise be clamped to zero and
+        // appear as a black halo around the sun.
+        image::imageops::FilterType::Nearest,
     );
     // to_rgb32f() converts to a linear-float ImageBuffer<Rgb<f32>, Vec<f32>>.
     // into_raw() returns the flat [R, G, B, R, G, B, ...] pixel data.
     let raw = resized.to_rgb32f().into_raw();
     let mut out = Vec::with_capacity((ENV_MAP_WIDTH * ENV_MAP_HEIGHT * 4) as usize);
     for chunk in raw.chunks(3) {
-        out.push(chunk[0]);
-        out.push(chunk[1]);
-        out.push(chunk[2]);
+        // Replace NaN / Inf (can arise from Lanczos resampling of extreme HDR
+        // sun-disk pixels) with 0 so they don't propagate as black fireflies.
+        out.push(chunk[0].max(0.0).min(1e10));
+        out.push(chunk[1].max(0.0).min(1e10));
+        out.push(chunk[2].max(0.0).min(1e10));
         out.push(1.0_f32); // alpha pad — Rgba32Float needs 4 channels
     }
     Some(out)
@@ -190,6 +195,27 @@ fn gradient_sky_rgb(elevation: f32) -> (f32, f32, f32) {
         let b = (1.0 - t) * 0.1;
         (r, g, b)
     }
+}
+
+/// Load or generate equirectangular environment-map data (RGBA32 Float).
+///
+/// Priority:
+/// 1. `scene_path` — explicit HDR path from the scene YAML
+/// 2. `textures/env.hdr` — well-known default location
+/// 3. Procedural gradient sky
+///
+/// Returns `ENV_MAP_WIDTH × ENV_MAP_HEIGHT × 4` f32 values.
+pub fn load_env_map_data(scene_path: Option<&str>) -> Vec<f32> {
+    if let Some(p) = scene_path {
+        if let Some(data) = try_load_hdr(p) {
+            return data;
+        }
+        log::warn!(
+            "env_map '{}' could not be loaded; falling back to default",
+            p
+        );
+    }
+    try_load_hdr("textures/env.hdr").unwrap_or_else(build_gradient_env_map)
 }
 
 // ---------------------------------------------------------------------------

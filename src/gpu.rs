@@ -36,7 +36,7 @@ use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
 use crate::scene::{GpuSphere, load_scene_from_yaml};
 use crate::texture::{
-    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures,
+    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
 };
 use notify::Watcher as _;
 
@@ -383,14 +383,35 @@ impl GpuState {
         let loaded = load_scene_from_yaml(&scene_path);
         let bvh_result = build_bvh(&loaded.spheres);
 
+        // wgpu requires every storage-buffer binding to be at least as large as
+        // the stride declared in the shader (32 bytes = one GpuSphere).  When
+        // the scene has no spheres the buffer would be zero bytes, causing a
+        // validation error.  Pad with a stub sphere placed far outside the
+        // scene so BVH traversal never hits it.
+        let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
+            vec![GpuSphere {
+                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
+                mat_and_pad: [0; 4],
+            }]
+        } else {
+            bvh_result.ordered_spheres.clone()
+        };
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sphere storage"),
-            contents: bytemuck::cast_slice(&bvh_result.ordered_spheres),
+            contents: bytemuck::cast_slice(&sphere_data),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
+        // Sphere BVH nodes: also needs at least one entry when there are no
+        // spheres (the shader indexes this array unconditionally during traversal).
+        let bvh_node_data: Vec<GpuBvhNode> = if bvh_result.nodes.is_empty() {
+            use bytemuck::Zeroable;
+            vec![GpuBvhNode::zeroed()]
+        } else {
+            bvh_result.nodes.clone()
+        };
         let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("bvh node storage"),
-            contents: bytemuck::cast_slice(&bvh_result.nodes),
+            contents: bytemuck::cast_slice(&bvh_node_data),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
@@ -414,7 +435,8 @@ impl GpuState {
         );
 
         // ---- Phase 11: textures + environment map --------------------------
-        let (albedo_layers, env_map_data) = load_all_textures();
+        let (albedo_layers, _) = load_all_textures();
+        let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
 
         // RGBA8 Unorm 2D texture array — MAX_TEXTURES layers, TEXTURE_SIZE².
         let albedo_tex = device.create_texture(&TextureDescriptor {
@@ -516,19 +538,40 @@ impl GpuState {
             ..Default::default()
         });
 
+        // Mesh buffers: guard against zero-byte uploads (no-mesh scene).
+        // wgpu requires every bound buffer to be at least as large as the
+        // stride declared in the shader via min_binding_size.
+        let mesh_vertices_data: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
+            use bytemuck::Zeroable;
+            vec![GpuVertex::zeroed()]
+        } else {
+            mesh_result.vertices.clone()
+        };
+        let mesh_triangles_data: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
+            use bytemuck::Zeroable;
+            vec![GpuTriangle::zeroed()]
+        } else {
+            mesh_result.ordered_triangles.clone()
+        };
+        let mesh_bvh_data: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
+            use bytemuck::Zeroable;
+            vec![GpuBvhNode::zeroed()]
+        } else {
+            mesh_result.nodes.clone()
+        };
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vertex storage"),
-            contents: bytemuck::cast_slice(&mesh_result.vertices),
+            contents: bytemuck::cast_slice(&mesh_vertices_data),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh triangle storage"),
-            contents: bytemuck::cast_slice(&mesh_result.ordered_triangles),
+            contents: bytemuck::cast_slice(&mesh_triangles_data),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
         let mesh_bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh bvh node storage"),
-            contents: bytemuck::cast_slice(&mesh_result.nodes),
+            contents: bytemuck::cast_slice(&mesh_bvh_data),
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
@@ -928,41 +971,73 @@ impl GpuState {
         let loaded = load_scene_from_yaml(&path);
 
         let bvh_result = build_bvh(&loaded.spheres);
+        let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
+            vec![GpuSphere {
+                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
+                mat_and_pad: [0; 4],
+            }]
+        } else {
+            bvh_result.ordered_spheres.clone()
+        };
         self.sphere_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sphere storage"),
-                contents: bytemuck::cast_slice(&bvh_result.ordered_spheres),
+                contents: bytemuck::cast_slice(&sphere_data),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
+        let reload_bvh_nodes: Vec<GpuBvhNode> = {
+            use bytemuck::Zeroable;
+            if bvh_result.nodes.is_empty() {
+                vec![GpuBvhNode::zeroed()]
+            } else {
+                bvh_result.nodes.clone()
+            }
+        };
         self.bvh_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("bvh node storage"),
-                contents: bytemuck::cast_slice(&bvh_result.nodes),
+                contents: bytemuck::cast_slice(&reload_bvh_nodes),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
 
         let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
+        use bytemuck::Zeroable;
+        let reload_mesh_verts: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
+            vec![GpuVertex::zeroed()]
+        } else {
+            mesh_result.vertices.clone()
+        };
+        let reload_mesh_tris: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
+            vec![GpuTriangle::zeroed()]
+        } else {
+            mesh_result.ordered_triangles.clone()
+        };
+        let reload_mesh_bvh: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
+            vec![GpuBvhNode::zeroed()]
+        } else {
+            mesh_result.nodes.clone()
+        };
         self.vertex_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh vertex storage"),
-                contents: bytemuck::cast_slice(&mesh_result.vertices),
+                contents: bytemuck::cast_slice(&reload_mesh_verts),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
         self.triangle_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh triangle storage"),
-                contents: bytemuck::cast_slice(&mesh_result.ordered_triangles),
+                contents: bytemuck::cast_slice(&reload_mesh_tris),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
         self.mesh_bvh_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("mesh bvh node storage"),
-                contents: bytemuck::cast_slice(&mesh_result.nodes),
+                contents: bytemuck::cast_slice(&reload_mesh_bvh),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
 
@@ -986,6 +1061,44 @@ impl GpuState {
                 contents: bytemuck::cast_slice(&emissive_data),
                 usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
+
+        // Recreate the env map texture (the scene's env_map: field may have changed).
+        let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
+        let env_map_tex = self.device.create_texture(&TextureDescriptor {
+            label: Some("env map"),
+            size: Extent3d {
+                width: ENV_MAP_WIDTH,
+                height: ENV_MAP_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &env_map_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            bytemuck::cast_slice(&env_map_data),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4),
+                rows_per_image: Some(ENV_MAP_HEIGHT),
+            },
+            Extent3d {
+                width: ENV_MAP_WIDTH,
+                height: ENV_MAP_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
+        self._env_map_tex = env_map_tex;
 
         self.rebuild_bind_groups();
         self.frame_count = 0;

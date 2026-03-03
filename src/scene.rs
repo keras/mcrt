@@ -243,6 +243,11 @@ struct SceneFile {
     materials: indexmap::IndexMap<String, MaterialDesc>,
     /// Ordered list of scene objects.
     objects: Vec<ObjectDesc>,
+    /// Optional path (relative to the working directory) to an HDR equirectangular
+    /// environment map.  When absent the renderer falls back to `textures/env.hdr`,
+    /// then to the procedural gradient sky.
+    #[serde(default)]
+    env_map: Option<String>,
 }
 
 /// The result of loading a YAML scene file — ready for BVH construction and
@@ -273,6 +278,10 @@ pub struct LoadedScene {
     ///
     /// Note: emissive *mesh* triangles are not tracked here (Phase 13 scope).
     pub emissive_spheres: Vec<GpuSphere>,
+    /// Optional path to an HDR equirectangular environment map, as declared in
+    /// the scene YAML via `env_map: <path>`.  `None` means use the default
+    /// fallback chain (`textures/env.hdr` → procedural gradient).
+    pub env_map_path: Option<String>,
 }
 
 // Convert a YAML MaterialDesc into a GPU-ready GpuMaterial.
@@ -312,7 +321,9 @@ fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
 
 /// Convert degrees → radians.
 #[inline]
-fn to_rad(deg: f32) -> f32 { deg * std::f32::consts::PI / 180.0 }
+fn to_rad(deg: f32) -> f32 {
+    deg * std::f32::consts::PI / 180.0
+}
 
 /// Build a **row-major** 3×3 rotation matrix from Euler angles (degrees).
 /// Convention: R = Rz(z) · Ry(y) · Rx(x)  — intrinsic XYZ / extrinsic ZYX.
@@ -322,9 +333,9 @@ fn euler_to_mat3(rx: f32, ry: f32, rz: f32) -> [[f32; 3]; 3] {
     let (sy, cy) = to_rad(ry).sin_cos();
     let (sz, cz) = to_rad(rz).sin_cos();
     [
-        [ cy * cz,  sx * sy * cz - cx * sz,  cx * sy * cz + sx * sz ],
-        [ cy * sz,  sx * sy * sz + cx * cz,  cx * sy * sz - sx * cz ],
-        [     -sy,                 sx * cy,                  cx * cy ],
+        [cy * cz, sx * sy * cz - cx * sz, cx * sy * cz + sx * sz],
+        [cy * sz, sx * sy * sz + cx * cz, cx * sy * sz - sx * cz],
+        [-sy, sx * cy, cx * cy],
     ]
 }
 
@@ -538,24 +549,57 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                 // box is axis-aligned.
                 let rot = rotate
                     .map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz))
-                    .unwrap_or([[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]);
+                    .unwrap_or([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]);
 
                 // Six faces defined as (outward local normal, 4 CCW corner offsets).
                 // Corner offsets are in the box's local space (centred at origin);
                 // they are rotated and then shifted by `center`.
                 let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
                     // +X
-                    ([ 1., 0., 0.], [[ hx,-hy,-hz],[ hx,-hy, hz],[ hx, hy, hz],[ hx, hy,-hz]]),
+                    (
+                        [1., 0., 0.],
+                        [[hx, -hy, -hz], [hx, -hy, hz], [hx, hy, hz], [hx, hy, -hz]],
+                    ),
                     // -X
-                    ([-1., 0., 0.], [[-hx,-hy, hz],[-hx,-hy,-hz],[-hx, hy,-hz],[-hx, hy, hz]]),
+                    (
+                        [-1., 0., 0.],
+                        [
+                            [-hx, -hy, hz],
+                            [-hx, -hy, -hz],
+                            [-hx, hy, -hz],
+                            [-hx, hy, hz],
+                        ],
+                    ),
                     // +Y
-                    ([ 0., 1., 0.], [[-hx, hy,-hz],[ hx, hy,-hz],[ hx, hy, hz],[-hx, hy, hz]]),
+                    (
+                        [0., 1., 0.],
+                        [[-hx, hy, -hz], [hx, hy, -hz], [hx, hy, hz], [-hx, hy, hz]],
+                    ),
                     // -Y
-                    ([ 0.,-1., 0.], [[ hx,-hy,-hz],[-hx,-hy,-hz],[-hx,-hy, hz],[ hx,-hy, hz]]),
+                    (
+                        [0., -1., 0.],
+                        [
+                            [hx, -hy, -hz],
+                            [-hx, -hy, -hz],
+                            [-hx, -hy, hz],
+                            [hx, -hy, hz],
+                        ],
+                    ),
                     // +Z
-                    ([ 0., 0., 1.], [[ hx,-hy, hz],[-hx,-hy, hz],[-hx, hy, hz],[ hx, hy, hz]]),
+                    (
+                        [0., 0., 1.],
+                        [[hx, -hy, hz], [-hx, -hy, hz], [-hx, hy, hz], [hx, hy, hz]],
+                    ),
                     // -Z
-                    ([ 0., 0.,-1.], [[-hx,-hy,-hz],[ hx,-hy,-hz],[ hx, hy,-hz],[-hx, hy,-hz]]),
+                    (
+                        [0., 0., -1.],
+                        [
+                            [-hx, -hy, -hz],
+                            [hx, -hy, -hz],
+                            [hx, hy, -hz],
+                            [-hx, hy, -hz],
+                        ],
+                    ),
                 ];
 
                 let uvs = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
@@ -702,6 +746,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         mesh_triangles,
         camera,
         emissive_spheres,
+        env_map_path: scene.env_map,
     }
 }
 
@@ -1208,12 +1253,20 @@ objects:
         let loaded = load_scene_from_str(yaml, "<inline>");
         // First 2 triangles belong to the culled plane; next 2 to the double-sided one.
         for tri in &loaded.mesh_triangles[..2] {
-            assert_ne!(tri.mat_idx & BACKFACE_CULL_FLAG, 0,
-                "culled plane triangle should have bit 31 set, got {:#010x}", tri.mat_idx);
+            assert_ne!(
+                tri.mat_idx & BACKFACE_CULL_FLAG,
+                0,
+                "culled plane triangle should have bit 31 set, got {:#010x}",
+                tri.mat_idx
+            );
         }
         for tri in &loaded.mesh_triangles[2..] {
-            assert_eq!(tri.mat_idx & BACKFACE_CULL_FLAG, 0,
-                "double-sided plane triangle should NOT have bit 31 set, got {:#010x}", tri.mat_idx);
+            assert_eq!(
+                tri.mat_idx & BACKFACE_CULL_FLAG,
+                0,
+                "double-sided plane triangle should NOT have bit 31 set, got {:#010x}",
+                tri.mat_idx
+            );
         }
     }
 
@@ -1318,55 +1371,54 @@ objects:
 
         // For each face, collect the 4 vertices whose stored normal matches
         // and verify the span in each world axis.
-        let check_face =
-            |nx: f32, ny: f32, nz: f32, span_x: f32, span_y: f32, span_z: f32| {
-                let face_verts: Vec<_> = verts
-                    .iter()
-                    .filter(|v| {
-                        (v.normal[0] - nx).abs() < 1e-5
-                            && (v.normal[1] - ny).abs() < 1e-5
-                            && (v.normal[2] - nz).abs() < 1e-5
-                    })
-                    .collect();
-                assert_eq!(
-                    face_verts.len(),
-                    4,
-                    "face ({nx},{ny},{nz}) must have 4 vertices"
-                );
-                let xs: Vec<f32> = face_verts.iter().map(|v| v.position[0]).collect();
-                let ys: Vec<f32> = face_verts.iter().map(|v| v.position[1]).collect();
-                let zs: Vec<f32> = face_verts.iter().map(|v| v.position[2]).collect();
-                let span = |vals: &[f32]| {
-                    vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
-                        - vals.iter().cloned().fold(f32::INFINITY, f32::min)
-                };
-                let tol = 1e-4;
-                assert!(
-                    (span(&xs) - span_x).abs() < tol,
-                    "face ({nx},{ny},{nz}) X-span={} expected {span_x}",
-                    span(&xs)
-                );
-                assert!(
-                    (span(&ys) - span_y).abs() < tol,
-                    "face ({nx},{ny},{nz}) Y-span={} expected {span_y}",
-                    span(&ys)
-                );
-                assert!(
-                    (span(&zs) - span_z).abs() < tol,
-                    "face ({nx},{ny},{nz}) Z-span={} expected {span_z}",
-                    span(&zs)
-                );
+        let check_face = |nx: f32, ny: f32, nz: f32, span_x: f32, span_y: f32, span_z: f32| {
+            let face_verts: Vec<_> = verts
+                .iter()
+                .filter(|v| {
+                    (v.normal[0] - nx).abs() < 1e-5
+                        && (v.normal[1] - ny).abs() < 1e-5
+                        && (v.normal[2] - nz).abs() < 1e-5
+                })
+                .collect();
+            assert_eq!(
+                face_verts.len(),
+                4,
+                "face ({nx},{ny},{nz}) must have 4 vertices"
+            );
+            let xs: Vec<f32> = face_verts.iter().map(|v| v.position[0]).collect();
+            let ys: Vec<f32> = face_verts.iter().map(|v| v.position[1]).collect();
+            let zs: Vec<f32> = face_verts.iter().map(|v| v.position[2]).collect();
+            let span = |vals: &[f32]| {
+                vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                    - vals.iter().cloned().fold(f32::INFINITY, f32::min)
             };
+            let tol = 1e-4;
+            assert!(
+                (span(&xs) - span_x).abs() < tol,
+                "face ({nx},{ny},{nz}) X-span={} expected {span_x}",
+                span(&xs)
+            );
+            assert!(
+                (span(&ys) - span_y).abs() < tol,
+                "face ({nx},{ny},{nz}) Y-span={} expected {span_y}",
+                span(&ys)
+            );
+            assert!(
+                (span(&zs) - span_z).abs() < tol,
+                "face ({nx},{ny},{nz}) Z-span={} expected {span_z}",
+                span(&zs)
+            );
+        };
 
         // ±X faces: fixed x, span Y=4, Z=6
-        check_face( 1., 0., 0., 0., 4., 6.);
+        check_face(1., 0., 0., 0., 4., 6.);
         check_face(-1., 0., 0., 0., 4., 6.);
         // ±Y faces: fixed y, span X=2, Z=6
-        check_face( 0., 1., 0., 2., 0., 6.);
-        check_face( 0.,-1., 0., 2., 0., 6.);
+        check_face(0., 1., 0., 2., 0., 6.);
+        check_face(0., -1., 0., 2., 0., 6.);
         // ±Z faces: fixed z, span X=2, Y=4
-        check_face( 0., 0., 1., 2., 4., 0.);
-        check_face( 0., 0.,-1., 2., 4., 0.);
+        check_face(0., 0., 1., 2., 4., 0.);
+        check_face(0., 0., -1., 2., 4., 0.);
     }
 
     #[test]
@@ -1394,35 +1446,56 @@ objects:
         // All rotated normals must still be unit vectors.
         for (i, v) in loaded.mesh_vertices.iter().enumerate() {
             let n = &v.normal;
-            let len = (n[0]*n[0] + n[1]*n[1] + n[2]*n[2]).sqrt();
-            assert!((len - 1.0).abs() < tol, "vertex {i} normal not unit: len={len}");
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!(
+                (len - 1.0).abs() < tol,
+                "vertex {i} normal not unit: len={len}"
+            );
         }
 
         // Collect face normals; after Ry(90) they must all be axis-aligned.
         let axis_normals: [[f32; 3]; 6] = [
-            [ 1., 0., 0.], [-1., 0., 0.],
-            [ 0., 1., 0.], [ 0.,-1., 0.],
-            [ 0., 0., 1.], [ 0., 0.,-1.],
+            [1., 0., 0.],
+            [-1., 0., 0.],
+            [0., 1., 0.],
+            [0., -1., 0.],
+            [0., 0., 1.],
+            [0., 0., -1.],
         ];
         for (i, v) in loaded.mesh_vertices.iter().enumerate() {
             let n = [v.normal[0], v.normal[1], v.normal[2]];
             let ok = axis_normals.iter().any(|&a| {
-                (n[0]-a[0]).abs() < tol && (n[1]-a[1]).abs() < tol && (n[2]-a[2]).abs() < tol
+                (n[0] - a[0]).abs() < tol && (n[1] - a[1]).abs() < tol && (n[2] - a[2]).abs() < tol
             });
-            assert!(ok, "vertex {i} normal {n:?} is not axis-aligned after Ry(90)");
+            assert!(
+                ok,
+                "vertex {i} normal {n:?} is not axis-aligned after Ry(90)"
+            );
         }
 
         // Original +X face (local normal [1,0,0]) should map to world [0,0,-1].
         // Find those 4 vertices: they should have z ≈ -1, x ≈ 0.
-        let minus_z_face: Vec<_> = loaded.mesh_vertices.iter()
+        let minus_z_face: Vec<_> = loaded
+            .mesh_vertices
+            .iter()
             .filter(|v| (v.normal[2] + 1.0).abs() < tol)
             .collect();
-        assert_eq!(minus_z_face.len(), 4, "rotated +X face should appear as -Z face");
+        assert_eq!(
+            minus_z_face.len(),
+            4,
+            "rotated +X face should appear as -Z face"
+        );
         for v in &minus_z_face {
-            assert!((v.position[0]).abs() < tol + 1.0 + tol, // x ∈ [-1, 1]
-                "rotated -Z face vertex has unexpected x={}", v.position[0]);
-            assert!((v.position[2] + 1.0).abs() < tol,
-                "rotated -Z face vertex z should be -1, got {}", v.position[2]);
+            assert!(
+                (v.position[0]).abs() < tol + 1.0 + tol, // x ∈ [-1, 1]
+                "rotated -Z face vertex has unexpected x={}",
+                v.position[0]
+            );
+            assert!(
+                (v.position[2] + 1.0).abs() < tol,
+                "rotated -Z face vertex z should be -1, got {}",
+                v.position[2]
+            );
         }
     }
 

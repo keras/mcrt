@@ -282,7 +282,9 @@ fn env_color(unit_dir: vec3<f32>) -> vec3<f32> {
     // Flip vertical: image row 0 is the zenith (v→1 → iy→0).
     let ix = clamp(i32(u * f32(dims.x)), 0, dims.x - 1);
     let iy = clamp(i32((1.0 - v) * f32(dims.y)), 0, dims.y - 1);
-    return textureLoad(env_map, vec2<i32>(ix, iy), 0).xyz;
+    // Clamp HDR values to [0, 1]: overexposed pixels (e.g. sun disk) become
+    // pure white rather than contributing unbounded radiance / fireflies.
+    return min(textureLoad(env_map, vec2<i32>(ix, iy), 0).xyz, vec3<f32>(1.0));
 }
 
 // ---- ray-sphere intersection ----------------------------------------------
@@ -990,7 +992,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 0 at u32::MAX (which would produce +Inf weight, corrupting pixels with NaN).
     let weight = 1.0 / f32(min(frame_count, MAX_FRAME_COUNT) + 1u);
     let prev   = textureLoad(accum_read, coord, 0).xyz;
-    let accum  = mix(prev, sample, weight);
+
+    // Sanitize: replace NaN or Inf in the sample before accumulating.
+    // NaN check: NaN != NaN. Inf check: abs() > a finite upper bound.
+    // Without this, a single NaN sample permanently corrupts the accumulator
+    // for that pixel (mix(prev, NaN, w) == NaN for all subsequent frames).
+    let safe = select(vec3<f32>(0.0), min(sample, vec3<f32>(1e10)), sample == sample);
+
+    // Also sanitize prev: if the accumulator already holds NaN (from a frame
+    // before this guard was added), recover immediately rather than waiting
+    // for a frame_count == 0 reset.
+    let safe_prev = select(vec3<f32>(0.0), prev, prev == prev);
+
+    let accum  = mix(safe_prev, safe, weight);
 
     // Store raw HDR radiance — tone-mapping is applied in the display pass.
     textureStore(accum_write, coord, vec4<f32>(accum, 1.0));

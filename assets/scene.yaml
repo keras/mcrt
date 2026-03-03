@@ -23,16 +23,6 @@ camera:
   vfov:      40.0
   aperture:  0.5
 
-# ---------------------------------------------------------------------------
-# Material palette  (dict: key = name, value = definition)
-# ---------------------------------------------------------------------------
-#   index 0 - ground (Lambertian grey + checker texture)
-#   index 1 - green  (Lambertian)
-#   index 2 - red    (Lambertian)
-#   index 3 - gold   (metal, fuzz 0.1)
-#   index 4 - glass  (dielectric, IOR 1.5)
-#   index 5 - bunny  (polished gold-white metal)
-#   index 6 - light  (emissive warm area light, Phase 13)
 
 materials:
   ground:
