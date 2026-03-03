@@ -109,8 +109,7 @@ fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, heigh
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    /// Eye position in world space.  `.w` carries the monotonic `frame_count`
-    /// (cast to `f32`) so the compute shader can seed a PRNG in Phase 5.
+    /// Eye position in world space.  `.w` is unused padding.
     origin: [f32; 4],
     /// Lower-left corner of the virtual screen in world space.  `.w` unused.
     lower_left: [f32; 4],
@@ -118,6 +117,11 @@ struct CameraUniform {
     horizontal: [f32; 4],
     /// Full vertical extent of the virtual screen (top − bottom).  `.w` unused.
     vertical: [f32; 4],
+    /// Monotonically increasing frame index.  Stored as `u32` (not `f32`) so it
+    /// remains exact beyond 2²⁴ frames (~77 h at 60 fps with f32 precision).
+    /// Read directly as `u32` in WGSL to seed the per-pixel PRNG.
+    frame_count: u32,
+    _pad: [u32; 3],
 }
 
 /// Compute the camera uniform for a pinhole camera.
@@ -157,6 +161,9 @@ fn compute_camera(width: u32, height: u32, look_from: Vec3, look_at: Vec3) -> Ca
         lower_left: lower_left.extend(0.0).to_array(),
         horizontal: horizontal.extend(0.0).to_array(),
         vertical: vertical.extend(0.0).to_array(),
+        // frame_count is set by the caller (render()) after camera construction.
+        frame_count: 0,
+        _pad: [0; 3],
     }
 }
 
@@ -588,9 +595,9 @@ impl GpuState {
         let angle = elapsed * 0.5; // radians / second
         let look_from = Vec3::new(angle.sin() * ORBIT_RADIUS, ORBIT_HEIGHT, angle.cos() * ORBIT_RADIUS);
         let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
-        // Pack the frame counter into the unused origin.w so the shader can seed
-        // a per-pixel PRNG without a separate uniform in Phase 5.
-        cam.origin[3] = self.frame_count as f32;
+        // Store the frame counter as a u32 directly in the struct — avoids the
+        // f32 precision loss that would occur beyond 2²⁴ frames (~77 h @ 60 fps).
+        cam.frame_count = self.frame_count;
         self.frame_count = self.frame_count.wrapping_add(1);
         self.queue.write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
 
@@ -613,9 +620,9 @@ impl GpuState {
             });
             cpass.set_pipeline(&self.compute_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_group, &[]);
-            // Ceil-divide so every pixel is covered even for non-multiple-of-8 sizes.
-            let wg_x = self.config.width.div_ceil(8);
-            let wg_y = self.config.height.div_ceil(8);
+            // Ceil-divide so every pixel is covered even for non-multiple-of-16 sizes.
+            let wg_x = self.config.width.div_ceil(16);
+            let wg_y = self.config.height.div_ceil(16);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 

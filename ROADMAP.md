@@ -69,11 +69,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Implement a simple unbiased path tracer with diffuse (Lambertian) materials.
 
-- [ ] Implement a PRNG in WGSL (PCG or similar) seeded per-pixel per-frame
-- [ ] On hit, scatter a new ray in a random direction on the hemisphere (cosine-weighted)
-- [ ] Recurse (loop) up to a max bounce depth (e.g., 8)
-- [ ] Accumulate color: multiply albedo at each bounce, add sky contribution on miss
-- [ ] Single sample per pixel per frame — no accumulation yet
+- [x] Implement a PRNG in WGSL (PCG or similar) seeded per-pixel per-frame
+- [x] On hit, scatter a new ray in a random direction on the hemisphere (cosine-weighted)
+- [x] Recurse (loop) up to a max bounce depth (e.g., 8)
+- [x] Accumulate color: multiply albedo at each bounce, add sky contribution on miss
+- [x] Single sample per pixel per frame — no accumulation yet
 
 **Output:** Noisy but correct diffuse global illumination (single sample).
 
