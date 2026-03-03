@@ -1,21 +1,19 @@
 use std::mem::size_of;
 use std::sync::Arc;
-use std::time::Instant;
 
 use bytemuck::{bytes_of, Zeroable};
 use glam::Vec3;
 use log::info;
 use wgpu::{
-    AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
-    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
-    Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
-    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
-    StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureViewDescriptor, TextureViewDimension, VertexState,
+    BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
+    BindingResource, BindingType, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
+    ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor, Extent3d, FragmentState,
+    InstanceDescriptor, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor,
+    PowerPreference, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
+    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StorageTextureAccess, StoreOp, SurfaceError, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
+    TextureViewDimension, VertexState,
 };
 use winit::{
     application::ApplicationHandler,
@@ -25,18 +23,21 @@ use winit::{
 };
 
 // ---------------------------------------------------------------------------
-// Helper: create the display texture and its default view
+// Helper: create an HDR accumulation texture and its default view
 // ---------------------------------------------------------------------------
 
-/// Creates an `Rgba8Unorm` texture that we write gradient pixels into from the
-/// CPU (Phase 2) and will later be replaced by compute-shader writes (Phase 3+).
-fn create_display_texture(
+/// Creates an `Rgba32Float` texture used for HDR progressive accumulation.
+///
+/// Both `TEXTURE_BINDING` (for `textureLoad` in compute & display shaders)
+/// and `STORAGE_BINDING` (for `textureStore` in the compute shader) are
+/// required.  Two of these textures ping-pong every frame.
+fn create_accum_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&TextureDescriptor {
-        label: Some("display texture"),
+        label: Some("accum texture"),
         size: Extent3d {
             width,
             height,
@@ -45,59 +46,14 @@ fn create_display_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8Unorm,
-        // TEXTURE_BINDING  — the fragment shader samples this texture.
-        // COPY_DST         — the CPU fills it via queue.write_texture() (Phase 2).
-        // STORAGE_BINDING  — the compute shader will write to it in Phase 3+.
-        usage: TextureUsages::TEXTURE_BINDING
-            | TextureUsages::COPY_DST
-            | TextureUsages::STORAGE_BINDING,
+        format: TextureFormat::Rgba32Float,
+        // TEXTURE_BINDING  — read by compute (accum_read) and display shaders.
+        // STORAGE_BINDING  — written by compute shader (accum_write).
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     });
-
     let view = texture.create_view(&TextureViewDescriptor::default());
     (texture, view)
-}
-
-// ---------------------------------------------------------------------------
-// Helper: fill the display texture with a CPU-generated gradient
-// ---------------------------------------------------------------------------
-
-/// Writes an RGBA gradient into `texture`:
-///   R = x / width,  G = y / height,  B = 0.5,  A = 255.
-/// Used in Phase 2 to verify the display pipeline end-to-end.
-/// Retained for debugging; superseded by the compute shader in Phase 3+.
-#[allow(dead_code)]
-fn fill_gradient(queue: &wgpu::Queue, texture: &wgpu::Texture, width: u32, height: u32) {
-    // Cast to usize before multiplying to avoid u32 overflow at large resolutions.
-    let mut pixels: Vec<u8> = Vec::with_capacity(width as usize * height as usize * 4);
-    for y in 0..height {
-        for x in 0..width {
-            let r = ((x as f32 / width as f32) * 255.0) as u8;
-            let g = ((y as f32 / height as f32) * 255.0) as u8;
-            pixels.extend_from_slice(&[r, g, 128, 255]);
-        }
-    }
-
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        &pixels,
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(4 * width),
-            rows_per_image: None, // only meaningful for 3D/array textures
-        },
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -175,9 +131,11 @@ fn compute_camera(width: u32, height: u32, look_from: Vec3, look_at: Vec3) -> Ca
 /// Must match `array<Sphere, 8>` in path_trace.wgsl.
 const MAX_SPHERES: usize = 8;
 
-/// Radius of the auto-orbit circle (world units).  Mirrored in `render()`.
+/// Radius of the auto-orbit circle (world units).  Restored in Phase 8.
+#[allow(dead_code)]
 const ORBIT_RADIUS: f32 = 3.5;
-/// Eye height above the world origin during the orbit.
+/// Eye height above the world origin during the orbit.  Restored in Phase 8.
+#[allow(dead_code)]
 const ORBIT_HEIGHT: f32 = 1.0;
 
 /// GPU-side sphere layout.  Packing centre + radius into one `[f32; 4]` ensures
@@ -248,28 +206,29 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     window: Arc<Window>,
 
-    // Phase 2: display texture pipeline
-    display_texture: wgpu::Texture,
-    display_texture_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
-    /// Kept so the bind group can be cheaply recreated on resize.
+    // Phase 6: ping-pong HDR accumulation textures
+    /// The two `Rgba32Float` textures that alternate as write/read targets each frame.
+    accum_textures: [wgpu::Texture; 2],
+    /// Default views into `accum_textures`.
+    accum_views: [wgpu::TextureView; 2],
+    /// Kept so bind groups can be cheaply recreated on resize.
     bind_group_layout: wgpu::BindGroupLayout,
-    bind_group: wgpu::BindGroup,
+    /// `display_bind_groups[i]` reads from `accum_views[i]` — swapped every frame.
+    display_bind_groups: [wgpu::BindGroup; 2],
     render_pipeline: wgpu::RenderPipeline,
 
     // Phase 3: compute (path tracer)
     camera_buffer: wgpu::Buffer,
     /// Kept for cheap bind-group recreation on resize.
     compute_bind_group_layout: wgpu::BindGroupLayout,
-    compute_bind_group: wgpu::BindGroup,
+    /// `compute_bind_groups[i]` writes to `accum_views[i]`, reads `accum_views[1-i]`.
+    compute_bind_groups: [wgpu::BindGroup; 2],
     compute_pipeline: wgpu::ComputePipeline,
 
     // Phase 4: sphere scene
     scene_buffer: wgpu::Buffer,
-    /// Wall-clock time at initialisation; used to drive the auto-orbit.
-    start_time: Instant,
-    /// Monotonically increasing frame index; packed into `camera.origin.w` so
-    /// the compute shader can seed a per-frame PRNG in Phase 5.
+    /// Monotonically increasing frame index; resets to 0 on resize so the
+    /// accumulation restarts from a clean state.
     frame_count: u32,
 }
 
@@ -309,59 +268,50 @@ impl GpuState {
         config.present_mode = wgpu::PresentMode::Fifo;
         surface.configure(&device, &config);
 
-        // ---- display texture -----------------------------------------------
-        let (display_texture, display_texture_view) =
-            create_display_texture(&device, config.width, config.height);
+        // ---- accumulation textures ----------------------------------------
+        // Two Rgba32Float textures ping-pong every frame: the compute shader
+        // writes to accum[f_idx] and reads from accum[1 - f_idx]; the display
+        // pass reads from accum[f_idx] for tone-mapping.
+        let (accum_tex0, accum_view0) =
+            create_accum_texture(&device, config.width, config.height);
+        let (accum_tex1, accum_view1) =
+            create_accum_texture(&device, config.width, config.height);
+        let accum_textures = [accum_tex0, accum_tex1];
+        let accum_views = [accum_view0, accum_view1];
 
-        // ---- sampler -------------------------------------------------------
-        let sampler = device.create_sampler(&SamplerDescriptor {
-            label: Some("display sampler"),
-            address_mode_u: AddressMode::ClampToEdge,
-            address_mode_v: AddressMode::ClampToEdge,
-            address_mode_w: AddressMode::ClampToEdge,
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
-            ..Default::default()
-        });
-
-        // ---- bind group layout --------------------------------------------
+        // ---- display bind group layout ------------------------------------
+        // Single entry: the Rgba32Float accumulation texture read via
+        // textureLoad (no sampler needed, avoids FLOAT32_FILTERABLE feature).
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("display bgl"),
-            entries: &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+                count: None,
+            }],
         });
 
-        // ---- bind group ----------------------------------------------------
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("display bg"),
-            layout: &bind_group_layout,
-            entries: &[
-                BindGroupEntry {
+        // ---- display bind groups ------------------------------------------
+        // display_bind_groups[i] reads accum_views[i].
+        let make_display_bg = |view: &wgpu::TextureView, label: &str| {
+            device.create_bind_group(&BindGroupDescriptor {
+                label: Some(label),
+                layout: &bind_group_layout,
+                entries: &[BindGroupEntry {
                     binding: 0,
-                    resource: BindingResource::TextureView(&display_texture_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
+                    resource: BindingResource::TextureView(view),
+                }],
+            })
+        };
+        let display_bind_groups = [
+            make_display_bg(&accum_views[0], "display bg 0"),
+            make_display_bg(&accum_views[1], "display bg 1"),
+        ];
 
         // ---- shader --------------------------------------------------------
         let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -434,13 +384,13 @@ impl GpuState {
             device.create_bind_group_layout(&BindGroupLayoutDescriptor {
                 label: Some("compute bgl"),
                 entries: &[
-                    // binding 0: write-only storage texture (the output image)
+                    // binding 0: write-only storage texture (accumulation write target)
                     BindGroupLayoutEntry {
                         binding: 0,
                         visibility: ShaderStages::COMPUTE,
                         ty: BindingType::StorageTexture {
                             access: StorageTextureAccess::WriteOnly,
-                            format: TextureFormat::Rgba8Unorm,
+                            format: TextureFormat::Rgba32Float,
                             view_dimension: TextureViewDimension::D2,
                         },
                         count: None,
@@ -471,28 +421,51 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // binding 3: previous frame's accumulation (read via textureLoad)
+                    BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: false },
+                            view_dimension: TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
-        // ---- compute bind group -------------------------------------------
-        let compute_bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute bg"),
-            layout: &compute_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::TextureView(&display_texture_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: scene_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        // ---- compute bind groups ------------------------------------------
+        // compute_bind_groups[i]: write to accum_views[i], read accum_views[1-i].
+        let make_compute_bg =
+            |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
+                device.create_bind_group(&BindGroupDescriptor {
+                    label: Some(label),
+                    layout: &compute_bind_group_layout,
+                    entries: &[
+                        BindGroupEntry {
+                            binding: 0,
+                            resource: BindingResource::TextureView(write_view),
+                        },
+                        BindGroupEntry {
+                            binding: 1,
+                            resource: camera_buffer.as_entire_binding(),
+                        },
+                        BindGroupEntry {
+                            binding: 2,
+                            resource: scene_buffer.as_entire_binding(),
+                        },
+                        BindGroupEntry {
+                            binding: 3,
+                            resource: BindingResource::TextureView(read_view),
+                        },
+                    ],
+                })
+            };
+        let compute_bind_groups = [
+            make_compute_bg(&accum_views[0], &accum_views[1], "compute bg 0"),
+            make_compute_bg(&accum_views[1], &accum_views[0], "compute bg 1"),
+        ];
 
         // ---- compute shader -----------------------------------------------
         let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -522,18 +495,16 @@ impl GpuState {
             queue,
             config,
             window,
-            display_texture,
-            display_texture_view,
-            sampler,
+            accum_textures,
+            accum_views,
             bind_group_layout,
-            bind_group,
+            display_bind_groups,
             render_pipeline,
             camera_buffer,
             compute_bind_group_layout,
-            compute_bind_group,
+            compute_bind_groups,
             compute_pipeline,
             scene_buffer,
-            start_time: Instant::now(),
             frame_count: 0,
         }
     }
@@ -547,60 +518,95 @@ impl GpuState {
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
 
-        // Recreate display texture at the new size.
-        let (tex, view) = create_display_texture(&self.device, new_width, new_height);
-        self.display_texture = tex;
-        self.display_texture_view = view;
+        // Recreate both accumulation textures at the new size.
+        let (tex0, view0) = create_accum_texture(&self.device, new_width, new_height);
+        let (tex1, view1) = create_accum_texture(&self.device, new_width, new_height);
+        self.accum_textures = [tex0, tex1];
+        self.accum_views = [view0, view1];
 
-        // Bind group must reference the new texture view.
-        self.bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("display bg"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                BindGroupEntry {
+        // Recreate display bind groups to reference the new views.
+        self.display_bind_groups = [
+            self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("display bg 0"),
+                layout: &self.bind_group_layout,
+                entries: &[BindGroupEntry {
                     binding: 0,
-                    resource: BindingResource::TextureView(&self.display_texture_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+                    resource: BindingResource::TextureView(&self.accum_views[0]),
+                }],
+            }),
+            self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("display bg 1"),
+                layout: &self.bind_group_layout,
+                entries: &[BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&self.accum_views[1]),
+                }],
+            }),
+        ];
 
-        // Compute bind group also references the (new) texture view.
-        self.compute_bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-            label: Some("compute bg"),
-            layout: &self.compute_bind_group_layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::TextureView(&self.display_texture_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: self.camera_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: self.scene_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        // Recreate compute bind groups to reference the new views.
+        self.compute_bind_groups = [
+            self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("compute bg 0"),
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&self.accum_views[0]),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: self.camera_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: self.scene_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::TextureView(&self.accum_views[1]),
+                    },
+                ],
+            }),
+            self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some("compute bg 1"),
+                layout: &self.compute_bind_group_layout,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&self.accum_views[1]),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: self.camera_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: self.scene_buffer.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::TextureView(&self.accum_views[0]),
+                    },
+                ],
+            }),
+        ];
+
+        // Reset accumulation so the new-size buffer starts clean.
+        self.frame_count = 0;
     }
 
     fn render(&mut self) -> Result<(), SurfaceError> {
-        // Orbit the camera around the scene based on elapsed wall-clock time.
-        let elapsed = self.start_time.elapsed().as_secs_f32();
-        let angle = elapsed * 0.5; // radians / second
-        let look_from = Vec3::new(
-            angle.sin() * ORBIT_RADIUS,
-            ORBIT_HEIGHT,
-            angle.cos() * ORBIT_RADIUS,
-        );
-        let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
-        // Store the frame counter as a u32 directly in the struct — avoids the
-        // f32 precision loss that would occur beyond 2²⁴ frames (~77 h @ 60 fps).
+        // Static camera for Phase 6 (orbit disabled so the image converges).
+        // Phase 8 will restore interactive controls.
+        let look_from = Vec3::new(0.0, 1.0, 3.5);
+        let mut cam =
+            compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
+
+        // Derive the ping-pong index *before* incrementing frame_count so the
+        // formula is a simple modulo with no subtraction — avoids any risk of
+        // u32 underflow and keeps the relationship obvious.
+        let f_idx = (self.frame_count % 2) as usize;
         cam.frame_count = self.frame_count;
         self.frame_count = self.frame_count.wrapping_add(1);
         self.queue
@@ -617,21 +623,21 @@ impl GpuState {
                 label: Some("frame encoder"),
             });
 
-        // ---- compute pass: path tracer writes into the display texture ----
+        // ---- compute pass: path tracer accumulates into accum[f_idx] ------
         {
             let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("path trace pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.compute_pipeline);
-            cpass.set_bind_group(0, &self.compute_bind_group, &[]);
+            cpass.set_bind_group(0, &self.compute_bind_groups[f_idx], &[]);
             // Ceil-divide so every pixel is covered even for non-multiple-of-16 sizes.
             let wg_x = self.config.width.div_ceil(16);
             let wg_y = self.config.height.div_ceil(16);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
-        // ---- render pass: blit the texture to the swap-chain surface -------
+        // ---- render pass: tone-map accum[f_idx] to the swap-chain surface --
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("display pass"),
@@ -651,7 +657,7 @@ impl GpuState {
             });
 
             pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(0, &self.display_bind_groups[f_idx], &[]);
             pass.draw(0..3, 0..1); // full-screen triangle — no vertex buffer
         }
 

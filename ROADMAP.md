@@ -83,11 +83,14 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Accumulate samples across frames for a converging image.
 
-- [ ] Add a second texture (accumulation buffer) that persists across frames
-- [ ] Maintain a frame counter uniform; blend new sample with running average
-  - `accumulated = (accumulated * (frame - 1) + new_sample) / frame`
-- [ ] Reset accumulation when camera moves or scene changes
-- [ ] Display the accumulated result via the render pass
+- [x] Add a second texture (accumulation buffer) that persists across frames
+      — two `Rgba32Float` textures ping-pong every frame (`TEXTURE_BINDING | STORAGE_BINDING`)
+- [x] Maintain a frame counter uniform; blend new sample with running average
+      — `mix(prev, sample, 1/(frame+1))`; cap at 65 535 frames to prevent `+Inf` weight
+- [x] Reset accumulation when camera moves or scene changes
+      — `frame_count = 0` in `resize()`; static camera for Phase 6 (orbit re-enabled in Phase 8)
+- [x] Display the accumulated result via the render pass
+      — `textureLoad` + Reinhard tone-map + γ 2.2 in `display.wgsl` (no sampler, no `FLOAT32_FILTERABLE` requirement)
 
 **Output:** Image that progressively converges to a clean render while the camera is still.
 

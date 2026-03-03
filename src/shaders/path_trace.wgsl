@@ -1,8 +1,8 @@
-// path_trace.wgsl — Phase 5: single-sample diffuse path tracing
+// path_trace.wgsl — Phase 6: progressive HDR accumulation
 //
-// Each invocation shoots one full path per pixel (up to MAX_BOUNCES bounces)
-// and writes the raw HDR sample directly to the output texture.  The result
-// is correct-but-noisy; Phase 6 adds temporal accumulation to converge it.
+// Each invocation shoots one diffuse path per pixel and blends the new sample
+// into a running per-pixel average stored in the Rgba32Float accumulation
+// texture.  The display pass tone-maps the average each frame.
 
 // ---- shared primitives ----------------------------------------------------
 
@@ -59,14 +59,19 @@ struct SceneData {
 
 // ---- bindings -------------------------------------------------------------
 
-/// Output image written each frame (single noisy sample until Phase 6).
-@group(0) @binding(0) var output: texture_storage_2d<rgba8unorm, write>;
+/// Accumulation write target: the compute shader writes the blended average here.
+/// Ping-pongs with accum_read every frame.
+@group(0) @binding(0) var accum_write: texture_storage_2d<rgba32float, write>;
 
-/// Camera uploaded every frame to drive the orbit animation.
+/// Camera uniform; updated every frame with the current frame index for PRNG.
 @group(0) @binding(1) var<uniform> camera: Camera;
 
-/// Static scene; updated when spheres are added/moved (Phase 6+).
+/// Scene: static sphere list.
 @group(0) @binding(2) var<uniform> scene: SceneData;
+
+/// Accumulation read source: the previous frame's running average.
+/// Ping-pongs with accum_write every frame.
+@group(0) @binding(3) var accum_read: texture_2d<f32>;
 
 // ---- PCG PRNG -------------------------------------------------------------
 //
@@ -235,24 +240,23 @@ fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
 
 @compute @workgroup_size(16, 16)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims  = textureDimensions(output);
+    let dims  = textureDimensions(accum_write);
     let coord = gid.xy;
 
-    // Discard out-of-bounds threads (non-multiple-of-8 resolutions).
+    // Discard out-of-bounds threads (non-multiple-of-16 resolutions).
     if coord.x >= dims.x || coord.y >= dims.y { return; }
 
     let frame_count = camera.frame_count;
 
-    // Seed the PRNG uniquely per pixel per frame.  Hashing each coordinate
-    // individually before XOR-ing avoids the linear correlation that a simple
-    // multiply-and-add formula would leave between nearby pixels.
-    // TODO(Phase 6): add a sample_index argument here when dispatching
-    // multiple samples per frame (e.g. ^ sample_idx * 31337u).
-    var rng = pcg_hash(pcg_hash(coord.x ^ (coord.y << 16u)) ^ (frame_count * 2654435761u));
+    // Seed the PRNG uniquely per pixel per frame.
+    // Use `coord.x + coord.y * dims.x` for the spatial component — this is a
+    // bijection over [0, width*height) that avoids the coord.y << 16 trick
+    // silently collapsing rows 0 and 65536 on 8K+ monitors.
+    var rng = pcg_hash(pcg_hash(coord.x + coord.y * dims.x) ^ (frame_count * 2654435761u));
+    // (2654435761 is the Knuth multiplicative hash constant, chosen so nearby
+    // frames produce maximally different seeds.)
 
-    // Sub-pixel jitter: random offset within the pixel for AA and to break up
-    // the structured pattern visible with a fixed half-pixel centre offset.
-    // Draws from the PRNG before bounce sampling so seed quality is maximised.
+    // Sub-pixel jitter for AA and better convergence of the running average.
     let u = (f32(coord.x) + rand_f32(&rng)) / f32(dims.x);
     let v = 1.0 - (f32(coord.y) + rand_f32(&rng)) / f32(dims.y);
 
@@ -263,10 +267,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         - camera.origin.xyz;
     let ray = Ray(camera.origin.xyz, normalize(raw_dir));
 
-    let color = path_color(ray, &rng);
+    let sample = path_color(ray, &rng);
 
-    // Write the raw sample directly to the output texture.
-    // TODO(Phase 6): replace this with an rgba32float accumulation texture
-    // and accumulate HDR; clamp/tone-map only in the display (blit) pass.
-    textureStore(output, coord, vec4<f32>(clamp(color, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0));
+    // Progressive accumulation — running average.
+    //   weight  = 1 / (frame_count + 1)
+    //   new_avg = mix(prev_avg, sample, weight)
+    // When frame_count = 0 (first frame or after a resize reset) weight = 1.0,
+    // so the previous texture value is discarded regardless of its contents.
+    //
+    // Cap at 65535 frames: prevents the denominator from wrapping to 0 at
+    // u32::MAX which would produce +Inf weight and corrupt all pixels with NaN.
+    let weight = 1.0 / f32(min(frame_count, 65535u) + 1u);
+    let prev   = textureLoad(accum_read, coord, 0).xyz;
+    let accum  = mix(prev, sample, weight);
+
+    // Store raw HDR radiance — tone-mapping is applied in the display pass.
+    textureStore(accum_write, coord, vec4<f32>(accum, 1.0));
 }
