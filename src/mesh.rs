@@ -301,7 +301,7 @@ pub fn triangle_aabb(verts: &[GpuVertex], tri: &GpuTriangle) -> Aabb {
 /// normals, so even a coarse mesh (e.g. 12 × 24) looks round under path tracing.
 ///
 /// Material index `mat_idx` is assigned to every triangle.
-#[allow(dead_code)] // used in tests and available as public API for future scenes
+#[cfg(test)]
 pub fn build_uv_sphere_mesh(
     center: [f32; 3],
     radius: f32,
@@ -381,7 +381,7 @@ pub fn build_uv_sphere_mesh(
 /// The torus lies in the XZ plane by default.
 ///
 /// Material index `mat_idx` is assigned to every triangle.
-#[allow(dead_code)] // used in tests and available as public API for future scenes
+#[cfg(test)]
 pub fn build_torus_mesh(
     center: [f32; 3],
     major_r: f32,
@@ -471,7 +471,6 @@ pub fn build_torus_mesh(
 /// When the OBJ supplies per-vertex normals they are used directly.  If a face
 /// vertex has no normal reference the face's geometric normal is computed and
 /// applied to all three of its vertices (flat shading for that triangle).
-#[allow(dead_code)] // retained as public API; called when an OBJ path is provided
 pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTriangle>), String> {
     let content =
         std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
@@ -646,13 +645,11 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
 // is not called in the current build path.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 #[inline]
 fn sub3(a: [f32; 4], b: [f32; 4]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
-#[allow(dead_code)]
 #[inline]
 fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [
@@ -662,7 +659,6 @@ fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-#[allow(dead_code)]
 #[inline]
 fn normalize3(v: [f32; 3]) -> [f32; 3] {
     let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();

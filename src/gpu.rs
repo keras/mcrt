@@ -442,7 +442,8 @@ impl GpuState {
         // and upload both the reordered sphere list and the flat node array as
         // storage buffers.  The loaded scene also carries the material table,
         // the mesh geometry, and optional camera settings.
-        let loaded = load_scene_from_yaml(&scene_path);
+        let loaded = load_scene_from_yaml(&scene_path)
+            .expect("failed to load initial scene");
         let bvh_result = build_bvh(&loaded.spheres);
 
         // wgpu requires every storage-buffer binding to be at least as large as
@@ -1176,7 +1177,13 @@ impl GpuState {
     /// user's viewpoint survives edits.
     fn reload_scene(&mut self) {
         let path = self.scene_path.clone();
-        let loaded = load_scene_from_yaml(&path);
+        let loaded = match load_scene_from_yaml(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("reload_scene: {e}");
+                return;
+            }
+        };
 
         let bvh_result = build_bvh(&loaded.spheres);
         let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {

@@ -234,12 +234,20 @@ pub fn load_env_map_data(scene_path: Option<&str>) -> Vec<f32> {
 pub fn load_all_textures() -> (Vec<Vec<u8>>, Vec<f32>) {
     let albedo_paths: &[Option<&str>] = &[
         None,                       // layer 0: always white (managed internally)
-        None,                       // layer 1: checker demo
+        None,                       // layer 1: built explicitly below
         Some("textures/earth.png"), // layer 2: optional earth texture
-        None,                       // layer 3: checker demo
+        None,                       // layer 3: checker fallback
     ];
 
-    let albedo_layers = build_albedo_layers(albedo_paths);
+    let mut albedo_layers = build_albedo_layers(albedo_paths);
+
+    // Layer 1: white/gray grid checker used by the ground sphere in scene.yaml.
+    // Overwrite the magenta-black "missing texture" fallback with a clean pattern.
+    albedo_layers[1] = build_checker_texture(
+        TEXTURE_SIZE,
+        [220, 220, 220, 255], // light gray
+        [50, 50, 50, 255],    // dark gray
+    );
 
     let env_map = try_load_hdr("textures/env.hdr").unwrap_or_else(build_gradient_env_map);
 

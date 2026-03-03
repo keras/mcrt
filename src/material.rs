@@ -3,6 +3,7 @@
 // All types are bytemuck-compatible (Pod + Zeroable) for direct GPU upload.
 // No wgpu imports live here, keeping the module unit-testable without a device.
 
+#[cfg(test)]
 use bytemuck::Zeroable;
 
 // ---------------------------------------------------------------------------
@@ -13,7 +14,7 @@ use bytemuck::Zeroable;
 ///
 /// **Must match** `MAX_MATERIALS` in `path_trace.wgsl`.  When this value
 /// changes, update the WGSL shader constant too.
-pub const MAX_MATERIALS: usize = 8;
+pub const MAX_MATERIALS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // GPU types
@@ -35,11 +36,11 @@ pub const MAX_MATERIALS: usize = 8;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterial {
     /// .x = material type (u32), .yzw = unused.
-    pub type_pad:    [u32; 4],
+    pub type_pad: [u32; 4],
     /// .xyz = albedo colour, .w = fuzz ∈ [0, 1].
     pub albedo_fuzz: [f32; 4],
     /// .x = index of refraction, .yzw = unused.
-    pub ior_pad:     [f32; 4],
+    pub ior_pad: [f32; 4],
 }
 
 /// Full material table uploaded to the GPU.
@@ -49,16 +50,16 @@ pub struct GpuMaterial {
 /// - `n_emissive` : number of emissive spheres in the companion `emissive_buffer`
 ///                  (Phase 13); `0` disables Next-Event Estimation in the shader.
 ///
-/// Size = 16 + [`MAX_MATERIALS`] × 48 = 400 bytes.
+/// Size = 16 + [`MAX_MATERIALS`] × 48 = 3088 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterialData {
-    pub mat_count:  u32,
+    pub mat_count: u32,
     /// Phase 13: number of emissive spheres in the companion emissive buffer.
     /// Must be kept in sync with `emissive_buffer` in `gpu.rs`.
     pub n_emissive: u32,
-    pub _pad:       [u32; 2],
-    pub materials:  [GpuMaterial; MAX_MATERIALS],
+    pub _pad: [u32; 2],
+    pub materials: [GpuMaterial; MAX_MATERIALS],
 }
 
 // ---------------------------------------------------------------------------
@@ -67,11 +68,11 @@ pub struct GpuMaterialData {
 
 /// **Must match** the `mat_type` values in `path_trace.wgsl`.
 pub const MAT_LAMBERTIAN: u32 = 0;
-pub const MAT_METAL:      u32 = 1;
+pub const MAT_METAL: u32 = 1;
 pub const MAT_DIELECTRIC: u32 = 2;
 /// Phase 13: emissive surface; `albedo_fuzz.xyz` = emission colour,
 /// `ior_pad.x` = emission strength multiplier.
-pub const MAT_EMISSIVE:   u32 = 3;
+pub const MAT_EMISSIVE: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Material builder
@@ -88,32 +89,32 @@ pub const MAT_EMISSIVE:   u32 = 3;
 ///
 /// Superseded for the main render path by [`crate::scene::load_scene_from_yaml`];
 /// retained for unit tests and as a reference implementation.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn build_materials() -> GpuMaterialData {
     let raw: &[GpuMaterial] = &[
         // 0: Lambertian grey — ground (checker texture, layer 1)
         GpuMaterial {
-            type_pad:    [MAT_LAMBERTIAN, 1, 0, 0], // type_pad[1]=1 → albedo layer 1
+            type_pad: [MAT_LAMBERTIAN, 1, 0, 0], // type_pad[1]=1 → albedo layer 1
             albedo_fuzz: [0.5, 0.5, 0.5, 0.0],
-            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+            ior_pad: [1.0, 0.0, 0.0, 0.0],
         },
         // 1: Lambertian red — centre sphere (no texture)
         GpuMaterial {
-            type_pad:    [MAT_LAMBERTIAN, 0, 0, 0],
+            type_pad: [MAT_LAMBERTIAN, 0, 0, 0],
             albedo_fuzz: [0.7, 0.3, 0.3, 0.0],
-            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+            ior_pad: [1.0, 0.0, 0.0, 0.0],
         },
         // 2: Metal gold, fuzz = 0.1 — left sphere
         GpuMaterial {
-            type_pad:    [MAT_METAL, 0, 0, 0],
+            type_pad: [MAT_METAL, 0, 0, 0],
             albedo_fuzz: [0.8, 0.6, 0.2, 0.1],
-            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+            ior_pad: [1.0, 0.0, 0.0, 0.0],
         },
         // 3: Dielectric glass, IOR = 1.5 — right sphere
         GpuMaterial {
-            type_pad:    [MAT_DIELECTRIC, 0, 0, 0],
+            type_pad: [MAT_DIELECTRIC, 0, 0, 0],
             albedo_fuzz: [1.0, 1.0, 1.0, 0.0],
-            ior_pad:     [1.5, 0.0, 0.0, 0.0],
+            ior_pad: [1.5, 0.0, 0.0, 0.0],
         },
     ];
 
@@ -146,7 +147,10 @@ mod tests {
     fn glass_ior_is_1_5() {
         let m = build_materials();
         let ior = m.materials[3].ior_pad[0];
-        assert!((ior - 1.5).abs() < 1e-6, "glass IOR should be 1.5, got {ior}");
+        assert!(
+            (ior - 1.5).abs() < 1e-6,
+            "glass IOR should be 1.5, got {ior}"
+        );
     }
 
     #[test]
@@ -158,7 +162,10 @@ mod tests {
     #[test]
     fn metal_fuzz_is_positive() {
         let m = build_materials();
-        assert!(m.materials[2].albedo_fuzz[3] > 0.0, "metal fuzz should be > 0");
+        assert!(
+            m.materials[2].albedo_fuzz[3] > 0.0,
+            "metal fuzz should be > 0"
+        );
     }
 
     #[test]

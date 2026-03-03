@@ -532,22 +532,65 @@ fn push_quad_face(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Scene loading errors
+// ---------------------------------------------------------------------------
+
+/// Errors that can occur when parsing a scene from YAML.
+#[derive(Debug)]
+pub enum SceneError {
+    /// File I/O failure (only returned by [`load_scene_from_yaml`]).
+    Io(std::io::Error),
+    /// YAML is syntactically or semantically invalid.
+    Parse(String),
+    /// An object references a material name not declared in `materials:`.
+    UnknownMaterial(String),
+    /// A mesh `.obj` file could not be loaded.
+    MeshLoad(String),
+    /// The scene declares more materials than the GPU buffer can hold.
+    TooManyMaterials { count: usize, max: usize },
+}
+
+impl std::fmt::Display for SceneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Parse(m) => write!(f, "parse error: {m}"),
+            Self::UnknownMaterial(n) => write!(f, "unknown material '{n}'"),
+            Self::MeshLoad(m) => write!(f, "mesh load error: {m}"),
+            Self::TooManyMaterials { count, max } => {
+                write!(f, "scene uses {count} materials but limit is {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SceneError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        if let Self::Io(e) = self {
+            Some(e)
+        } else {
+            None
+        }
+    }
+}
+
 /// Parse a scene from a YAML *string* and return data ready for GPU upload.
 ///
-/// `source` is only used in panic messages (e.g. the original file path, or
+/// `source` is only used in error messages (e.g. the original file path, or
 /// `"<inline>"` for tests).  This is the real implementation; the public
 /// [`load_scene_from_yaml`] is a thin wrapper that reads the file first.
-pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
+pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScene, SceneError> {
     use crate::material::{GpuMaterialData, MAX_MATERIALS};
     use bytemuck::Zeroable;
     use std::collections::HashMap;
 
-    let scene: SceneFile = serde_yaml::from_str(text)
-        .unwrap_or_else(|e| panic!("failed to parse scene file '{}': {}", source, e));
+    let scene: SceneFile = serde_yml::from_str(text)
+        .map_err(|e| SceneError::Parse(format!("failed to parse '{}': {}", source, e)))?;
 
     // Build the material palette from the top-level `materials:` dict.
-    // IndexMap preserves insertion order, so GPU indices are deterministic.
-    // Duplicate keys are rejected at parse time by serde_yaml.
+    // IndexMap preserves insertion order so GPU indices are deterministic.
+    // Duplicate keys are rejected at parse time by serde_yml.
     let mut name_to_idx: HashMap<String, u32> = HashMap::new();
     let mut gpu_mats = Vec::<crate::material::GpuMaterial>::new();
     for (name, desc) in &scene.materials {
@@ -563,7 +606,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             match $mat {
                 MaterialRef::Named(name) => *name_to_idx
                     .get(name.as_str())
-                    .unwrap_or_else(|| panic!("object references unknown material '{}'", name)),
+                    .ok_or_else(|| SceneError::UnknownMaterial(name.clone()))?,
                 MaterialRef::Inline(desc) => {
                     let idx = gpu_mats.len() as u32;
                     gpu_mats.push(material_desc_to_gpu(desc));
@@ -726,8 +769,9 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                 transform,
             } => {
                 let mat_idx = resolve_mat!(material);
-                let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx)
-                    .unwrap_or_else(|e| panic!("failed to load mesh '{}': {}", obj_path, e));
+                let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx).map_err(|e| {
+                    SceneError::MeshLoad(format!("failed to load mesh '{}': {}", obj_path, e))
+                })?;
 
                 // Apply the TRS transform (scale → rotate → translate) to every vertex.
                 let s = transform.scale_factor();
@@ -792,12 +836,12 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
     }
 
     // Pack into GpuMaterialData.
-    assert!(
-        gpu_mats.len() <= MAX_MATERIALS,
-        "scene uses {} materials but MAX_MATERIALS = {}",
-        gpu_mats.len(),
-        MAX_MATERIALS
-    );
+    if gpu_mats.len() > MAX_MATERIALS {
+        return Err(SceneError::TooManyMaterials {
+            count: gpu_mats.len(),
+            max: MAX_MATERIALS,
+        });
+    }
     let mut mat_data = GpuMaterialData::zeroed();
     mat_data.mat_count = gpu_mats.len() as u32;
     mat_data.materials[..gpu_mats.len()].copy_from_slice(&gpu_mats);
@@ -836,7 +880,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         }
     });
 
-    LoadedScene {
+    Ok(LoadedScene {
         spheres,
         materials: mat_data,
         mesh_vertices,
@@ -858,7 +902,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             let _ = palette_count; // suppress warning
             names
         },
-    }
+    })
 }
 
 /// Load a scene from a YAML file and return spheres and materials ready for
@@ -870,13 +914,17 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
 /// by name; objects may also define their material inline.  See
 /// `assets/scene.yaml` for a complete example.
 ///
-/// # Panics
-/// Panics if the file cannot be read, the YAML is malformed, an object
-/// references an unknown material name, or more than `MAX_MATERIALS` unique
-/// materials are used.
-pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read scene file '{}': {}", path, e));
+/// # Errors
+/// Returns [`SceneError`] if the file cannot be read, the YAML is malformed,
+/// an object references an unknown material name, or more than `MAX_MATERIALS`
+/// unique materials are used.
+pub fn load_scene_from_yaml(path: &str) -> Result<LoadedScene, SceneError> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        SceneError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read scene file '{}': {}", path, e),
+        ))
+    })?;
     load_scene_from_str(&text, path)
 }
 
@@ -891,7 +939,7 @@ pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
 /// - 1 — Lambertian red   (centre)
 /// - 2 — Metal gold, fuzz 0.1  (left)
 /// - 3 — Dielectric glass IOR 1.5 (right)
-#[allow(dead_code)] // retained as reference scene and for unit tests
+#[cfg(test)]
 pub fn build_scene() -> Vec<GpuSphere> {
     vec![
         // Ground plane represented as a large sphere.
@@ -932,7 +980,7 @@ pub fn build_scene() -> Vec<GpuSphere> {
 /// The equivalent data-driven scene is `assets/scene.yaml`, loaded by
 /// [`load_scene_from_yaml`].  This builder is retained for unit tests and as
 /// a reference implementation.
-#[allow(dead_code)] // superseded by load_scene_from_yaml + assets/scene.yaml; kept for tests
+#[cfg(test)]
 pub fn build_large_scene() -> Vec<GpuSphere> {
     let mut spheres = Vec::with_capacity(68);
 
@@ -1108,14 +1156,14 @@ objects:
 
     #[test]
     fn yaml_scene_sphere_count() {
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         // FIXTURE_SCENE has 5 sphere objects (4 non-emissive + 1 light).
         assert_eq!(loaded.spheres.len(), 5);
     }
 
     #[test]
     fn yaml_scene_sphere_centers_are_correct() {
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         assert_eq!(loaded.spheres[0].center_r, [0.0_f32, -100.0, 0.0, 100.0]);
         assert_eq!(loaded.spheres[1].center_r, [0.0_f32, 2.5, 0.0, 1.0]);
         assert_eq!(loaded.spheres[2].center_r, [-4.0_f32, 1.0, 0.0, 1.0]);
@@ -1124,7 +1172,7 @@ objects:
 
     #[test]
     fn yaml_scene_sphere_material_indices_in_range() {
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         let mat_count = loaded.materials.mat_count;
         for (i, s) in loaded.spheres.iter().enumerate() {
             assert!(
@@ -1139,7 +1187,7 @@ objects:
 
     #[test]
     fn yaml_scene_material_count() {
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         // FIXTURE_SCENE declares 6 named materials: ground, glass, metal, red, bunny, light.
         assert_eq!(loaded.materials.mat_count, 6);
     }
@@ -1158,7 +1206,7 @@ objects:
   - { type: sphere, center: [0.0, -100.0, 0.0], radius: 100.0, material: wall  }
   - { type: sphere, center: [-2.0,   4.0,  0.0], radius: 0.5,   material: light }
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         assert_eq!(
             loaded.emissive_spheres.len(),
             1,
@@ -1181,7 +1229,7 @@ materials:
 objects:
   - { type: sphere, center: [0, 0, 0], radius: 1, material: wall }
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         assert_eq!(
             loaded.emissive_spheres.len(),
             0,
@@ -1199,7 +1247,7 @@ materials:
 objects:
   - { type: sphere, center: [0, 5, 0], radius: 1.0, material: sun }
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         assert_eq!(loaded.materials.mat_count, 1);
         assert_eq!(
             loaded.materials.materials[0].type_pad[0],
@@ -1224,7 +1272,7 @@ objects:
     radius: 1
     material: { type: metal, albedo: [0.8, 0.6, 0.2], fuzz: 0.1 }
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         assert_eq!(
             loaded.materials.mat_count, 2,
             "expected 1 named + 1 inline = 2 materials, got {}",
@@ -1235,7 +1283,7 @@ objects:
     #[test]
     fn yaml_scene_has_mesh_geometry() {
         // FIXTURE_SCENE includes models/bunny.obj; verify non-trivial geometry.
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         assert!(
             loaded.mesh_vertices.len() > 100,
             "expected >100 mesh vertices (bunny), got {}",
@@ -1250,7 +1298,7 @@ objects:
 
     #[test]
     fn yaml_scene_camera_is_loaded() {
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         let cam = loaded.camera.expect("fixture must have a camera block");
         assert_eq!(cam.look_from, [4.0_f32, 3.0, 8.0]);
         assert_eq!(cam.look_at, [0.0_f32, 0.5, 0.0]);
@@ -1278,7 +1326,7 @@ objects:
     transform:
       translate: [0.0, 0.0, 0.0]
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         // 4 real vertices + 0 stub (mesh is non-empty)
         assert_eq!(
             loaded.mesh_vertices.len(),
@@ -1329,7 +1377,7 @@ objects:
     transform:
       translate: [0.0, 2.0, -5.0]
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         let mat_count = loaded.materials.mat_count;
         for tri in &loaded.mesh_triangles {
             // Mask off the backface-cull flag before comparing against mat_count.
@@ -1366,7 +1414,7 @@ objects:
     transform:
       translate: [0.0, 5.0, 0.0]
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         // First 2 triangles belong to the culled plane; next 2 to the double-sided one.
         for tri in &loaded.mesh_triangles[..2] {
             assert_ne!(
@@ -1400,7 +1448,7 @@ objects:
     transform:
       translate: [0.0, 0.5, 0.0]
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         assert_eq!(
             loaded.mesh_vertices.len(),
             24,
@@ -1435,7 +1483,7 @@ objects:
     half_extents: [1.0, 2.0, 3.0]
     material: m
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         let axis_normals: [[f32; 3]; 6] = [
             [1.0, 0.0, 0.0],
             [-1.0, 0.0, 0.0],
@@ -1471,7 +1519,7 @@ objects:
     material: m
 "#;
         // hx=1, hy=2, hz=3 → box is 2×4×6 in X×Y×Z.
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         let verts = &loaded.mesh_vertices;
 
         // For each face, collect the 4 vertices whose stored normal matches
@@ -1544,7 +1592,7 @@ objects:
     transform:
       rotate: [0, 90, 0]
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         let tol = 1e-5_f32;
 
         // After Ry(90°): local X -> world -Z, local Z -> world X.
@@ -1615,7 +1663,7 @@ camera:
 objects:
   - { type: sphere, center: [0, 0, 0], radius: 1, material: { type: lambertian } }
 "#;
-        let loaded = load_scene_from_str(yaml, "<inline>");
+        let loaded = load_scene_from_str(yaml, "<inline>").expect("scene parse error");
         let cam = loaded.camera.expect("inline yaml must have a camera block");
         assert!(
             (cam.focus_dist - 5.0).abs() < 1e-4,
@@ -1627,7 +1675,7 @@ objects:
     #[test]
     fn yaml_scene_mesh_material_index_in_range() {
         // Every triangle in the loaded mesh must reference a valid material slot.
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>").expect("scene parse error");
         let mat_count = loaded.materials.mat_count;
         for (i, tri) in loaded.mesh_triangles.iter().enumerate() {
             assert!(
