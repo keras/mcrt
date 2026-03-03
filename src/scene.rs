@@ -157,6 +157,7 @@ enum ObjectDesc {
     ///   material: gold
     ///   scale: 8.0
     ///   translate: [0.0, -0.267, 0.0]
+    ///   rotate: [0.0, 45.0, 0.0]   # optional XYZ Euler degrees
     /// ```
     Mesh {
         /// Path to a Wavefront OBJ file (relative to the working directory).
@@ -171,6 +172,12 @@ enum ObjectDesc {
         /// scaling.  Defaults to `[0, 0, 0]` (no translation).
         #[serde(default)]
         translate: Option<[f32; 3]>,
+        /// Optional Euler rotation angles in **degrees** applied in XYZ order
+        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
+        /// Rotation is applied around the mesh origin after scaling but before
+        /// translation.  Defaults to `[0, 0, 0]` (no rotation).
+        #[serde(default)]
+        rotate: Option<[f32; 3]>,
     },
     /// A finite rectangular plane tessellated into two triangles and added to
     /// the mesh buffer.  The normal determines which side is "front" (outward).
@@ -181,6 +188,7 @@ enum ObjectDesc {
     ///   normal: [0.0, 0.0,  1.0]
     ///   half_extents: [2.75, 2.75]
     ///   material: white
+    ///   rotate: [0.0, 15.0, 0.0]   # optional XYZ Euler degrees
     /// ```
     Plane {
         /// World-space centre of the rectangle.
@@ -193,6 +201,12 @@ enum ObjectDesc {
         half_extents: [f32; 2],
         /// Material reference: a name string or an inline definition.
         material: MaterialRef,
+        /// Optional Euler rotation angles in **degrees** applied in XYZ order
+        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
+        /// Rotates the plane normal (and the derived tangent frame) around the
+        /// plane centre.  Defaults to `[0, 0, 0]` (no rotation).
+        #[serde(default)]
+        rotate: Option<[f32; 3]>,
         /// When `true` rays hitting the back face (i.e. `dot(ray_dir, normal) > 0`)
         /// produce no intersection.  Useful for wall planes that will never be
         /// seen from behind, cutting the number of triangles the BVH has to test.
@@ -509,6 +523,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                 normal,
                 half_extents,
                 material,
+                rotate,
                 backface_culling,
             } => {
                 let base_idx = resolve_mat!(material);
@@ -523,9 +538,18 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                     base_idx
                 };
                 let [hw, hh] = *half_extents;
+                // Apply optional rotation to the plane normal.  The tangent
+                // axes are re-derived automatically inside push_quad_face via
+                // Gram–Schmidt, so rotating the normal is sufficient to orient
+                // the plane in any direction.
+                let eff_normal = if let Some([rx, ry, rz]) = *rotate {
+                    rot3(&euler_to_mat3(rx, ry, rz), *normal)
+                } else {
+                    *normal
+                };
                 push_quad_face(
                     *center,
-                    *normal,
+                    eff_normal,
                     hw,
                     hh,
                     mat_idx,
@@ -632,12 +656,13 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                 material,
                 scale,
                 translate,
+                rotate,
             } => {
                 let mat_idx = resolve_mat!(material);
                 let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx)
                     .unwrap_or_else(|e| panic!("failed to load mesh '{}': {}", obj_path, e));
 
-                // Apply optional uniform scale + translation to vertex positions.
+                // Apply optional uniform scale + rotation + translation to vertex positions.
                 let s = scale.unwrap_or(1.0);
                 // Negative scale would flip handedness without inverting stored normals,
                 // producing inside-out lighting.  Zero scale collapses geometry into a
@@ -648,13 +673,28 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                     obj_path
                 );
                 let t = translate.unwrap_or([0.0f32; 3]);
-                if s != 1.0 || t != [0.0f32; 3] {
+                // Build optional rotation matrix from Euler angles (degrees).
+                // Applied after scaling but before translation — i.e. the mesh
+                // rotates around its (scaled) local origin.
+                let rot = rotate.map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz));
+                if s != 1.0 || t != [0.0f32; 3] || rot.is_some() {
                     for v in &mut verts {
-                        v.position[0] = v.position[0] * s + t[0];
-                        v.position[1] = v.position[1] * s + t[1];
-                        v.position[2] = v.position[2] * s + t[2];
-                        // Normals are direction vectors; uniform scale preserves
-                        // their direction so no normal adjustment is needed.
+                        // Scale → rotate → translate position.
+                        let mut pos = [v.position[0] * s, v.position[1] * s, v.position[2] * s];
+                        if let Some(m) = &rot {
+                            pos = rot3(m, pos);
+                        }
+                        v.position[0] = pos[0] + t[0];
+                        v.position[1] = pos[1] + t[1];
+                        v.position[2] = pos[2] + t[2];
+                        // Rotate normals.  Uniform scale preserves direction;
+                        // translation does not affect direction vectors.
+                        if let Some(m) = &rot {
+                            let rn = rot3(m, [v.normal[0], v.normal[1], v.normal[2]]);
+                            v.normal[0] = rn[0];
+                            v.normal[1] = rn[1];
+                            v.normal[2] = rn[2];
+                        }
                     }
                 }
 

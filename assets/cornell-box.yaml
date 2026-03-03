@@ -1,22 +1,11 @@
-# assets/cornell-box.yaml — Traditional Cornell Box scene.
-#
-# Walls are finite rectangle planes (type: plane), each tessellated to two
-# triangles and added to the mesh BVH — exact geometry, no sphere approximation.
-#
-# Scene contents
-#   • Five wall planes   (floor, ceiling, back, left-red, right-green)
-#   • Emissive area-light sphere near the ceiling
-#       radius ≈ 0.41 ≈ 15 % of box width ÷ 2
-#   • White Lambertian box mesh  (models/box.obj, scaled × 1.4, left-back)
-#   • Glass dielectric sphere    (IOR 1.5, right-front)
-#   • Brushed-silver metal sphere (right-back)
+# Traditional Cornell Box scene.
 
 # ---------------------------------------------------------------------------
 # Camera — positioned outside the open front face, looking into the box
 # ---------------------------------------------------------------------------
 camera:
-  look_from: [0.0, 2.75,  8.0]
-  look_at:   [0.0, 2, 0]
+  look_from: [0.0, 4.75,  8.0]
+  look_at:   [0.0, 4, 0]
   vfov:      60.0
   aperture:  0
 
@@ -24,7 +13,6 @@ camera:
 # Material palette
 # ---------------------------------------------------------------------------
 materials:
-
   # --- walls ----------------------------------------------------------------
   white:
     type: lambertian
@@ -50,10 +38,10 @@ materials:
     type: dielectric
     ior: 1.5
 
-  silver:
+  metal:
     type: metal
-    albedo: [0.8, 0.8, 0.8]
-    fuzz: 0.05
+    albedo: [0.6, 0.6, 0.8]
+    fuzz: 0.5
 
 # ---------------------------------------------------------------------------
 # Objects
@@ -113,8 +101,16 @@ objects:
   - type: plane
     center: [0.0, 9.9, -2.75]
     normal: [0.0, -1.0, 0.0]
-    half_extents: [0.7, 0.7]
+    half_extents: [0.6, 0.6]
+    rotate: [0, 0, 90]
     material: ceiling_light
+
+  - type: plane
+    center: [0.1, 9.9, -2.75]
+    normal: [0.0, -1.0, 0.0]
+    half_extents: [0.7, 0.7]
+    rotate: [0, 0, 90]
+    material: white
 
   # ---- interior objects ----------------------------------------------------
 
@@ -139,8 +135,8 @@ objects:
     radius: 1.0
     material: glass
 
-  # Metal (silver) sphere — right-back quarter of the box, resting on the floor.
+  # Metal sphere
   - type: sphere
     center: [2.5, 1.5, -3]
     radius: 1.5
-    material: silver
+    material: metal

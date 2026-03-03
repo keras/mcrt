@@ -848,33 +848,33 @@ impl GpuState {
                 entries: &[
                     // 0: accum texture (HDR radiance, non-filterable Rgba32Float)
                     BindGroupLayoutEntry {
-                        binding:    0,
+                        binding: 0,
                         visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Texture {
-                            sample_type:    TextureSampleType::Float { filterable: false },
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: false },
                             view_dimension: TextureViewDimension::D2,
-                            multisampled:   false,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     // 1: G-buffer (normal + depth, non-filterable Rgba32Float)
                     BindGroupLayoutEntry {
-                        binding:    1,
+                        binding: 1,
                         visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Texture {
-                            sample_type:    TextureSampleType::Float { filterable: false },
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: false },
                             view_dimension: TextureViewDimension::D2,
-                            multisampled:   false,
+                            multisampled: false,
                         },
                         count: None,
                     },
                     // 2: denoised output (write-only storage texture)
                     BindGroupLayoutEntry {
-                        binding:    2,
+                        binding: 2,
                         visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::StorageTexture {
-                            access:         StorageTextureAccess::WriteOnly,
-                            format:         TextureFormat::Rgba32Float,
+                        ty: BindingType::StorageTexture {
+                            access: StorageTextureAccess::WriteOnly,
+                            format: TextureFormat::Rgba32Float,
                             view_dimension: TextureViewDimension::D2,
                         },
                         count: None,
@@ -1049,10 +1049,10 @@ impl GpuState {
             create_storage_texture(&self.device, new_width, new_height, "gbuffer");
         let (dn_tex, dn_view) =
             create_storage_texture(&self.device, new_width, new_height, "denoise output");
-        self._gbuffer_tex     = gb_tex;
-        self.gbuffer_view     = gb_view;
-        self._denoise_output_tex  = dn_tex;
-        self.denoise_output_view  = dn_view;
+        self._gbuffer_tex = gb_tex;
+        self.gbuffer_view = gb_view;
+        self._denoise_output_tex = dn_tex;
+        self.denoise_output_view = dn_view;
 
         self.rebuild_bind_groups();
         self.frame_count = 0;
