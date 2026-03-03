@@ -35,8 +35,9 @@ use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, c
 use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
 use crate::scene::{GpuSphere, load_scene_from_yaml};
-use crate::texture::
-    {ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures};
+use crate::texture::{
+    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures,
+};
 use notify::Watcher as _;
 
 // ---------------------------------------------------------------------------
@@ -535,14 +536,17 @@ impl GpuState {
         // Always non-empty: pad with a stub sphere far away so the shader
         // can unconditionally index the array (no out-of-bounds).
         let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-            vec![GpuSphere { center_r: [1.0e9, 1.0e9, 1.0e9, 0.0], mat_and_pad: [0; 4] }]
+            vec![GpuSphere {
+                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
+                mat_and_pad: [0; 4],
+            }]
         } else {
             loaded.emissive_spheres.clone()
         };
         let emissive_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("emissive sphere storage"),
+            label: Some("emissive sphere storage"),
             contents: bytemuck::cast_slice(&emissive_data),
-            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
         // ---- material buffer -----------------------------------------------
@@ -743,16 +747,16 @@ impl GpuState {
         // fall back to the built-in orbit-camera defaults.
         let camera = if let Some(ref c) = loaded.camera {
             let look_from = glam::Vec3::from(c.look_from);
-            let look_at   = glam::Vec3::from(c.look_at);
+            let look_at = glam::Vec3::from(c.look_at);
             let mut cs = CameraState::from_initial_position(look_from, look_at);
-            cs.vfov       = c.vfov;
-            cs.aperture   = c.aperture;
+            cs.vfov = c.vfov;
+            cs.aperture = c.aperture;
             cs.focus_dist = c.focus_dist;
             // Keep tgt_* in sync so the initial lerp is a no-op.
-            cs.tgt_yaw      = cs.yaw;
-            cs.tgt_pitch    = cs.pitch;
+            cs.tgt_yaw = cs.yaw;
+            cs.tgt_pitch = cs.pitch;
             cs.tgt_distance = cs.distance;
-            cs.tgt_look_at  = cs.look_at;
+            cs.tgt_look_at = cs.look_at;
             cs
         } else {
             CameraState::from_initial_position(INIT_LOOK_FROM, INIT_LOOK_AT)
@@ -782,7 +786,11 @@ impl GpuState {
                     None
                 }
             };
-        let scene_change_rx = if _scene_watcher.is_some() { Some(sc_rx) } else { None };
+        let scene_change_rx = if _scene_watcher.is_some() {
+            Some(sc_rx)
+        } else {
+            None
+        };
 
         // ---- build bind groups from the already-created resources ---------
         // Use a temporary partial struct so rebuild_bind_groups can be called
@@ -920,53 +928,63 @@ impl GpuState {
         let loaded = load_scene_from_yaml(&path);
 
         let bvh_result = build_bvh(&loaded.spheres);
-        self.sphere_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("sphere storage"),
+        self.sphere_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sphere storage"),
                 contents: bytemuck::cast_slice(&bvh_result.ordered_spheres),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
-        self.bvh_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("bvh node storage"),
+        self.bvh_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bvh node storage"),
                 contents: bytemuck::cast_slice(&bvh_result.nodes),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
 
         let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
-        self.vertex_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("mesh vertex storage"),
+        self.vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh vertex storage"),
                 contents: bytemuck::cast_slice(&mesh_result.vertices),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
-        self.triangle_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("mesh triangle storage"),
+        self.triangle_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh triangle storage"),
                 contents: bytemuck::cast_slice(&mesh_result.ordered_triangles),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
-        self.mesh_bvh_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("mesh bvh node storage"),
+        self.mesh_bvh_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mesh bvh node storage"),
                 contents: bytemuck::cast_slice(&mesh_result.nodes),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
 
         // Material buffer has a fixed GPU layout — just overwrite in place.
-        self.queue.write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
+        self.queue
+            .write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
 
         // Recreate emissive buffer (count may have changed after hot-reload).
         let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-            vec![GpuSphere { center_r: [1.0e9, 1.0e9, 1.0e9, 0.0], mat_and_pad: [0; 4] }]
+            vec![GpuSphere {
+                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
+                mat_and_pad: [0; 4],
+            }]
         } else {
             loaded.emissive_spheres.clone()
         };
-        self.emissive_buffer =
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label:    Some("emissive sphere storage"),
+        self.emissive_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("emissive sphere storage"),
                 contents: bytemuck::cast_slice(&emissive_data),
-                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
             });
 
         self.rebuild_bind_groups();
@@ -982,7 +1000,9 @@ impl GpuState {
         // so that the user's current viewpoint is preserved while editing the scene.
         // Camera changes (look_from / look_at / vfov / aperture) require a restart.
         if loaded.camera.is_some() {
-            info!("hot-reload: 'camera:' block changes require a restart to take effect (current viewpoint preserved)");
+            info!(
+                "hot-reload: 'camera:' block changes require a restart to take effect (current viewpoint preserved)"
+            );
         }
     }
 

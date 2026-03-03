@@ -57,12 +57,12 @@ enum MaterialKind {
 /// - `focus_dist` → distance between `look_from` and `look_at`
 #[derive(serde::Deserialize, Clone, Debug)]
 struct CameraDesc {
-    look_from:  [f32; 3],
-    look_at:    [f32; 3],
+    look_from: [f32; 3],
+    look_at: [f32; 3],
     #[serde(default)]
-    vfov:       Option<f32>,
+    vfov: Option<f32>,
     #[serde(default)]
-    aperture:   Option<f32>,
+    aperture: Option<f32>,
     #[serde(default)]
     focus_dist: Option<f32>,
 }
@@ -72,13 +72,13 @@ struct CameraDesc {
 #[derive(Clone, Debug)]
 pub struct SceneCameraSettings {
     /// Eye position in world space.
-    pub look_from:  [f32; 3],
+    pub look_from: [f32; 3],
     /// Point the camera looks toward.
-    pub look_at:    [f32; 3],
+    pub look_at: [f32; 3],
     /// Vertical field of view in degrees.
-    pub vfov:       f32,
+    pub vfov: f32,
     /// Lens aperture radius (0 = pinhole / no depth-of-field).
-    pub aperture:   f32,
+    pub aperture: f32,
     /// Distance to the focal plane.
     pub focus_dist: f32,
 }
@@ -230,26 +230,26 @@ fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
     let albedo = desc.albedo.unwrap_or([1.0, 1.0, 1.0]);
     match desc.kind {
         MaterialKind::Lambertian => crate::material::GpuMaterial {
-            type_pad:    [MAT_LAMBERTIAN, desc.texture_layer, 0, 0],
+            type_pad: [MAT_LAMBERTIAN, desc.texture_layer, 0, 0],
             albedo_fuzz: [albedo[0], albedo[1], albedo[2], 0.0],
-            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+            ior_pad: [1.0, 0.0, 0.0, 0.0],
         },
         MaterialKind::Metal => crate::material::GpuMaterial {
-            type_pad:    [MAT_METAL, desc.texture_layer, 0, 0],
+            type_pad: [MAT_METAL, desc.texture_layer, 0, 0],
             albedo_fuzz: [albedo[0], albedo[1], albedo[2], desc.fuzz.unwrap_or(0.0)],
-            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+            ior_pad: [1.0, 0.0, 0.0, 0.0],
         },
         MaterialKind::Dielectric => crate::material::GpuMaterial {
-            type_pad:    [MAT_DIELECTRIC, 0, 0, 0],
+            type_pad: [MAT_DIELECTRIC, 0, 0, 0],
             albedo_fuzz: [1.0, 1.0, 1.0, 0.0],
-            ior_pad:     [desc.ior.unwrap_or(1.5), 0.0, 0.0, 0.0],
+            ior_pad: [desc.ior.unwrap_or(1.5), 0.0, 0.0, 0.0],
         },
         // Emissive: albedo_fuzz.xyz = emission colour; ior_pad.x = strength.
         // These materials terminate paths and serve as area lights for NEE.
         MaterialKind::Emissive => crate::material::GpuMaterial {
-            type_pad:    [MAT_EMISSIVE, 0, 0, 0],
+            type_pad: [MAT_EMISSIVE, 0, 0, 0],
             albedo_fuzz: [albedo[0], albedo[1], albedo[2], 0.0],
-            ior_pad:     [desc.emission_strength.unwrap_or(1.0), 0.0, 0.0, 0.0],
+            ior_pad: [desc.emission_strength.unwrap_or(1.0), 0.0, 0.0, 0.0],
         },
     }
 }
@@ -297,20 +297,29 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
 
     // Process objects — spheres and mesh files — accumulating GPU data.
     let mut spheres: Vec<GpuSphere> = Vec::new();
-    let mut mesh_vertices:  Vec<crate::mesh::GpuVertex>   = Vec::new();
+    let mut mesh_vertices: Vec<crate::mesh::GpuVertex> = Vec::new();
     let mut mesh_triangles: Vec<crate::mesh::GpuTriangle> = Vec::new();
 
     for obj in &scene.objects {
         match obj {
-            ObjectDesc::Sphere { center, radius, material } => {
+            ObjectDesc::Sphere {
+                center,
+                radius,
+                material,
+            } => {
                 let mat_idx = resolve_mat!(material);
                 spheres.push(GpuSphere {
-                    center_r:    [center[0], center[1], center[2], *radius],
+                    center_r: [center[0], center[1], center[2], *radius],
                     mat_and_pad: [mat_idx, 0, 0, 0],
                 });
             }
 
-            ObjectDesc::Mesh { path: obj_path, material, scale, translate } => {
+            ObjectDesc::Mesh {
+                path: obj_path,
+                material,
+                scale,
+                translate,
+            } => {
                 let mat_idx = resolve_mat!(material);
                 let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx)
                     .unwrap_or_else(|e| panic!("failed to load mesh '{}': {}", obj_path, e));
@@ -320,7 +329,11 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                 // Negative scale would flip handedness without inverting stored normals,
                 // producing inside-out lighting.  Zero scale collapses geometry into a
                 // degenerate point.  Both are almost certainly unintentional.
-                assert!(s > 0.0, "mesh '{}' scale must be positive (got {s})", obj_path);
+                assert!(
+                    s > 0.0,
+                    "mesh '{}' scale must be positive (got {s})",
+                    obj_path
+                );
                 let t = translate.unwrap_or([0.0f32; 3]);
                 if s != 1.0 || t != [0.0f32; 3] {
                     for v in &mut verts {
@@ -357,12 +370,15 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
     if mesh_vertices.is_empty() {
         mesh_vertices.push(crate::mesh::GpuVertex {
             position: [1.0e9, 1.0e9, 1.0e9, 1.0],
-            normal:   [0.0, 1.0, 0.0, 0.0],
-            uv:       [0.0, 0.0, 0.0, 0.0],
+            normal: [0.0, 1.0, 0.0, 0.0],
+            uv: [0.0, 0.0, 0.0, 0.0],
         });
         // A degenerate triangle (single repeated vertex) that Möller–Trumbore
         // will always reject (det ≈ 0).
-        mesh_triangles.push(crate::mesh::GpuTriangle { v: [0, 0, 0], mat_idx: 0 });
+        mesh_triangles.push(crate::mesh::GpuTriangle {
+            v: [0, 0, 0],
+            mat_idx: 0,
+        });
     }
 
     // Pack into GpuMaterialData.
@@ -383,8 +399,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         .iter()
         .filter(|s| {
             let idx = s.mat_and_pad[0] as usize;
-            idx < gpu_mats.len()
-                && gpu_mats[idx].type_pad[0] == crate::material::MAT_EMISSIVE
+            idx < gpu_mats.len() && gpu_mats[idx].type_pad[0] == crate::material::MAT_EMISSIVE
         })
         .copied()
         .collect();
@@ -393,7 +408,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
     // Convert the optional camera block.
     let camera = scene.camera.as_ref().map(|c| {
         let look_from = c.look_from;
-        let look_at   = c.look_at;
+        let look_at = c.look_at;
         let dist = {
             let d = [
                 look_from[0] - look_at[0],
@@ -405,8 +420,8 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         SceneCameraSettings {
             look_from,
             look_at,
-            vfov:       c.vfov.unwrap_or(crate::camera::DEFAULT_VFOV),
-            aperture:   c.aperture.unwrap_or(0.0),
+            vfov: c.vfov.unwrap_or(crate::camera::DEFAULT_VFOV),
+            aperture: c.aperture.unwrap_or(0.0),
             focus_dist: c.focus_dist.unwrap_or(dist),
         }
     });
@@ -676,9 +691,9 @@ objects:
     fn yaml_scene_sphere_centers_are_correct() {
         let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
         assert_eq!(loaded.spheres[0].center_r, [0.0_f32, -100.0, 0.0, 100.0]);
-        assert_eq!(loaded.spheres[1].center_r, [0.0_f32,   2.5,  0.0, 1.0]);
-        assert_eq!(loaded.spheres[2].center_r, [-4.0_f32,  1.0,  0.0, 1.0]);
-        assert_eq!(loaded.spheres[3].center_r, [4.0_f32,   1.0,  0.0, 1.0]);
+        assert_eq!(loaded.spheres[1].center_r, [0.0_f32, 2.5, 0.0, 1.0]);
+        assert_eq!(loaded.spheres[2].center_r, [-4.0_f32, 1.0, 0.0, 1.0]);
+        assert_eq!(loaded.spheres[3].center_r, [4.0_f32, 1.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -689,7 +704,9 @@ objects:
             assert!(
                 s.mat_and_pad[0] < mat_count,
                 "sphere {} has material index {} but palette only has {} entries",
-                i, s.mat_and_pad[0], mat_count
+                i,
+                s.mat_and_pad[0],
+                mat_count
             );
         }
     }
@@ -705,16 +722,29 @@ objects:
 
     #[test]
     fn yaml_scene_emissive_sphere_tracked() {
-        // FIXTURE_SCENE has exactly one emissive sphere (the `light` material).
-        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        // Use a lightweight mesh-free inline YAML so this test has no
+        // dependency on models/bunny.obj (FIXTURE_SCENE includes a mesh).
+        let yaml = r#"
+materials:
+  wall:  { type: lambertian, albedo: [0.8, 0.8, 0.8] }
+  light: { type: emissive,   albedo: [1.0, 0.85, 0.7], emission_strength: 8.0 }
+objects:
+  - { type: sphere, center: [0.0, -100.0, 0.0], radius: 100.0, material: wall  }
+  - { type: sphere, center: [-2.0,   4.0,  0.0], radius: 0.5,   material: light }
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
         assert_eq!(
-            loaded.emissive_spheres.len(), 1,
+            loaded.emissive_spheres.len(),
+            1,
             "expected 1 emissive sphere, got {}",
             loaded.emissive_spheres.len()
         );
         assert_eq!(loaded.materials.n_emissive, 1);
-        // Verify the emissive sphere's position and radius match the fixture.
-        assert_eq!(loaded.emissive_spheres[0].center_r, [-2.0_f32, 4.0, 0.0, 0.5]);
+        // Verify the emissive sphere's position and radius.
+        assert_eq!(
+            loaded.emissive_spheres[0].center_r,
+            [-2.0_f32, 4.0, 0.0, 0.5]
+        );
     }
 
     #[test]
@@ -726,7 +756,11 @@ objects:
   - { type: sphere, center: [0, 0, 0], radius: 1, material: wall }
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
-        assert_eq!(loaded.emissive_spheres.len(), 0, "expected no emissive spheres");
+        assert_eq!(
+            loaded.emissive_spheres.len(),
+            0,
+            "expected no emissive spheres"
+        );
         assert_eq!(loaded.materials.n_emissive, 0);
     }
 
@@ -793,9 +827,13 @@ objects:
         let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
         let cam = loaded.camera.expect("fixture must have a camera block");
         assert_eq!(cam.look_from, [4.0_f32, 3.0, 8.0]);
-        assert_eq!(cam.look_at,   [0.0_f32, 0.5, 0.0]);
+        assert_eq!(cam.look_at, [0.0_f32, 0.5, 0.0]);
         assert!((cam.vfov - 40.0).abs() < 1e-4, "vfov should be 40°");
-        assert!((cam.aperture - 0.1).abs() < 1e-5, "expected aperture 0.1, got {}", cam.aperture);
+        assert!(
+            (cam.aperture - 0.1).abs() < 1e-5,
+            "expected aperture 0.1, got {}",
+            cam.aperture
+        );
     }
 
     #[test]
@@ -827,7 +865,9 @@ objects:
             assert!(
                 tri.mat_idx < mat_count,
                 "triangle {} has mat_idx {} but mat_count = {}",
-                i, tri.mat_idx, mat_count
+                i,
+                tri.mat_idx,
+                mat_count
             );
         }
     }

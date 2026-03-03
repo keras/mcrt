@@ -13,7 +13,7 @@
 //
 // Phase 11 additions (still present):
 //   - HitRecord gains a `uv: vec2<f32>` field populated by both
-//     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).  
+//     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
 //   - HitRecord gains a `uv: vec2<f32>` field populated by both
 //     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
 //   - Three new bindings: 9 (sampler), 10 (albedo texture_2d_array<f32>),
@@ -695,6 +695,17 @@ fn scatter(mat: Material, ray_in: Ray, hit: HitRecord,
     switch mat.type_pad.x {
         case 1u: { return scatter_metal(mat, ray_in, hit, rng); }
         case 2u: { return scatter_dielectric(mat, ray_in, hit, rng); }
+        case 3u: {
+            // Emissive surfaces do not scatter — path_color returns before
+            // scatter() is called for emissive hits.  This explicit case
+            // ensures that any future refactor cannot silently treat an
+            // emissive surface as Lambertian.
+            var r: ScatterResult;
+            r.absorbed    = true;
+            r.direction   = vec3<f32>(0.0);
+            r.attenuation = vec3<f32>(0.0);
+            return r;
+        }
         default: { return scatter_lambertian(mat, hit, rng); }
     }
 }
@@ -764,6 +775,12 @@ fn sphere_ray_entry(origin: vec3<f32>, dir: vec3<f32>,
 /// connects `origin` to the emissive sphere whose material index is `mat_idx`.
 /// Averages over all n_emissive spheres (we always pick one at random).
 /// Returns 0 if n_emissive == 0 or the target sphere subtends no solid angle.
+///
+/// LIMITATION: matches emissive spheres by material index only.  If more than
+/// one emissive sphere shares `mat_idx` the returned value sums all their
+/// contributions / n, overcounting relative to the true per-direction NEE PDF.
+/// Keep each emissive sphere on a distinct material index until sphere-identity
+/// tracking is added to HitRecord.
 fn nee_sphere_pdf(origin: vec3<f32>, mat_idx: u32) -> f32 {
     let n = materials.n_emissive;
     if n == 0u { return 0.0; }
