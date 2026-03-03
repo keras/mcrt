@@ -128,12 +128,12 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Accelerate ray-scene intersection for larger scenes.
 
-- [ ] Build a Bounding Volume Hierarchy (BVH) on the CPU using SAH (Surface Area Heuristic)
-- [ ] Flatten the BVH tree into a GPU-friendly array of nodes
+- [x] Build a Bounding Volume Hierarchy (BVH) on the CPU using SAH (Surface Area Heuristic)
+- [x] Flatten the BVH tree into a GPU-friendly array of nodes
   - Node struct: AABB min/max, left/right child or primitive range
-- [ ] Upload the flattened BVH + primitive list as storage buffers
-- [ ] Implement stackless or small-stack BVH traversal in WGSL
-- [ ] Ray-AABB intersection test (slab method)
+- [x] Upload the flattened BVH + primitive list as storage buffers
+- [x] Implement stackless or small-stack BVH traversal in WGSL
+- [x] Ray-AABB intersection test (slab method)
 
 **Output:** Scenes with hundreds of spheres at interactive rates.
 

@@ -44,13 +44,25 @@ pub struct GpuSphere {
 pub fn build_scene() -> Vec<GpuSphere> {
     vec![
         // Ground plane represented as a large sphere.
-        GpuSphere { center_r: [0.0, -100.5, 0.0, 100.0], mat_and_pad: [0, 0, 0, 0] },
+        GpuSphere {
+            center_r: [0.0, -100.5, 0.0, 100.0],
+            mat_and_pad: [0, 0, 0, 0],
+        },
         // Centre sphere.
-        GpuSphere { center_r: [0.0,   0.0, 0.0,   0.5], mat_and_pad: [1, 0, 0, 0] },
+        GpuSphere {
+            center_r: [0.0, 0.0, 0.0, 0.5],
+            mat_and_pad: [1, 0, 0, 0],
+        },
         // Left sphere.
-        GpuSphere { center_r: [-1.2,  0.0, 0.0,   0.5], mat_and_pad: [2, 0, 0, 0] },
+        GpuSphere {
+            center_r: [-1.2, 0.0, 0.0, 0.5],
+            mat_and_pad: [2, 0, 0, 0],
+        },
         // Right sphere.
-        GpuSphere { center_r: [ 1.2,  0.0, 0.0,   0.5], mat_and_pad: [3, 0, 0, 0] },
+        GpuSphere {
+            center_r: [1.2, 0.0, 0.0, 0.5],
+            mat_and_pad: [3, 0, 0, 0],
+        },
     ]
 }
 
@@ -70,14 +82,23 @@ pub fn build_large_scene() -> Vec<GpuSphere> {
 
     // Ground plane.
     spheres.push(GpuSphere {
-        center_r:    [0.0, -100.5, 0.0, 100.0],
+        center_r: [0.0, -100.5, 0.0, 100.0],
         mat_and_pad: [0, 0, 0, 0],
     });
 
     // Three large accent spheres (centre, left, right).
-    spheres.push(GpuSphere { center_r: [ 0.0, 1.0, 0.0, 1.0], mat_and_pad: [3, 0, 0, 0] }); // glass
-    spheres.push(GpuSphere { center_r: [-4.0, 1.0, 0.0, 1.0], mat_and_pad: [2, 0, 0, 0] }); // metal
-    spheres.push(GpuSphere { center_r: [ 4.0, 1.0, 0.0, 1.0], mat_and_pad: [1, 0, 0, 0] }); // red
+    spheres.push(GpuSphere {
+        center_r: [0.0, 1.0, 0.0, 1.0],
+        mat_and_pad: [3, 0, 0, 0],
+    }); // glass
+    spheres.push(GpuSphere {
+        center_r: [-4.0, 1.0, 0.0, 1.0],
+        mat_and_pad: [2, 0, 0, 0],
+    }); // metal
+    spheres.push(GpuSphere {
+        center_r: [4.0, 1.0, 0.0, 1.0],
+        mat_and_pad: [1, 0, 0, 0],
+    }); // red
 
     // 8 × 8 grid of small spheres scattered across the ground plane.
     for row in 0..8i32 {
@@ -88,7 +109,7 @@ pub fn build_large_scene() -> Vec<GpuSphere> {
             // the four material slots without requiring a PRNG.
             let mat = ((row * 3 + col) % 4).unsigned_abs();
             spheres.push(GpuSphere {
-                center_r:    [x, 0.0, z, 0.3],
+                center_r: [x, 0.0, z, 0.3],
                 mat_and_pad: [mat, 0, 0, 0],
             });
         }
@@ -123,7 +144,11 @@ mod tests {
         let mut indices: Vec<u32> = spheres.iter().map(|s| s.mat_and_pad[0]).collect();
         let before = indices.len();
         indices.dedup();
-        assert_eq!(indices.len(), before, "expected all material indices to be unique");
+        assert_eq!(
+            indices.len(),
+            before,
+            "expected all material indices to be unique"
+        );
     }
 
     #[test]
@@ -156,7 +181,11 @@ mod tests {
     #[test]
     fn large_scene_material_indices_valid() {
         for s in build_large_scene() {
-            assert!(s.mat_and_pad[0] < 4, "material index {} out of range", s.mat_and_pad[0]);
+            assert!(
+                s.mat_and_pad[0] < 4,
+                "material index {} out of range",
+                s.mat_and_pad[0]
+            );
         }
     }
 
@@ -168,7 +197,11 @@ mod tests {
             let idx = s.mat_and_pad[0] as usize;
             used[idx] = true;
         }
-        assert!(used.iter().all(|&u| u), "not all material slots are used: {:?}", used);
+        assert!(
+            used.iter().all(|&u| u),
+            "not all material slots are used: {:?}",
+            used
+        );
     }
 
     #[test]

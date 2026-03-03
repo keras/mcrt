@@ -9,12 +9,12 @@
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
 
+mod app;
+mod bvh;
 mod camera;
+mod gpu;
 mod material;
 mod scene;
-mod bvh;
-mod gpu;
-mod app;
 
 use winit::event_loop::EventLoop;
 
