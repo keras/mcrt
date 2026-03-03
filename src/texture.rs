@@ -119,8 +119,8 @@ pub fn build_albedo_layers(paths: &[Option<&str>]) -> Vec<Vec<u8>> {
 /// for `ENV_MAP_WIDTH × ENV_MAP_HEIGHT` pixels, or `None` on any error.
 ///
 /// The image is rescaled to `ENV_MAP_WIDTH × ENV_MAP_HEIGHT` if needed.
-/// The caller must enable the `hdr` feature of the `image` crate.
-#[allow(dead_code)]
+///
+/// **Requires** the `hdr` feature of the `image` crate (enabled in Cargo.toml).
 pub fn try_load_hdr(path: &str) -> Option<Vec<f32>> {
     let img = image::open(Path::new(path)).ok()?;
     let resized = img.resize_exact(
@@ -215,8 +215,7 @@ pub fn load_all_textures() -> (Vec<Vec<u8>>, Vec<f32>) {
 
     let albedo_layers = build_albedo_layers(albedo_paths);
 
-    let env_map = try_load_hdr("textures/env.hdr")
-        .unwrap_or_else(build_gradient_env_map);
+    let env_map = try_load_hdr("textures/env.hdr").unwrap_or_else(build_gradient_env_map);
 
     (albedo_layers, env_map)
 }
@@ -279,10 +278,7 @@ mod tests {
     #[test]
     fn env_map_correct_size() {
         let data = build_gradient_env_map();
-        assert_eq!(
-            data.len(),
-            (ENV_MAP_WIDTH * ENV_MAP_HEIGHT * 4) as usize
-        );
+        assert_eq!(data.len(), (ENV_MAP_WIDTH * ENV_MAP_HEIGHT * 4) as usize);
     }
 
     #[test]
@@ -313,5 +309,37 @@ mod tests {
             zenith_lum > nadir_lum,
             "zenith lum {zenith_lum:.3} should exceed nadir lum {nadir_lum:.3}"
         );
+    }
+
+    // M4: additional edge-case tests suggested by code review ----------------
+
+    #[test]
+    fn albedo_layer_0_is_white_even_with_path_given() {
+        // paths[0] = Some(...) must be ignored; layer 0 is always white.
+        let layers = build_albedo_layers(&[Some("this_path_does_not_exist.png"), None, None, None]);
+        assert!(
+            layers[0].iter().all(|&b| b == 255),
+            "layer 0 must be solid white regardless of the path provided for index 0"
+        );
+    }
+
+    #[test]
+    fn albedo_layers_with_short_paths_fills_remaining_as_checker() {
+        // When paths.len() < MAX_TEXTURES, remaining layers use the checker fallback.
+        let layers = build_albedo_layers(&[None]); // only 1 entry, rest implicit
+        assert_eq!(layers.len(), MAX_TEXTURES as usize);
+    }
+
+    #[test]
+    fn checker_texture_size_less_than_8_uses_single_pixel_tiles() {
+        // size=4 → tile = max(4/8, 1) = 1: every pixel alternates.
+        let a = [255u8, 0, 0, 255];
+        let b = [0u8, 0, 255, 255];
+        let data = build_checker_texture(4, a, b);
+        assert_eq!(data.len(), (4 * 4 * 4) as usize);
+        // Pixel (0,0): (0/1 + 0/1) % 2 = 0 → color_a
+        assert_eq!(&data[0..4], &a);
+        // Pixel (1,0): (1 + 0) % 2 = 1 → color_b
+        assert_eq!(&data[4..8], &b);
     }
 }

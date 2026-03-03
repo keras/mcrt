@@ -7,6 +7,9 @@
 // Phase 9 change: the fixed-size GpuSceneData uniform was replaced by a
 // dynamic Vec<GpuSphere> that is uploaded via a storage buffer.  This removes
 // the MAX_SPHERES cap and enables BVH-accelerated scenes with arbitrary counts.
+//
+// Phase 12 change: `load_scene_from_yaml` allows scenes to be described by a
+// plain YAML file (see assets/scene.yaml) instead of hard-coded Rust builders.
 
 // ---------------------------------------------------------------------------
 // GPU types
@@ -28,6 +31,52 @@ pub struct GpuSphere {
 // ---------------------------------------------------------------------------
 // Scene builders
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// YAML scene loader (Phase 12)
+// ---------------------------------------------------------------------------
+
+/// Per-sphere entry in the YAML scene file.
+#[derive(serde::Deserialize)]
+struct SphereDesc {
+    /// World-space centre as `[x, y, z]`.
+    center: [f32; 3],
+    /// Sphere radius (must be positive).
+    radius: f32,
+    /// Index into the material array built by [`crate::material::build_materials`].
+    material: u32,
+}
+
+/// Top-level structure of a YAML scene file.
+#[derive(serde::Deserialize)]
+struct SceneFile {
+    spheres: Vec<SphereDesc>,
+}
+
+/// Load a scene from a YAML file and return the corresponding `Vec<GpuSphere>`.
+///
+/// The YAML must contain a top-level `spheres` sequence; each element must
+/// provide `center`, `radius`, and `material` fields.  See `assets/scene.yaml`
+/// for a complete example.
+///
+/// # Panics
+/// Panics if the file cannot be read or the YAML is malformed.
+pub fn load_scene_from_yaml(path: &str) -> Vec<GpuSphere> {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read scene file '{}': {}", path, e));
+    let scene: SceneFile = serde_yaml::from_str(&text)
+        .unwrap_or_else(|e| panic!("failed to parse scene file '{}': {}", path, e));
+    scene
+        .spheres
+        .iter()
+        .map(|s| GpuSphere {
+            center_r: [s.center[0], s.center[1], s.center[2], s.radius],
+            mat_and_pad: [s.material, 0, 0, 0],
+        })
+        .collect()
+}
+
+
 
 /// Construct the original four-sphere demo scene.
 ///

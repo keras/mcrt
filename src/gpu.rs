@@ -16,13 +16,12 @@ use wgpu::{
     BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
     CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
     Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState,
-    RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
-    RequestAdapterOptions, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StorageTextureAccess, StoreOp, SurfaceError,
-    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
-    TextureViewDimension, VertexState,
+    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
+    SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
+    StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::{
     dpi::PhysicalPosition,
@@ -35,8 +34,10 @@ use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::{GpuMaterialData, build_materials};
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh, build_torus_mesh};
-use crate::scene::{GpuSphere, build_large_scene};
-use crate::texture::{load_all_textures, ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE};
+use crate::scene::{GpuSphere, load_scene_from_yaml};
+use crate::texture::{
+    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures,
+};
 
 // ---------------------------------------------------------------------------
 // Render / input constants
@@ -364,7 +365,7 @@ impl GpuState {
         // Build the BVH on the CPU from the large demo scene, then upload
         // both the reordered sphere list and the flat node array as storage
         // buffers.  Storage buffers accept dynamic sizes, removing MAX_SPHERES.
-        let bvh_result = build_bvh(&build_large_scene());
+        let bvh_result = build_bvh(&load_scene_from_yaml("assets/scene.yaml"));
 
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sphere storage"),
@@ -436,7 +437,7 @@ impl GpuState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
+            format: TextureFormat::Rgba8UnormSrgb,       // sRGB→linear decode on fetch
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -473,9 +474,7 @@ impl GpuState {
             ..Default::default()
         });
 
-        info!(
-            "Albedo texture array: {MAX_TEXTURES} layers @ {TEXTURE_SIZE}×{TEXTURE_SIZE}"
-        );
+        info!("Albedo texture array: {MAX_TEXTURES} layers @ {TEXTURE_SIZE}×{TEXTURE_SIZE}");
 
         // RGBA32 Float equirectangular environment map.
         let env_map_tex = device.create_texture(&TextureDescriptor {
@@ -520,8 +519,8 @@ impl GpuState {
         // Linear/clamp sampler for the albedo texture array.
         let tex_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("linear sampler"),
-            address_mode_u: AddressMode::ClampToEdge,
-            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_u: AddressMode::Repeat,       // wrap for sphere/mesh UV
+            address_mode_v: AddressMode::Repeat,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
             ..Default::default()

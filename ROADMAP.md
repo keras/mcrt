@@ -167,7 +167,23 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 ---
 
-## Phase 12: Emissive Materials & Light Sampling
+## Phase 12: Declarative Scene Definitions
+
+**Goal:** Replace hard-coded scene builders with data-driven YAML scene files.
+
+- [x] Define a human-readable YAML scene format (spheres with centre, radius, material)
+- [x] Add `serde` + `serde_yaml` dependencies
+- [x] Implement `load_scene_from_yaml` in `scene.rs` that parses the YAML and produces `Vec<GpuSphere>`
+- [x] Write the existing `build_large_scene` demo scene as `assets/scene.yaml`
+- [x] Load `assets/scene.yaml` in `gpu.rs` instead of calling `build_large_scene`
+- [ ] Extend the format to cover triangle meshes, camera, and material overrides
+- [ ] Hot-reload scene file on disk change without restarting the renderer
+
+**Output:** A running renderer whose scene is fully described by a plain YAML file that can be edited without recompiling.
+
+---
+
+## Phase 13: Emissive Materials & Light Sampling
 
 **Goal:** Support emissive surfaces and reduce noise with next-event estimation.
 
@@ -180,7 +196,7 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 ---
 
-## Phase 13: Denoising & Tone Mapping
+## Phase 14: Denoising & Tone Mapping
 
 **Goal:** Post-process the raw path-traced output for display quality.
 
@@ -193,7 +209,7 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 ---
 
-## Phase 14: UI & Scene Editing
+## Phase 15: UI & Scene Editing
 
 **Goal:** Add a GUI for tweaking scene and render parameters at runtime.
 

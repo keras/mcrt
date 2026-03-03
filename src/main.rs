@@ -3,7 +3,7 @@
 // The application is split into focused modules:
 //
 //   camera   — CameraUniform and compute_camera() (pure, testable, no wgpu)
-//   scene    — GpuSphere and build_scene / build_large_scene
+//   scene    — GpuSphere, build_scene, and load_scene_from_yaml (Phase 12)
 //   material — GpuMaterial / GpuMaterialData and build_materials()
 //   bvh      — GpuBvhNode and build_bvh() (Phase 9 SAH acceleration structure)
 //   mesh     — GpuVertex, GpuTriangle, build_mesh_bvh(), UV-sphere / OBJ loader

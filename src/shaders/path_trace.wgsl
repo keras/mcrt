@@ -1,6 +1,16 @@
-// path_trace.wgsl — Phase 10: Triangle mesh path tracer
+// path_trace.wgsl — Phase 11: Textures & environment maps
 //
-// Phase 10 changes over Phase 9:
+// Phase 11 additions over Phase 10:
+//   - HitRecord gains a `uv: vec2<f32>` field populated by both
+//     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
+//   - Three new bindings: 9 (sampler), 10 (albedo texture_2d_array<f32>),
+//     11 (HDR equirectangular env map as texture_2d<f32>).
+//   - scatter_lambertian and scatter_metal sample the albedo texture array
+//     using mat.type_pad[1] as the layer index (0 = white / no texture).
+//   - env_color() replaces the procedural sky_color() in path_color()
+//     for HDR environment lighting or a procedural fallback gradient.
+//
+// Phase 10 changes (still present):
 //   - A Vertex struct (position/normal/UV) and Triangle struct (v[3] + mat_idx)
 //     are added on bindings 6 and 7 respectively.
 //   - A second BVH (mesh_bvh_nodes, binding 8) is added for the triangle mesh.
@@ -225,14 +235,6 @@ fn pcg_hash(v: u32) -> u32 {
 fn rand_f32(rng: ptr<function, u32>) -> f32 {
     *rng = pcg_hash(*rng);
     return bitcast<f32>((*rng >> 9u) | 0x3f800000u) - 1.0;
-}
-
-// ---- sky gradient ---------------------------------------------------------
-
-/// Classic RTIOW sky: white at the horizon, sky-blue at the zenith.
-fn sky_color(unit_dir: vec3<f32>) -> vec3<f32> {
-    let t = 0.5 * (unit_dir.y + 1.0);
-    return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.5, 0.7, 1.0), t);
 }
 
 // ---- environment map lookup -----------------------------------------------
@@ -626,6 +628,8 @@ fn scatter_dielectric(mat: Material, ray_in: Ray, hit: HitRecord,
     var r: ScatterResult;
     r.absorbed    = false;
     r.attenuation = vec3<f32>(1.0); // glass transmits all wavelengths equally
+    // type_pad[1] (texture layer index) is intentionally not used for glass:
+    // real glass has no surface albedo colour — tinting is a separate feature.
 
     let ior = mat.ior_pad.x;
     // Air-to-glass (front face): η_ratio = 1/ior.
