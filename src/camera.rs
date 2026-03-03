@@ -36,20 +36,20 @@ pub const INIT_LOOK_AT: Vec3 = Vec3::ZERO;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
     /// Eye position in world space.  `.w` unused.
-    pub origin:      [f32; 4],
+    pub origin: [f32; 4],
     /// Lower-left corner of the virtual screen on the focus plane.  `.w` unused.
-    pub lower_left:  [f32; 4],
+    pub lower_left: [f32; 4],
     /// Full horizontal extent of the screen on the focus plane.  `.w` unused.
-    pub horizontal:  [f32; 4],
+    pub horizontal: [f32; 4],
     /// Full vertical extent of the screen on the focus plane.  `.w` unused.
-    pub vertical:    [f32; 4],
+    pub vertical: [f32; 4],
     /// Camera right-basis scaled by lens radius.  Zero for pinhole camera.
-    pub defocus_u:   [f32; 4],
+    pub defocus_u: [f32; 4],
     /// Camera up-basis scaled by lens radius.   Zero for pinhole camera.
-    pub defocus_v:   [f32; 4],
+    pub defocus_v: [f32; 4],
     /// Monotonically increasing frame index.  `u32` to stay exact beyond 2²⁴.
     pub frame_count: u32,
-    pub _pad:        [u32; 3],
+    pub _pad: [u32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -74,20 +74,20 @@ pub struct CameraUniform {
 /// the cross product zero. This function detects that case and falls back to
 /// a Z-up vector so the camera remains numerically stable (no NaN propagation).
 pub fn compute_camera(
-    width:      u32,
-    height:     u32,
-    look_from:  Vec3,
-    look_at:    Vec3,
-    vfov_deg:   f32,
-    aperture:   f32,
+    width: u32,
+    height: u32,
+    look_from: Vec3,
+    look_at: Vec3,
+    vfov_deg: f32,
+    aperture: f32,
     focus_dist: f32,
 ) -> CameraUniform {
-    let aspect          = width as f32 / height as f32;
-    let vup             = Vec3::new(0.0, 1.0, 0.0);
-    let vfov_rad        = vfov_deg.to_radians();
-    let h               = (vfov_rad * 0.5).tan();
+    let aspect = width as f32 / height as f32;
+    let vup = Vec3::new(0.0, 1.0, 0.0);
+    let vfov_rad = vfov_deg.to_radians();
+    let h = (vfov_rad * 0.5).tan();
     let viewport_height = 2.0 * h;
-    let viewport_width  = aspect * viewport_height;
+    let viewport_width = aspect * viewport_height;
 
     // Orthonormal camera basis (right-handed, Z points toward the viewer).
     let w = (look_from - look_at).normalize(); // backward
@@ -101,28 +101,28 @@ pub fn compute_camera(
     };
 
     let cam_u = vup_safe.cross(w).normalize(); // right
-    let cam_v = w.cross(cam_u);                // up (unit: w⊥cam_u, both unit)
+    let cam_v = w.cross(cam_u); // up (unit: w⊥cam_u, both unit)
 
     // Scale screen extents by focus_dist so the virtual screen sits exactly
     // on the plane of sharp focus.
-    let horizontal = focus_dist * viewport_width  * cam_u;
-    let vertical   = focus_dist * viewport_height * cam_v;
+    let horizontal = focus_dist * viewport_width * cam_u;
+    let vertical = focus_dist * viewport_height * cam_v;
     let lower_left = look_from - horizontal * 0.5 - vertical * 0.5 - focus_dist * w;
 
     // Lens disk basis vectors (zero for pinhole where aperture = 0).
     let lens_radius = aperture * 0.5;
-    let defocus_u   = cam_u * lens_radius;
-    let defocus_v   = cam_v * lens_radius;
+    let defocus_u = cam_u * lens_radius;
+    let defocus_v = cam_v * lens_radius;
 
     CameraUniform {
-        origin:      look_from.extend(0.0).to_array(),
-        lower_left:  lower_left.extend(0.0).to_array(),
-        horizontal:  horizontal.extend(0.0).to_array(),
-        vertical:    vertical.extend(0.0).to_array(),
-        defocus_u:   defocus_u.extend(0.0).to_array(),
-        defocus_v:   defocus_v.extend(0.0).to_array(),
+        origin: look_from.extend(0.0).to_array(),
+        lower_left: lower_left.extend(0.0).to_array(),
+        horizontal: horizontal.extend(0.0).to_array(),
+        vertical: vertical.extend(0.0).to_array(),
+        defocus_u: defocus_u.extend(0.0).to_array(),
+        defocus_v: defocus_v.extend(0.0).to_array(),
         frame_count: 0, // caller sets this before uploading
-        _pad:        [0; 3],
+        _pad: [0; 3],
     }
 }
 
@@ -138,7 +138,8 @@ mod tests {
     #[test]
     fn pinhole_has_no_defocus() {
         let cam = compute_camera(
-            800, 600,
+            800,
+            600,
             Vec3::new(0.0, 0.0, 3.0),
             Vec3::ZERO,
             60.0,
@@ -162,7 +163,15 @@ mod tests {
     /// frame_count is initialised to 0 by compute_camera (caller fills it in).
     #[test]
     fn frame_count_initialised_zero() {
-        let cam = compute_camera(800, 600, Vec3::new(0.0, 0.0, 3.0), Vec3::ZERO, 60.0, 0.0, 3.0);
+        let cam = compute_camera(
+            800,
+            600,
+            Vec3::new(0.0, 0.0, 3.0),
+            Vec3::ZERO,
+            60.0,
+            0.0,
+            3.0,
+        );
         assert_eq!(cam.frame_count, 0);
     }
 
@@ -171,15 +180,21 @@ mod tests {
     fn gimbal_lock_no_nan() {
         // eye directly above target → view direction is (0,1,0) = world-up
         let cam = compute_camera(
-            800, 600,
+            800,
+            600,
             Vec3::new(0.0, 5.0, 0.0),
             Vec3::ZERO,
-            60.0, 0.0, 5.0,
+            60.0,
+            0.0,
+            5.0,
         );
         let buf = [cam];
         let all_fields: &[f32] = bytemuck::cast_slice(&buf);
         for &v in all_fields {
-            assert!(!v.is_nan(), "NaN detected in camera uniform during gimbal-lock test");
+            assert!(
+                !v.is_nan(),
+                "NaN detected in camera uniform during gimbal-lock test"
+            );
         }
     }
 
@@ -187,15 +202,20 @@ mod tests {
     #[test]
     fn thin_lens_has_defocus() {
         let cam = compute_camera(
-            800, 600,
+            800,
+            600,
             Vec3::new(0.0, 0.0, 3.0),
             Vec3::ZERO,
             60.0,
             0.5, // aperture > 0
             3.0,
         );
-        let du_len = cam.defocus_u[0].hypot(cam.defocus_u[1]).hypot(cam.defocus_u[2]);
-        let dv_len = cam.defocus_v[0].hypot(cam.defocus_v[1]).hypot(cam.defocus_v[2]);
+        let du_len = cam.defocus_u[0]
+            .hypot(cam.defocus_u[1])
+            .hypot(cam.defocus_u[2]);
+        let dv_len = cam.defocus_v[0]
+            .hypot(cam.defocus_v[1])
+            .hypot(cam.defocus_v[2]);
         assert!(du_len > 1e-5, "defocus_u should be non-zero");
         assert!(dv_len > 1e-5, "defocus_v should be non-zero");
     }

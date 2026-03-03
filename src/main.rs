@@ -3,14 +3,16 @@
 // The application is split into focused modules:
 //
 //   camera   — CameraUniform and compute_camera() (pure, testable, no wgpu)
-//   scene    — GpuSphere / GpuSceneData and build_scene()
+//   scene    — GpuSphere and build_scene / build_large_scene
 //   material — GpuMaterial / GpuMaterialData and build_materials()
+//   bvh      — GpuBvhNode and build_bvh() (Phase 9 SAH acceleration structure)
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
 
 mod camera;
 mod material;
 mod scene;
+mod bvh;
 mod gpu;
 mod app;
 

@@ -1,18 +1,18 @@
-// path_trace.wgsl — Phase 8: interactive orbit camera + depth of field
+// path_trace.wgsl — Phase 9: BVH-accelerated path tracer
 //
-// Each invocation shoots one full path per pixel, dispatching to the correct
-// scatter function (Lambertian / metal / dielectric) based on the material
-// buffer, and accumulates the HDR result into the ping-pong texture pair.
-// Depth-of-field is implemented via the thin-lens model: rays originate from
-// a random point on the aperture disk and converge on the focus plane.
+// Phase 9 changes over Phase 8:
+//   - Scene spheres are now in a runtime-sized storage buffer (binding 2)
+//     instead of a fixed-capacity SceneData uniform.  This removes MAX_SPHERES.
+//   - A flat BVH node array is added on binding 5.  Each frame the compute
+//     kernel traverses the BVH to find intersections instead of a O(N) loop.
+//   - Ray-AABB slab test + iterative stack-based BVH traversal are implemented
+//     below.  The rest of the pipeline (camera, materials, accumulation) is
+//     unchanged from Phase 8.
 
 // ---- module-level constants -----------------------------------------------
 
 /// Full circle in radians (2π).  Used in spherical- and disk-sampling functions.
 const TAU: f32 = 6.283185307179586;
-
-/// Maximum sphere count; must match MAX_SPHERES in scene.rs.
-const MAX_SPHERES: u32 = 8u;
 
 /// Maximum material count; must match MAX_MATERIALS in material.rs.
 const MAX_MATERIALS: u32 = 8u;
@@ -76,22 +76,31 @@ struct Camera {
     _pad2: u32,
 }
 
-// ---- sphere scene buffer --------------------------------------------------
-// Each sphere packs centre + radius into one vec4 to keep the Rust-side layout
-// identical without any manual padding.
+// ---- sphere storage buffer -----------------------------------------------
+// Phase 9: the sphere list is a runtime-sized storage buffer, replacing the
+// fixed-capacity SceneData uniform.  Leaf BVH nodes index into this array.
 
 struct Sphere {
     center_r:    vec4<f32>,  // .xyz = centre, .w = radius
     mat_and_pad: vec4<u32>,  // .x = material index, .yzw = unused
 }
 
-// Fixed-capacity scene; must match MAX_SPHERES in scene.rs (and this file).
-struct SceneData {
-    sphere_count: u32,
-    _pad0: u32,
-    _pad1: u32,
-    _pad2: u32,
-    spheres: array<Sphere, MAX_SPHERES>,
+// ---- BVH node buffer ------------------------------------------------------
+// Flat BVH node layout (48 bytes, 3 × 16-byte chunks — vec4-aligned).
+// Must match GpuBvhNode in bvh.rs.
+//
+//   prim_count == 0  →  internal node
+//       left child  = this_index + 1      (pre-order invariant)
+//       right child = right_or_offset
+//   prim_count >  0  →  leaf node
+//       sphere range = spheres[right_or_offset .. right_or_offset + prim_count]
+struct BvhNode {
+    aabb_min:        vec4<f32>,  // .xyz = AABB minimum corner, .w = unused
+    aabb_max:        vec4<f32>,  // .xyz = AABB maximum corner, .w = unused
+    right_or_offset: u32,        // internal: right child index; leaf: sphere start
+    prim_count:      u32,        // 0 = internal node; > 0 = leaf (primitive count)
+    _pad0:           u32,
+    _pad1:           u32,
 }
 
 // ---- material buffer -----------------------------------------------------
@@ -128,8 +137,8 @@ struct MaterialData {
 /// Camera uniform; updated every frame with the current frame index for PRNG.
 @group(0) @binding(1) var<uniform> camera: Camera;
 
-/// Scene: static sphere list.
-@group(0) @binding(2) var<uniform> scene: SceneData;
+/// BVH-reordered sphere list.  Indexed by leaf-node primitive ranges.
+@group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
 
 /// Accumulation read source: the previous frame's running average.
 /// Ping-pongs with accum_write every frame.
@@ -137,6 +146,9 @@ struct MaterialData {
 
 /// Material descriptors for all spheres in the scene.
 @group(0) @binding(4) var<uniform> materials: MaterialData;
+
+/// Flat BVH node array.  Traversal always starts at index 0 (root).
+@group(0) @binding(5) var<storage, read> bvh_nodes: array<BvhNode>;
 
 // ---- PCG PRNG -------------------------------------------------------------
 //
@@ -207,26 +219,91 @@ fn ray_sphere_hit(r: Ray, sphere: Sphere, t_min: f32, t_max: f32) -> HitRecord {
     return hit;
 }
 
-// ---- scene traversal ------------------------------------------------------
+// ---- ray-AABB intersection (slab method) ----------------------------------
 
-/// Finds the closest sphere hit along ray `r` in (t_min, t_max).
+/// Test ray `r` against axis-aligned bounding box [bb_min, bb_max] within the
+/// open interval (t_min, t_max).  Uses branchless min/max per axis so there is
+/// no divergence for rays with negative direction components.
+///
+/// **NaN guard**: direction components with magnitude < 1e-7 are replaced by
+/// a large finite reciprocal (±1e30) so `0 * ∞ = NaN` cannot occur on slab
+/// boundaries.  This is the Kensler sign-safe variant.
+fn ray_aabb_hit(r: Ray, bb_min: vec3<f32>, bb_max: vec3<f32>, t_min: f32, t_max: f32) -> bool {
+    // Clamp near-zero direction components to avoid NaN when origin sits exactly
+    // on a slab boundary (0 * ±Inf = NaN in IEEE 754, GPU-undefined in WGSL).
+    let safe_d = select(r.dir, sign(r.dir + vec3(1e-30)) * vec3(1e-7), abs(r.dir) < vec3(1e-7));
+    let inv_d = 1.0 / safe_d;
+    let ta    = (bb_min - r.origin) * inv_d;
+    let tb    = (bb_max - r.origin) * inv_d;
+    // Narrow the interval [t0, t1] with each axis slab.
+    let t0 = max(t_min, max(min(ta.x, tb.x), max(min(ta.y, tb.y), min(ta.z, tb.z))));
+    let t1 = min(t_max, min(max(ta.x, tb.x), min(max(ta.y, tb.y), max(ta.z, tb.z))));
+    return t1 > t0;
+}
+
+// ---- BVH traversal --------------------------------------------------------
+
+/// Finds the closest sphere hit along ray `r` in (t_min, t_max) via BVH traversal.
+///
+/// Uses a fixed-size iterative stack (32 entries) to avoid recursion.
+/// The pre-order layout guarantees that the left child always immediately
+/// follows the parent: `left = node_idx + 1`.  The right child index is
+/// stored explicitly in `node.right_or_offset`.
+///
+/// Right is pushed before left so the left sub-tree is popped and processed
+/// first, matching both spatial proximity and memory locality.
 fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
     var best: HitRecord;
-    best.t = -1.0;
+    best.t     = -1.0;
     var closest = t_max;
 
-    // Cap to array size to guard against a corrupt sphere_count from the CPU.
-    let count = min(scene.sphere_count, MAX_SPHERES);
-    for (var i = 0u; i < count; i++) {
-        let hit = ray_sphere_hit(r, scene.spheres[i], t_min, closest);
-        // ray_sphere_hit returns t > t_min (1e-4) on a hit; the `> 0.0` check
-        // is equivalent here because t_min > 0.  (If t_min were ever negative,
-        // the check would need to be > t_min instead.)
-        if hit.t > 0.0 {
-            best    = hit;
-            closest = hit.t;
+    let node_count = i32(arrayLength(&bvh_nodes));
+    if node_count == 0 { return best; }
+
+    // Fixed traversal stack — large enough for trees with ≤ 512 leaf primitives.
+    var stack: array<u32, 32>;
+    var sp: i32 = 0;  // index of the top-of-stack element
+    stack[0] = 0u;    // push root (index 0)
+
+    while sp >= 0 {
+        let node_idx = stack[u32(sp)];
+        sp -= 1;
+
+        let node = bvh_nodes[node_idx];
+
+        // Reject immediately if this node's AABB is not hit.
+        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, closest) {
+            continue;
+        }
+
+        if node.prim_count > 0u {
+            // Leaf: test every primitive in the range.
+            let prim_end = node.right_or_offset + node.prim_count;
+            for (var i = node.right_or_offset; i < prim_end; i++) {
+                let hit = ray_sphere_hit(r, spheres[i], t_min, closest);
+                if hit.t > 0.0 {
+                    best    = hit;
+                    closest = hit.t;
+                }
+            }
+        } else {
+            // Internal node: push right child first, then left.
+            // Guard: stack capacity is 32 entries (indices 0..31).  For scenes with
+            // ≤ 512 primitives the SAH tree depth is ≤ 9, so sp never exceeds ~18
+            // during normal traversal.  The guard at sp < 30 ensures two safe pushes
+            // (sp would reach at most 31 = last valid index).  If sp ≥ 30 the subtree
+            // is silently skipped; this cannot happen for any scene registered in this
+            // application, but a future scene with ≥32 nesting levels would need a
+            // larger stack or an iterative builder.
+            if sp < 30 {
+                sp += 1;
+                stack[u32(sp)] = node.right_or_offset;  // right child
+                sp += 1;
+                stack[u32(sp)] = node_idx + 1u;          // left child (pre-order)
+            }
         }
     }
+
     return best;
 }
 

@@ -21,6 +21,7 @@ use wgpu::{
     TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
     VertexState,
 };
+use wgpu::util::DeviceExt;
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, MouseButton, MouseScrollDelta},
@@ -28,9 +29,10 @@ use winit::{
     window::Window,
 };
 
+use crate::bvh::{build_bvh, GpuBvhNode};
 use crate::camera::{compute_camera, CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM};
 use crate::material::{build_materials, GpuMaterialData};
-use crate::scene::{build_scene, GpuSceneData};
+use crate::scene::{build_large_scene, GpuSphere};
 
 // ---------------------------------------------------------------------------
 // Render / input constants
@@ -207,8 +209,11 @@ pub struct GpuState {
     compute_bind_group_layout:  wgpu::BindGroupLayout,
     compute_bind_groups:        [wgpu::BindGroup; 2],
     compute_pipeline:           wgpu::ComputePipeline,
-    scene_buffer:               wgpu::Buffer,
+    /// BVH-reordered sphere list (storage buffer, binding 2).
+    sphere_buffer:              wgpu::Buffer,
     material_buffer:            wgpu::Buffer,
+    /// Flat BVH node array (storage buffer, binding 5).
+    bvh_buffer:                 wgpu::Buffer,
 
     /// Monotonically increasing frame index; resets to 0 on camera move / resize.
     frame_count: u32,
@@ -328,15 +333,28 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
-        // ---- scene buffer --------------------------------------------------
-        let scene_data = build_scene();
-        let scene_buffer = device.create_buffer(&BufferDescriptor {
-            label:              Some("scene buffer"),
-            size:               size_of::<GpuSceneData>() as u64,
-            usage:              BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        // ---- sphere list + BVH --------------------------------------------
+        // Build the BVH on the CPU from the large demo scene, then upload
+        // both the reordered sphere list and the flat node array as storage
+        // buffers.  Storage buffers accept dynamic sizes, removing MAX_SPHERES.
+        let bvh_result = build_bvh(&build_large_scene());
+
+        let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("sphere storage"),
+            contents: bytemuck::cast_slice(&bvh_result.ordered_spheres),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
-        queue.write_buffer(&scene_buffer, 0, bytes_of(&scene_data));
+        let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("bvh node storage"),
+            contents: bytemuck::cast_slice(&bvh_result.nodes),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+
+        info!(
+            "BVH built: {} spheres → {} nodes",
+            bvh_result.ordered_spheres.len(),
+            bvh_result.nodes.len()
+        );
 
         // ---- material buffer -----------------------------------------------
         let material_data = build_materials();
@@ -377,15 +395,15 @@ impl GpuState {
                         },
                         count: None,
                     },
-                    // 2: sphere scene uniform
+                    // 2: sphere list storage buffer (BVH-reordered; runtime-sized array)
                     BindGroupLayoutEntry {
                         binding:    2,
                         visibility: ShaderStages::COMPUTE,
                         ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Uniform,
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
                             has_dynamic_offset: false,
                             min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuSceneData>() as u64
+                                size_of::<GpuSphere>() as u64
                             ),
                         },
                         count: None,
@@ -410,6 +428,19 @@ impl GpuState {
                             has_dynamic_offset: false,
                             min_binding_size:   wgpu::BufferSize::new(
                                 size_of::<GpuMaterialData>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
+                    // 5: BVH node array storage buffer (runtime-sized array)
+                    BindGroupLayoutEntry {
+                        binding:    5,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Buffer {
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   wgpu::BufferSize::new(
+                                size_of::<GpuBvhNode>() as u64
                             ),
                         },
                         count: None,
@@ -450,8 +481,9 @@ impl GpuState {
             &compute_bind_group_layout,
             &accum_views,
             &camera_buffer,
-            &scene_buffer,
+            &sphere_buffer,
             &material_buffer,
+            &bvh_buffer,
         );
 
         Self {
@@ -469,8 +501,9 @@ impl GpuState {
             compute_bind_group_layout,
             compute_bind_groups,
             compute_pipeline,
-            scene_buffer,
+            sphere_buffer,
             material_buffer,
+            bvh_buffer,
             frame_count: 0,
             camera,
             input: InputState::default(),
@@ -514,8 +547,9 @@ impl GpuState {
             &self.compute_bind_group_layout,
             &self.accum_views,
             &self.camera_buffer,
-            &self.scene_buffer,
+            &self.sphere_buffer,
             &self.material_buffer,
+            &self.bvh_buffer,
         );
     }
 
@@ -721,8 +755,9 @@ fn make_compute_bind_groups(
     layout:          &wgpu::BindGroupLayout,
     accum_views:     &[wgpu::TextureView; 2],
     camera_buffer:   &wgpu::Buffer,
-    scene_buffer:    &wgpu::Buffer,
+    sphere_buffer:   &wgpu::Buffer,
     material_buffer: &wgpu::Buffer,
+    bvh_buffer:      &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -731,9 +766,10 @@ fn make_compute_bind_groups(
             entries: &[
                 BindGroupEntry { binding: 0, resource: BindingResource::TextureView(write_view) },
                 BindGroupEntry { binding: 1, resource: camera_buffer.as_entire_binding() },
-                BindGroupEntry { binding: 2, resource: scene_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 2, resource: sphere_buffer.as_entire_binding() },
                 BindGroupEntry { binding: 3, resource: BindingResource::TextureView(read_view) },
                 BindGroupEntry { binding: 4, resource: material_buffer.as_entire_binding() },
+                BindGroupEntry { binding: 5, resource: bvh_buffer.as_entire_binding() },
             ],
         })
     };
