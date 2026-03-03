@@ -309,9 +309,13 @@ fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord 
     let n1 = vertices[tri.v.y].normal.xyz;
     let n2 = vertices[tri.v.z].normal.xyz;
     let w = 1.0 - u_bary - v_bary;
-    // normalize() guards against the near-degenerate case where two vertex
-    // normals nearly cancel (obtuse interpolation at a crease).
-    let interp_n = normalize(w * n0 + u_bary * n1 + v_bary * n2);
+    // normalize() is undefined in WGSL when the input has zero length.
+    // Guard: if the interpolated sum degenerates (e.g. opposing normals at a hard
+    // crease), fall back to vertex 0's normal.  This is safe because vertex 0 is
+    // always unit-length for all procedural meshes built in this application; an
+    // OBJ mesh with a zero-length stored normal is itself malformed.
+    let raw_n    = w * n0 + u_bary * n1 + v_bary * n2;
+    let interp_n = select(n0, normalize(raw_n), dot(raw_n, raw_n) > 1e-10);
 
     hit.t         = t;
     hit.point     = r.origin + t * r.dir;
@@ -346,66 +350,65 @@ fn ray_aabb_hit(r: Ray, bb_min: vec3<f32>, bb_max: vec3<f32>, t_min: f32, t_max:
 
 // ---- BVH traversal --------------------------------------------------------
 
-/// Finds the closest sphere hit along ray `r` in (t_min, t_max) via BVH traversal.
+/// `scene_hit` traverses both the sphere BVH (binding 5) and the mesh BVH
+/// (binding 8) and returns the closest hit across all primitives.  The two
+/// traversals share a running `closest` bound so each benefits from early-exit
+/// via the other's hits.
 ///
-/// Uses a fixed-size iterative stack (32 entries) to avoid recursion.
-/// The pre-order layout guarantees that the left child always immediately
-/// follows the parent: `left = node_idx + 1`.  The right child index is
-/// stored explicitly in `node.right_or_offset`.
-///
-/// Right is pushed before left so the left sub-tree is popped and processed
-/// first, matching both spatial proximity and memory locality.
+/// Neither traversal uses an early return — even an empty sphere BVH must not
+/// skip the mesh traversal (and vice versa), so both are always attempted.
 fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
     var best: HitRecord;
     best.t     = -1.0;
     var closest = t_max;
 
-    let node_count = i32(arrayLength(&bvh_nodes));
-    if node_count == 0 { return best; }
+    // ---- Sphere BVH traversal (Phase 9) -----------------------------------
+    // Guarded by arrayLength so a sphere-free scene still reaches the mesh pass.
+    if i32(arrayLength(&bvh_nodes)) > 0 {
+        // Fixed traversal stack — large enough for trees with ≤ 512 leaf primitives.
+        var stack: array<u32, 32>;
+        var sp: i32 = 0;  // index of the top-of-stack element
+        stack[0] = 0u;    // push root (index 0)
 
-    // Fixed traversal stack — large enough for trees with ≤ 512 leaf primitives.
-    var stack: array<u32, 32>;
-    var sp: i32 = 0;  // index of the top-of-stack element
-    stack[0] = 0u;    // push root (index 0)
+        while sp >= 0 {
+            let node_idx = stack[u32(sp)];
+            sp -= 1;
 
-    while sp >= 0 {
-        let node_idx = stack[u32(sp)];
-        sp -= 1;
+            let node = bvh_nodes[node_idx];
 
-        let node = bvh_nodes[node_idx];
+            // Reject immediately if this node's AABB is not hit.
+            if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, closest) {
+                continue;
+            }
 
-        // Reject immediately if this node's AABB is not hit.
-        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, closest) {
-            continue;
-        }
-
-        if node.prim_count > 0u {
-            // Leaf: test every primitive in the range.
-            let prim_end = node.right_or_offset + node.prim_count;
-            for (var i = node.right_or_offset; i < prim_end; i++) {
-                let hit = ray_sphere_hit(r, spheres[i], t_min, closest);
-                if hit.t > 0.0 {
-                    best    = hit;
-                    closest = hit.t;
+            if node.prim_count > 0u {
+                // Leaf: test every primitive in the range.
+                let prim_end = node.right_or_offset + node.prim_count;
+                for (var i = node.right_or_offset; i < prim_end; i++) {
+                    let hit = ray_sphere_hit(r, spheres[i], t_min, closest);
+                    if hit.t > 0.0 {
+                        best    = hit;
+                        closest = hit.t;
+                    }
+                }
+            } else {
+                // Internal node: push right child first, then left.
+                // Guard: stack capacity is 32 entries (indices 0..31).  For scenes with
+                // ≤ 512 primitives the SAH tree depth is ≤ 9, so sp never exceeds ~18
+                // during normal traversal.  The guard at sp < 30 ensures two safe pushes
+                // (sp would reach at most 31 = last valid index).  If sp ≥ 30 the subtree
+                // is silently skipped; this cannot happen for any scene registered in this
+                // application, but a future scene with ≥32 nesting levels would need a
+                // larger stack or an iterative builder.
+                if sp < 30 {
+                    sp += 1;
+                    stack[u32(sp)] = node.right_or_offset;  // right child
+                    sp += 1;
+                    stack[u32(sp)] = node_idx + 1u;          // left child (pre-order)
                 }
             }
-        } else {
-            // Internal node: push right child first, then left.
-            // Guard: stack capacity is 32 entries (indices 0..31).  For scenes with
-            // ≤ 512 primitives the SAH tree depth is ≤ 9, so sp never exceeds ~18
-            // during normal traversal.  The guard at sp < 30 ensures two safe pushes
-            // (sp would reach at most 31 = last valid index).  If sp ≥ 30 the subtree
-            // is silently skipped; this cannot happen for any scene registered in this
-            // application, but a future scene with ≥32 nesting levels would need a
-            // larger stack or an iterative builder.
-            if sp < 30 {
-                sp += 1;
-                stack[u32(sp)] = node.right_or_offset;  // right child
-                sp += 1;
-                stack[u32(sp)] = node_idx + 1u;          // left child (pre-order)
-            }
         }
-    }
+    } // end sphere BVH
 
     // ---- Mesh BVH traversal (Phase 10) ------------------------------------
     // Reuses `closest` already narrowed by any sphere hit above, so the mesh

@@ -24,9 +24,10 @@ use bytemuck::Zeroable;
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuVertex {
-    /// World-space position.  `.w` is unused padding (always 1.0 by convention).
+    /// World-space position.  `.w` is kept at `1.0` by convention (homogeneous
+    /// coordinate), but the shader reads only `.xyz`; `.w` is unused padding.
     pub position: [f32; 4],
-    /// Vertex normal (unit length).  `.w` is unused padding.
+    /// Vertex normal (unit length).  `.w` is unused padding (always 0.0).
     pub normal: [f32; 4],
     /// Texture coordinates.  `.xy` = UV, `.zw` = unused padding.
     pub uv: [f32; 4],
@@ -86,6 +87,14 @@ pub fn build_mesh_bvh(verts: &[GpuVertex], tris: &[GpuTriangle]) -> MeshBvhResul
             vertices: verts.to_vec(),
         };
     }
+
+    // Catch construction bugs early: every index must be in-bounds for `verts`.
+    debug_assert!(
+        tris.iter()
+            .all(|t| t.v.iter().all(|&i| (i as usize) < verts.len())),
+        "build_mesh_bvh: triangle vertex index out of bounds (verts.len()={})",
+        verts.len()
+    );
 
     let mut prim_infos: Vec<TriPrimInfo> = tris
         .iter()
@@ -510,27 +519,39 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                         .and_then(|s| resolve(s, normals.len()))
                         .unwrap_or(u32::MAX);
 
-                    let key = (pi, ti, ni);
-                    let vert_idx = *vert_cache.entry(key).or_insert_with(|| {
-                        let pos    = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
-                        let normal = if ni != u32::MAX {
-                            normals.get(ni as usize).copied().unwrap_or([0.0, 1.0, 0.0])
-                        } else {
-                            [0.0, 1.0, 0.0] // placeholder; patched below if geometry normal needed
-                        };
-                        let uv = if ti != u32::MAX {
-                            uvs.get(ti as usize).copied().unwrap_or([0.0; 2])
-                        } else {
-                            [0.0; 2]
-                        };
+                    // Vertices that lack an explicit normal reference (ni == u32::MAX)
+                    // are NOT deduplicated across faces: different faces sharing the
+                    // same position+UV but with no stored normal need independent
+                    // GpuVertex entries so that each face's geometric normal can be
+                    // patched without overwriting another face's result.
+                    let vert_idx = if ni != u32::MAX {
+                        let key = (pi, ti, ni);
+                        *vert_cache.entry(key).or_insert_with(|| {
+                            let pos    = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
+                            let normal = normals.get(ni as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
+                            let uv     = if ti != u32::MAX { uvs.get(ti as usize).copied().unwrap_or([0.0; 2]) } else { [0.0; 2] };
+                            let idx    = vertices.len() as u32;
+                            vertices.push(GpuVertex {
+                                position: [pos[0], pos[1], pos[2], 1.0],
+                                normal:   [normal[0], normal[1], normal[2], 0.0],
+                                uv:       [uv[0], uv[1], 0.0, 0.0],
+                            });
+                            idx
+                        })
+                    } else {
+                        // No explicit normal: always create a fresh vertex entry.
+                        // The geometric normal will be patched below after all three
+                        // vertex indices for this triangle are known.
+                        let pos = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
+                        let uv  = if ti != u32::MAX { uvs.get(ti as usize).copied().unwrap_or([0.0; 2]) } else { [0.0; 2] };
                         let idx = vertices.len() as u32;
                         vertices.push(GpuVertex {
                             position: [pos[0], pos[1], pos[2], 1.0],
-                            normal:   [normal[0], normal[1], normal[2], 0.0],
+                            normal:   [0.0, 1.0, 0.0, 0.0], // placeholder; patched below
                             uv:       [uv[0], uv[1], 0.0, 0.0],
                         });
                         idx
-                    });
+                    };
                     face_verts.push(vert_idx);
                 }
 
