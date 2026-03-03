@@ -291,6 +291,7 @@ pub fn triangle_aabb(verts: &[GpuVertex], tri: &GpuTriangle) -> Aabb {
 /// normals, so even a coarse mesh (e.g. 12 × 24) looks round under path tracing.
 ///
 /// Material index `mat_idx` is assigned to every triangle.
+#[allow(dead_code)] // used in tests and available as public API for future scenes
 pub fn build_uv_sphere_mesh(
     center:  [f32; 3],
     radius:  f32,
@@ -364,6 +365,7 @@ pub fn build_uv_sphere_mesh(
 /// The torus lies in the XZ plane by default.
 ///
 /// Material index `mat_idx` is assigned to every triangle.
+#[allow(dead_code)] // used in tests and available as public API for future scenes
 pub fn build_torus_mesh(
     center:    [f32; 3],
     major_r:   f32,

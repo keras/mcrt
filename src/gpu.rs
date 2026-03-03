@@ -33,11 +33,11 @@ use winit::{
 use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
-use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh, build_torus_mesh};
-use crate::scene::{GpuSphere, LoadedScene, load_scene_from_yaml};
-use crate::texture::{
-    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures,
-};
+use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
+use crate::scene::{GpuSphere, load_scene_from_yaml};
+use crate::texture::
+    {ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures};
+use notify::Watcher as _;
 
 // ---------------------------------------------------------------------------
 // Render / input constants
@@ -251,6 +251,15 @@ pub struct GpuState {
     // Sub-structs for non-GPU state.
     camera: CameraState,
     input: InputState,
+    // ---- Phase 12: hot-reload ------------------------------------------
+    /// Path of the currently loaded scene file (for hot-reload).
+    scene_path: String,
+    /// File-system watcher that fires when the scene file changes on disk.
+    /// Owned here only to keep the OS registration alive; never read after
+    /// construction.
+    _scene_watcher: Option<notify::RecommendedWatcher>,
+    /// Receives events from `_scene_watcher`; polled with `try_recv` each frame.
+    scene_change_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
 }
 
 impl GpuState {
@@ -364,13 +373,10 @@ impl GpuState {
         // ---- sphere list + BVH --------------------------------------------
         // Load the declarative scene from YAML, then build the BVH on the CPU
         // and upload both the reordered sphere list and the flat node array as
-        // storage buffers.  The loaded scene also carries the material table
-        // that replaces the hard-coded build_materials() call below.
-        let LoadedScene {
-            spheres: loaded_spheres,
-            materials: loaded_materials,
-        } = load_scene_from_yaml("assets/scene.yaml");
-        let bvh_result = build_bvh(&loaded_spheres);
+        // storage buffers.  The loaded scene also carries the material table,
+        // the mesh geometry, and optional camera settings.
+        let loaded = load_scene_from_yaml("assets/scene.yaml");
+        let bvh_result = build_bvh(&loaded.spheres);
 
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sphere storage"),
@@ -389,37 +395,11 @@ impl GpuState {
             bvh_result.nodes.len()
         );
 
-        // ---- triangle mesh (Phase 10) -------------------------------------
-        // Build a torus mesh and a UV-sphere mesh, merge them, then build a
-        // BVH over the combined triangle set.  Both shapes are placed near the
-        // existing sphere grid so the whole scene is visible from the default
-        // camera position.
-        //
-        // Torus  : centre (-3, 0.7, 0), major_r=0.9, minor_r=0.3, metal (mat 2)
-        // UV-sphere: centre (3.5, 0, 0), radius=0.7, glass (mat 3)
-        let (torus_verts, torus_tris) = build_torus_mesh([-3.0, 0.7, 0.0], 0.9, 0.3, 32, 16, 2);
-        let sphere_mesh_mat = 1u32; // red Lambertian
-        let (sphere_verts, sphere_tris_raw) =
-            crate::mesh::build_uv_sphere_mesh([3.5, 0.0, 0.0], 0.7, 20, 32, sphere_mesh_mat);
-
-        // Merge the two meshes: offset sphere vertex indices by torus vertex count.
-        let vert_offset = torus_verts.len() as u32;
-        let mut all_verts = torus_verts;
-        all_verts.extend_from_slice(&sphere_verts);
-
-        let mut all_tris: Vec<GpuTriangle> = torus_tris;
-        for t in &sphere_tris_raw {
-            all_tris.push(GpuTriangle {
-                v: [
-                    t.v[0] + vert_offset,
-                    t.v[1] + vert_offset,
-                    t.v[2] + vert_offset,
-                ],
-                mat_idx: t.mat_idx,
-            });
-        }
-
-        let mesh_result = build_mesh_bvh(&all_verts, &all_tris);
+        // ---- triangle mesh (Phase 12: data-driven from YAML scene file) ----
+        // Mesh geometry is fully declarative: `load_scene_from_yaml` above has
+        // already parsed all `type: mesh` objects and merged their vertices and
+        // triangles.  We just build the BVH here.
+        let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
 
         info!(
             "Mesh BVH built: {} triangles, {} vertices → {} nodes",
@@ -549,7 +529,7 @@ impl GpuState {
 
         // ---- material buffer -----------------------------------------------
         // Use the material table parsed from the YAML scene file.
-        let material_data = loaded_materials;
+        let material_data = loaded.materials;
         let material_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("material buffer"),
             size: size_of::<GpuMaterialData>() as u64,
@@ -728,7 +708,50 @@ impl GpuState {
         });
 
         // ---- initial camera state -----------------------------------------
-        let camera = CameraState::from_initial_position(INIT_LOOK_FROM, INIT_LOOK_AT);
+        // Use camera settings from the YAML scene file when present; otherwise
+        // fall back to the built-in orbit-camera defaults.
+        let camera = if let Some(ref c) = loaded.camera {
+            let look_from = glam::Vec3::from(c.look_from);
+            let look_at   = glam::Vec3::from(c.look_at);
+            let mut cs = CameraState::from_initial_position(look_from, look_at);
+            cs.vfov       = c.vfov;
+            cs.aperture   = c.aperture;
+            cs.focus_dist = c.focus_dist;
+            // Keep tgt_* in sync so the initial lerp is a no-op.
+            cs.tgt_yaw      = cs.yaw;
+            cs.tgt_pitch    = cs.pitch;
+            cs.tgt_distance = cs.distance;
+            cs.tgt_look_at  = cs.look_at;
+            cs
+        } else {
+            CameraState::from_initial_position(INIT_LOOK_FROM, INIT_LOOK_AT)
+        };
+
+        // ---- Phase 12: scene file watcher for hot-reload ------------------
+        let scene_path_str = "assets/scene.yaml";
+        let (sc_tx, sc_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let _scene_watcher: Option<notify::RecommendedWatcher> =
+            match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+                let _ = sc_tx.send(res);
+            }) {
+                Ok(mut w) => {
+                    if let Err(e) = w.watch(
+                        std::path::Path::new(scene_path_str),
+                        notify::RecursiveMode::NonRecursive,
+                    ) {
+                        log::warn!("scene hot-reload disabled (watch failed): {e}");
+                        None
+                    } else {
+                        info!("watching '{}' for hot-reload", scene_path_str);
+                        Some(w)
+                    }
+                }
+                Err(e) => {
+                    log::warn!("scene hot-reload disabled (watcher creation failed): {e}");
+                    None
+                }
+            };
+        let scene_change_rx = if _scene_watcher.is_some() { Some(sc_rx) } else { None };
 
         // ---- build bind groups from the already-created resources ---------
         // Use a temporary partial struct so rebuild_bind_groups can be called
@@ -780,6 +803,9 @@ impl GpuState {
             frame_count: 0,
             camera,
             input: InputState::default(),
+            scene_path: scene_path_str.to_string(),
+            _scene_watcher,
+            scene_change_rx,
         }
     }
 
@@ -832,12 +858,99 @@ impl GpuState {
     }
 
     // -----------------------------------------------------------------------
+    // Scene hot-reload
+    // -----------------------------------------------------------------------
+
+    /// Returns `true` if the watched scene file has changed since the last call,
+    /// and drains any additional queued events so no spurious second reload fires.
+    fn poll_scene_changed(&self) -> bool {
+        let changed = self
+            .scene_change_rx
+            .as_ref()
+            .map(|rx| rx.try_recv().is_ok())
+            .unwrap_or(false);
+        if changed {
+            if let Some(ref rx) = self.scene_change_rx {
+                while rx.try_recv().is_ok() {}
+            }
+        }
+        changed
+    }
+
+    /// Reload the scene file from disk: re-parse YAML, rebuild BVH and mesh,
+    /// recreate scene GPU buffers, rebuild compute bind groups, reset
+    /// accumulation.  The camera position is intentionally preserved so the
+    /// user's viewpoint survives edits.
+    fn reload_scene(&mut self) {
+        let path = self.scene_path.clone();
+        let loaded = load_scene_from_yaml(&path);
+
+        let bvh_result = build_bvh(&loaded.spheres);
+        self.sphere_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("sphere storage"),
+                contents: bytemuck::cast_slice(&bvh_result.ordered_spheres),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+        self.bvh_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("bvh node storage"),
+                contents: bytemuck::cast_slice(&bvh_result.nodes),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+
+        let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
+        self.vertex_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("mesh vertex storage"),
+                contents: bytemuck::cast_slice(&mesh_result.vertices),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+        self.triangle_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("mesh triangle storage"),
+                contents: bytemuck::cast_slice(&mesh_result.ordered_triangles),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+        self.mesh_bvh_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("mesh bvh node storage"),
+                contents: bytemuck::cast_slice(&mesh_result.nodes),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
+
+        // Material buffer has a fixed GPU layout — just overwrite in place.
+        self.queue.write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
+
+        self.rebuild_bind_groups();
+        self.frame_count = 0;
+        info!(
+            "hot-reload: {} spheres, {} triangles, {} materials from '{}'",
+            loaded.spheres.len(),
+            loaded.mesh_triangles.len(),
+            loaded.materials.mat_count,
+            path,
+        );
+        // The camera block in the YAML is intentionally NOT re-applied on hot-reload
+        // so that the user's current viewpoint is preserved while editing the scene.
+        // Camera changes (look_from / look_at / vfov / aperture) require a restart.
+        if loaded.camera.is_some() {
+            info!("hot-reload: 'camera:' block changes require a restart to take effect (current viewpoint preserved)");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Render
     // -----------------------------------------------------------------------
 
     /// Advance the camera lerp, upload the camera uniform, then dispatch the
     /// compute path tracer and the display (tone-map) render pass.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
+        // ---- hot-reload: check if scene file has changed on disk ----------
+        if self.poll_scene_changed() {
+            self.reload_scene();
+        }
+
         // ---- smooth-interpolate camera toward targets ---------------------
         let prev_look_from = self.camera.look_from();
 

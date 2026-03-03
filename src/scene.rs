@@ -45,6 +45,40 @@ enum MaterialKind {
     Dielectric,
 }
 
+/// Camera placement and lens settings parsed from the YAML `camera:` block.
+///
+/// All fields except `look_from` and `look_at` are optional:
+/// - `vfov`       → 60.0°
+/// - `aperture`   → 0.0 (pinhole)
+/// - `focus_dist` → distance between `look_from` and `look_at`
+#[derive(serde::Deserialize, Clone, Debug)]
+struct CameraDesc {
+    look_from:  [f32; 3],
+    look_at:    [f32; 3],
+    #[serde(default)]
+    vfov:       Option<f32>,
+    #[serde(default)]
+    aperture:   Option<f32>,
+    #[serde(default)]
+    focus_dist: Option<f32>,
+}
+
+/// Camera settings returned by [`load_scene_from_yaml`] when the YAML
+/// contains a `camera:` block.  `gpu.rs` converts this into a `CameraState`.
+#[derive(Clone, Debug)]
+pub struct SceneCameraSettings {
+    /// Eye position in world space.
+    pub look_from:  [f32; 3],
+    /// Point the camera looks toward.
+    pub look_at:    [f32; 3],
+    /// Vertical field of view in degrees.
+    pub vfov:       f32,
+    /// Lens aperture radius (0 = pinhole / no depth-of-field).
+    pub aperture:   f32,
+    /// Distance to the focal plane.
+    pub focus_dist: f32,
+}
+
 /// A material definition, used both in the top-level `materials:` palette and
 /// when a material is inlined directly inside an object definition.
 ///
@@ -93,9 +127,6 @@ enum MaterialRef {
 }
 
 /// A single object in the scene.  The `type` YAML field selects the variant.
-///
-/// Currently only `sphere` is supported; `cube`, `torus`, and `mesh` (external
-/// `.obj` file) are reserved for future phases.
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum ObjectDesc {
@@ -108,15 +139,41 @@ enum ObjectDesc {
         /// Material reference: a name string or an inline definition.
         material: MaterialRef,
     },
+    /// A triangle mesh loaded from an OBJ file.
+    ///
+    /// ```yaml
+    /// - type: mesh
+    ///   path: models/bunny.obj
+    ///   material: gold
+    ///   scale: 8.0
+    ///   translate: [0.0, -0.267, 0.0]
+    /// ```
+    Mesh {
+        /// Path to a Wavefront OBJ file (relative to the working directory).
+        path: String,
+        /// Material for all triangles in this mesh.
+        material: MaterialRef,
+        /// Uniform scale applied to every vertex position before upload.
+        /// Defaults to 1.0 (no scaling).
+        #[serde(default)]
+        scale: Option<f32>,
+        /// Translation `[x, y, z]` added to every vertex position after
+        /// scaling.  Defaults to `[0, 0, 0]` (no translation).
+        #[serde(default)]
+        translate: Option<[f32; 3]>,
+    },
     // Future variants:
-    // Cube   { center, size, material }
-    // Torus  { center, major_r, minor_r, material }
-    // Mesh   { path: String, material }
+    // Cube  { center, size, material }
+    // Torus { center, major_r, minor_r, material }
 }
 
 /// Top-level structure of a YAML scene file.
 #[derive(serde::Deserialize)]
 struct SceneFile {
+    /// Optional camera settings.  When present, the renderer initialises its
+    /// camera from these values instead of the built-in defaults.
+    #[serde(default)]
+    camera: Option<CameraDesc>,
     /// Named material palette.  Keys are material names; values are their
     /// definitions.  Insertion order is preserved by `IndexMap`, so GPU
     /// indices are deterministic.  Duplicate keys are a YAML parse error,
@@ -134,6 +191,17 @@ pub struct LoadedScene {
     pub spheres: Vec<GpuSphere>,
     /// Material table for the GPU material uniform buffer.
     pub materials: crate::material::GpuMaterialData,
+    /// Merged vertex array for all `mesh` objects; pass to
+    /// [`crate::mesh::build_mesh_bvh`] together with [`Self::mesh_triangles`].
+    /// Always non-empty (a stub vertex is appended when no mesh objects
+    /// exist so wgpu buffer binding validation always passes).
+    pub mesh_vertices: Vec<crate::mesh::GpuVertex>,
+    /// Merged, offset-adjusted triangle index array for all `mesh` objects.
+    /// Always non-empty (see [`Self::mesh_vertices`]).
+    pub mesh_triangles: Vec<crate::mesh::GpuTriangle>,
+    /// Camera placement & lens settings.  `Some` when the YAML includes a
+    /// `camera:` block; `None` when the built-in defaults should be used.
+    pub camera: Option<SceneCameraSettings>,
 }
 
 // Convert a YAML MaterialDesc into a GPU-ready GpuMaterial.
@@ -153,28 +221,18 @@ fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
     }
 }
 
-/// Load a scene from a YAML file and return spheres and materials ready for
-/// GPU upload.
+/// Parse a scene from a YAML *string* and return data ready for GPU upload.
 ///
-/// The YAML must contain a top-level `objects:` sequence where every entry has
-/// a `type` field (`sphere`, …) and a `material` field.  A `materials:` list
-/// at the top of the file declares named materials that objects can reference
-/// by name; objects may also define their material inline.  See
-/// `assets/scene.yaml` for a complete example.
-///
-/// # Panics
-/// Panics if the file cannot be read, the YAML is malformed, an object
-/// references an unknown material name, or more than `MAX_MATERIALS` unique
-/// materials are used.
-pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
+/// `source` is only used in panic messages (e.g. the original file path, or
+/// `"<inline>"` for tests).  This is the real implementation; the public
+/// [`load_scene_from_yaml`] is a thin wrapper that reads the file first.
+pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
     use crate::material::{GpuMaterialData, MAX_MATERIALS};
     use bytemuck::Zeroable;
     use std::collections::HashMap;
 
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("failed to read scene file '{}': {}", path, e));
-    let scene: SceneFile = serde_yaml::from_str(&text)
-        .unwrap_or_else(|e| panic!("failed to parse scene file '{}': {}", path, e));
+    let scene: SceneFile = serde_yaml::from_str(text)
+        .unwrap_or_else(|e| panic!("failed to parse scene file '{}': {}", source, e));
 
     // Build the material palette from the top-level `materials:` dict.
     // IndexMap preserves insertion order, so GPU indices are deterministic.
@@ -187,32 +245,91 @@ pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
         name_to_idx.insert(name.clone(), idx);
     }
 
-    // Process objects, resolving material references on the fly.
+    // Helper: resolve a MaterialRef → GPU material index.
+    // Inline materials are always appended as new entries (no deduplication).
+    macro_rules! resolve_mat {
+        ($mat:expr) => {{
+            match $mat {
+                MaterialRef::Named(name) => *name_to_idx
+                    .get(name.as_str())
+                    .unwrap_or_else(|| panic!("object references unknown material '{}'", name)),
+                MaterialRef::Inline(desc) => {
+                    let idx = gpu_mats.len() as u32;
+                    gpu_mats.push(material_desc_to_gpu(desc));
+                    idx
+                }
+            }
+        }};
+    }
+
+    // Process objects — spheres and mesh files — accumulating GPU data.
     let mut spheres: Vec<GpuSphere> = Vec::new();
+    let mut mesh_vertices:  Vec<crate::mesh::GpuVertex>   = Vec::new();
+    let mut mesh_triangles: Vec<crate::mesh::GpuTriangle> = Vec::new();
+
     for obj in &scene.objects {
         match obj {
-            ObjectDesc::Sphere {
-                center,
-                radius,
-                material,
-            } => {
-                let mat_idx = match material {
-                    MaterialRef::Named(name) => *name_to_idx
-                        .get(name.as_str())
-                        .unwrap_or_else(|| panic!("object references unknown material '{}'", name)),
-                    MaterialRef::Inline(desc) => {
-                        // Anonymous inline — always appended as a new entry.
-                        let idx = gpu_mats.len() as u32;
-                        gpu_mats.push(material_desc_to_gpu(desc));
-                        idx
-                    }
-                };
+            ObjectDesc::Sphere { center, radius, material } => {
+                let mat_idx = resolve_mat!(material);
                 spheres.push(GpuSphere {
-                    center_r: [center[0], center[1], center[2], *radius],
+                    center_r:    [center[0], center[1], center[2], *radius],
                     mat_and_pad: [mat_idx, 0, 0, 0],
                 });
             }
+
+            ObjectDesc::Mesh { path: obj_path, material, scale, translate } => {
+                let mat_idx = resolve_mat!(material);
+                let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx)
+                    .unwrap_or_else(|e| panic!("failed to load mesh '{}': {}", obj_path, e));
+
+                // Apply optional uniform scale + translation to vertex positions.
+                let s = scale.unwrap_or(1.0);
+                // Negative scale would flip handedness without inverting stored normals,
+                // producing inside-out lighting.  Zero scale collapses geometry into a
+                // degenerate point.  Both are almost certainly unintentional.
+                assert!(s > 0.0, "mesh '{}' scale must be positive (got {s})", obj_path);
+                let t = translate.unwrap_or([0.0f32; 3]);
+                if s != 1.0 || t != [0.0f32; 3] {
+                    for v in &mut verts {
+                        v.position[0] = v.position[0] * s + t[0];
+                        v.position[1] = v.position[1] * s + t[1];
+                        v.position[2] = v.position[2] * s + t[2];
+                        // Normals are direction vectors; uniform scale preserves
+                        // their direction so no normal adjustment is needed.
+                    }
+                }
+
+                // Merge into the shared vertex/triangle arrays, offsetting
+                // triangle indices so they index into the combined vertex buffer.
+                let vert_offset = mesh_vertices.len() as u32;
+                mesh_vertices.extend_from_slice(&verts);
+                for tri in &tris {
+                    mesh_triangles.push(crate::mesh::GpuTriangle {
+                        v: [
+                            tri.v[0] + vert_offset,
+                            tri.v[1] + vert_offset,
+                            tri.v[2] + vert_offset,
+                        ],
+                        mat_idx: tri.mat_idx,
+                    });
+                }
+            }
         }
+    }
+
+    // Ensure mesh buffers are never empty: a degenerate point at a distant
+    // location satisfies wgpu's minimum buffer-binding-size requirement while
+    // contributing zero visible geometry (the BVH AABB will never be hit by
+    // any camera ray originating from a normal scene position).
+    if mesh_vertices.is_empty() {
+        mesh_vertices.push(crate::mesh::GpuVertex {
+            position: [1.0e9, 1.0e9, 1.0e9, 1.0],
+            normal:   [0.0, 1.0, 0.0, 0.0],
+            uv:       [0.0, 0.0, 0.0, 0.0],
+        });
+        // A degenerate triangle (single repeated vertex) that Möller–Trumbore
+        // will always reject (det ≈ 0).
+        mesh_triangles.push(crate::mesh::GpuTriangle { v: [0, 0, 0], mat_idx: 0 });
     }
 
     // Pack into GpuMaterialData.
@@ -226,10 +343,53 @@ pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
     mat_data.mat_count = gpu_mats.len() as u32;
     mat_data.materials[..gpu_mats.len()].copy_from_slice(&gpu_mats);
 
+    // Convert the optional camera block.
+    let camera = scene.camera.as_ref().map(|c| {
+        let look_from = c.look_from;
+        let look_at   = c.look_at;
+        let dist = {
+            let d = [
+                look_from[0] - look_at[0],
+                look_from[1] - look_at[1],
+                look_from[2] - look_at[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        };
+        SceneCameraSettings {
+            look_from,
+            look_at,
+            vfov:       c.vfov.unwrap_or(crate::camera::DEFAULT_VFOV),
+            aperture:   c.aperture.unwrap_or(0.0),
+            focus_dist: c.focus_dist.unwrap_or(dist),
+        }
+    });
+
     LoadedScene {
         spheres,
         materials: mat_data,
+        mesh_vertices,
+        mesh_triangles,
+        camera,
     }
+}
+
+/// Load a scene from a YAML file and return spheres and materials ready for
+/// GPU upload.
+///
+/// The YAML must contain a top-level `objects:` sequence where every entry has
+/// a `type` field (`sphere`, …) and a `material` field.  A `materials:` map
+/// at the top of the file declares named materials that objects can reference
+/// by name; objects may also define their material inline.  See
+/// `assets/scene.yaml` for a complete example.
+///
+/// # Panics
+/// Panics if the file cannot be read, the YAML is malformed, an object
+/// references an unknown material name, or more than `MAX_MATERIALS` unique
+/// materials are used.
+pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read scene file '{}': {}", path, e));
+    load_scene_from_str(&text, path)
 }
 
 /// Construct the original four-sphere demo scene.
@@ -296,7 +456,7 @@ pub fn build_large_scene() -> Vec<GpuSphere> {
 
     // Three large accent spheres (centre, left, right).
     spheres.push(GpuSphere {
-        center_r: [0.0, 1.0, 0.0, 1.0],
+        center_r: [0.0, 2.5, 0.0, 1.0],
         mat_and_pad: [3, 0, 0, 0],
     }); // glass
     spheres.push(GpuSphere {
@@ -418,33 +578,62 @@ mod tests {
     }
 
     // ----- load_scene_from_yaml tests (Phase 12) ---------------------------
+    //
+    // All tests use self-contained inline YAML so they are independent of the
+    // contents of `assets/scene.yaml` on disk.
+
+    /// Minimal self-contained scene fixture used by multiple Phase 12 tests.
+    ///
+    /// Contains:
+    ///   - 5 named materials (ground, glass, metal, red, bunny)
+    ///   - 4 spheres with known positions and material indices 0-3
+    ///   - 1 mesh object (models/bunny.obj, scale 8, translated onto ground)
+    ///   - camera block (look_from=[4,3,8], look_at=[0,0.5,0], vfov=40, aperture=0.1)
+    const FIXTURE_SCENE: &str = r#"
+camera:
+  look_from: [4.0, 3.0, 8.0]
+  look_at:   [0.0, 0.5, 0.0]
+  vfov:      40.0
+  aperture:  0.1
+
+materials:
+  ground: { type: lambertian, albedo: [0.5, 0.5, 0.5] }
+  glass:  { type: dielectric, ior: 1.5 }
+  metal:  { type: metal,      albedo: [0.8, 0.6, 0.2], fuzz: 0.1 }
+  red:    { type: lambertian, albedo: [0.7, 0.1, 0.1] }
+  bunny:  { type: lambertian, albedo: [0.1, 0.1, 0.65] }
+
+objects:
+  - { type: sphere, center: [0.0, -100.0, 0.0], radius: 100.0, material: ground }
+  - { type: sphere, center: [0.0,   2.5,  0.0], radius: 1.0,   material: glass  }
+  - { type: sphere, center: [-4.0,  1.0,  0.0], radius: 1.0,   material: metal  }
+  - { type: sphere, center: [4.0,   1.0,  0.0], radius: 1.0,   material: red    }
+  - type: mesh
+    path: models/bunny.obj
+    material: bunny
+    scale: 8.0
+    translate: [0.5, -0.264, 0.0]
+"#;
 
     #[test]
-    fn yaml_scene_sphere_count_matches_builder() {
-        // Tests run from the Cargo workspace root, so the relative path works.
-        let loaded = load_scene_from_yaml("assets/scene.yaml");
-        let code = build_large_scene();
-        assert_eq!(loaded.spheres.len(), code.len());
+    fn yaml_scene_sphere_count() {
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        // FIXTURE_SCENE has exactly 4 sphere objects.
+        assert_eq!(loaded.spheres.len(), 4);
     }
 
     #[test]
-    fn yaml_scene_centers_match_builder() {
-        let loaded = load_scene_from_yaml("assets/scene.yaml");
-        let code = build_large_scene();
-        for (i, (y, c)) in loaded.spheres.iter().zip(code.iter()).enumerate() {
-            assert_eq!(
-                y.center_r, c.center_r,
-                "sphere {} center_r mismatch: yaml={:?} code={:?}",
-                i, y.center_r, c.center_r
-            );
-        }
+    fn yaml_scene_sphere_centers_are_correct() {
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        assert_eq!(loaded.spheres[0].center_r, [0.0_f32, -100.0, 0.0, 100.0]);
+        assert_eq!(loaded.spheres[1].center_r, [0.0_f32,   2.5,  0.0, 1.0]);
+        assert_eq!(loaded.spheres[2].center_r, [-4.0_f32,  1.0,  0.0, 1.0]);
+        assert_eq!(loaded.spheres[3].center_r, [4.0_f32,   1.0,  0.0, 1.0]);
     }
 
     #[test]
     fn yaml_scene_sphere_material_indices_in_range() {
-        // Every material index stored in a sphere must be a valid index into
-        // the material palette loaded from the same file.
-        let loaded = load_scene_from_yaml("assets/scene.yaml");
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
         let mat_count = loaded.materials.mat_count;
         for (i, s) in loaded.spheres.iter().enumerate() {
             assert!(
@@ -457,20 +646,89 @@ mod tests {
 
     #[test]
     fn yaml_scene_material_count() {
-        let loaded = load_scene_from_yaml("assets/scene.yaml");
-        // The scene declares exactly 5 named materials: ground, green, red, gold, glass.
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        // FIXTURE_SCENE declares 5 named materials: ground, glass, metal, red, bunny.
         assert_eq!(loaded.materials.mat_count, 5);
     }
 
     #[test]
     fn yaml_scene_inline_material_is_appended() {
-        // Build a minimal in-memory YAML that uses an inline material and check
-        // that it ends up in the returned GpuMaterialData.
-        let yaml = "\
-materials:\n  base:\n    type: lambertian\n    albedo: [0.5, 0.5, 0.5]\n\
-objects:\n  - type: sphere\n    center: [0, 0, 0]\n    radius: 1\n    material:\n      type: metal\n      albedo: [0.8, 0.6, 0.2]\n      fuzz: 0.1\n";
-        let scene: SceneFile = serde_yaml::from_str(yaml).unwrap();
-        // quick check: the scene has 1 declared + 1 inline = 2 materials after loading
-        let _ = scene; // structural parse is enough for this unit test
+        // An inline material on an object must be appended as a new GPU slot on
+        // top of any named materials.  1 named + 1 inline = mat_count 2.
+        let yaml = r#"
+materials:
+  base: { type: lambertian, albedo: [0.5, 0.5, 0.5] }
+objects:
+  - type: sphere
+    center: [0, 0, 0]
+    radius: 1
+    material: { type: metal, albedo: [0.8, 0.6, 0.2], fuzz: 0.1 }
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        assert_eq!(
+            loaded.materials.mat_count, 2,
+            "expected 1 named + 1 inline = 2 materials, got {}",
+            loaded.materials.mat_count
+        );
+    }
+
+    #[test]
+    fn yaml_scene_has_mesh_geometry() {
+        // FIXTURE_SCENE includes models/bunny.obj; verify non-trivial geometry.
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        assert!(
+            loaded.mesh_vertices.len() > 100,
+            "expected >100 mesh vertices (bunny), got {}",
+            loaded.mesh_vertices.len()
+        );
+        assert!(
+            loaded.mesh_triangles.len() > 100,
+            "expected >100 mesh triangles (bunny), got {}",
+            loaded.mesh_triangles.len()
+        );
+    }
+
+    #[test]
+    fn yaml_scene_camera_is_loaded() {
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let cam = loaded.camera.expect("fixture must have a camera block");
+        assert_eq!(cam.look_from, [4.0_f32, 3.0, 8.0]);
+        assert_eq!(cam.look_at,   [0.0_f32, 0.5, 0.0]);
+        assert!((cam.vfov - 40.0).abs() < 1e-4, "vfov should be 40°");
+        assert!((cam.aperture - 0.1).abs() < 1e-5, "expected aperture 0.1, got {}", cam.aperture);
+    }
+
+    #[test]
+    fn yaml_scene_camera_focus_dist_defaults_to_eye_distance() {
+        // When focus_dist is omitted the loader should default it to the
+        // Euclidean distance between look_from and look_at (here = 5.0).
+        let yaml = r#"
+camera:
+  look_from: [0.0, 0.0, 5.0]
+  look_at:   [0.0, 0.0, 0.0]
+objects:
+  - { type: sphere, center: [0, 0, 0], radius: 1, material: { type: lambertian } }
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        let cam = loaded.camera.expect("inline yaml must have a camera block");
+        assert!(
+            (cam.focus_dist - 5.0).abs() < 1e-4,
+            "expected focus_dist ≈ 5.0 (eye distance), got {}",
+            cam.focus_dist
+        );
+    }
+
+    #[test]
+    fn yaml_scene_mesh_material_index_in_range() {
+        // Every triangle in the loaded mesh must reference a valid material slot.
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        let mat_count = loaded.materials.mat_count;
+        for (i, tri) in loaded.mesh_triangles.iter().enumerate() {
+            assert!(
+                tri.mat_idx < mat_count,
+                "triangle {} has mat_idx {} but mat_count = {}",
+                i, tri.mat_idx, mat_count
+            );
+        }
     }
 }

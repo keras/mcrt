@@ -1,15 +1,27 @@
 # assets/scene.yaml - declarative description of the large demo scene.
 #
 # Format (Phase 12+):
+#   camera:    optional; overrides built-in orbit-camera defaults.
 #   materials: named palette as a mapping; keys are names, values are
 #              definitions.  Indices are assigned in declaration order.
 #              Duplicate keys are a YAML parse error (uniqueness is enforced
 #              by the format itself).
 #   objects:   list of scene primitives; each entry has a type field.
+#              type: sphere  - analytic sphere
+#              type: mesh    - OBJ file (with optional scale / translate)
 #
 # The material field on an object may be:
 #   - a plain string naming a material from the palette above, or
 #   - an inline mapping with type, albedo, fuzz, ior, ... fields.
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+camera:
+  look_from: [4.0, 3.0, 8.0]
+  look_at:   [0.0, 0.5, 0.0]
+  vfov:      40.0
+  aperture:  0.1
 
 # ---------------------------------------------------------------------------
 # Material palette  (dict: key = name, value = definition)
@@ -19,6 +31,7 @@
 #   index 2 - red    (Lambertian)
 #   index 3 - gold   (metal, fuzz 0.1)
 #   index 4 - glass  (dielectric, IOR 1.5)
+#   index 5 - bunny  (polished gold-white metal)
 
 materials:
   ground:
@@ -43,6 +56,10 @@ materials:
     type: dielectric
     ior: 1.5
 
+  bunny:
+    type: lambertian
+    albedo: [0.1, 0.1, 0.65]
+
 # ---------------------------------------------------------------------------
 # Objects
 # ---------------------------------------------------------------------------
@@ -57,7 +74,7 @@ objects:
 
   # Three large accent spheres
   - type: sphere
-    center: [0.0, 1.0, 0.0]
+    center: [0.0, 2.5, 0.0]
     radius: 1.0
     material: glass
 
@@ -152,3 +169,12 @@ objects:
   - { type: sphere, center: [1.5,  0.0, 3.5],  radius: 0.3, material: gold }
   - { type: sphere, center: [2.5,  0.0, 3.5],  radius: 0.3, material: glass }
   - { type: sphere, center: [3.5,  0.0, 3.5],  radius: 0.3, material: green }
+
+  # Stanford Bunny (models/bunny.obj).
+  # Original model is ~0.15 units tall; scale=8 gives ~1.2 units.
+  # translate y by -(ymin * scale) = -(0.033 * 8) = -0.264 to sit on the ground.
+  - type: mesh
+    path: models/bunny.obj
+    material: bunny
+    scale: 8.0
+    translate: [0.5, -0.264, 0.0]

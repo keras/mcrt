@@ -176,8 +176,8 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - [x] Implement `load_scene_from_yaml` in `scene.rs` that parses the YAML and produces `Vec<GpuSphere>`
 - [x] Write the existing `build_large_scene` demo scene as `assets/scene.yaml`
 - [x] Load `assets/scene.yaml` in `gpu.rs` instead of calling `build_large_scene`
-- [ ] Extend the format to cover triangle meshes, camera, and material overrides
-- [ ] Hot-reload scene file on disk change without restarting the renderer
+- [x] Extend the format to cover triangle meshes, camera, and material overrides
+- [x] Hot-reload scene file on disk change without restarting the renderer
 
 **Output:** A running renderer whose scene is fully described by a plain YAML file that can be edited without recompiling.
 
