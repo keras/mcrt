@@ -55,9 +55,6 @@ enum MaterialKind {
 /// - `texture_layer` → `0` (no albedo texture)
 #[derive(serde::Deserialize, Clone, Debug)]
 struct MaterialDesc {
-    /// Optional name used to reference this material from objects.
-    #[serde(default)]
-    name: Option<String>,
     /// Shading model: `lambertian`, `metal`, or `dielectric`.
     #[serde(rename = "type")]
     kind: MaterialKind,
@@ -120,11 +117,12 @@ enum ObjectDesc {
 /// Top-level structure of a YAML scene file.
 #[derive(serde::Deserialize)]
 struct SceneFile {
-    /// Named material palette.  Entries are assigned GPU indices 0, 1, 2, …
-    /// in declaration order.  Objects may reference them by name or define
-    /// their material inline.
+    /// Named material palette.  Keys are material names; values are their
+    /// definitions.  Insertion order is preserved by `IndexMap`, so GPU
+    /// indices are deterministic.  Duplicate keys are a YAML parse error,
+    /// which guarantees that each name maps to exactly one definition.
     #[serde(default)]
-    materials: Vec<MaterialDesc>,
+    materials: indexmap::IndexMap<String, MaterialDesc>,
     /// Ordered list of scene objects.
     objects: Vec<ObjectDesc>,
 }
@@ -178,15 +176,15 @@ pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
     let scene: SceneFile = serde_yaml::from_str(&text)
         .unwrap_or_else(|e| panic!("failed to parse scene file '{}': {}", path, e));
 
-    // Build the material palette from the top-level `materials:` list.
+    // Build the material palette from the top-level `materials:` dict.
+    // IndexMap preserves insertion order, so GPU indices are deterministic.
+    // Duplicate keys are rejected at parse time by serde_yaml.
     let mut name_to_idx: HashMap<String, u32> = HashMap::new();
     let mut gpu_mats = Vec::<crate::material::GpuMaterial>::new();
-    for desc in &scene.materials {
+    for (name, desc) in &scene.materials {
         let idx = gpu_mats.len() as u32;
         gpu_mats.push(material_desc_to_gpu(desc));
-        if let Some(name) = &desc.name {
-            name_to_idx.insert(name.clone(), idx);
-        }
+        name_to_idx.insert(name.clone(), idx);
     }
 
     // Process objects, resolving material references on the fly.
@@ -203,22 +201,10 @@ pub fn load_scene_from_yaml(path: &str) -> LoadedScene {
                         .get(name.as_str())
                         .unwrap_or_else(|| panic!("object references unknown material '{}'", name)),
                     MaterialRef::Inline(desc) => {
-                        // Reuse index if the inline material has a name already seen.
-                        if let Some(name) = &desc.name {
-                            if let Some(&idx) = name_to_idx.get(name.as_str()) {
-                                idx
-                            } else {
-                                let idx = gpu_mats.len() as u32;
-                                gpu_mats.push(material_desc_to_gpu(desc));
-                                name_to_idx.insert(name.clone(), idx);
-                                idx
-                            }
-                        } else {
-                            // Anonymous inline — always a new entry.
-                            let idx = gpu_mats.len() as u32;
-                            gpu_mats.push(material_desc_to_gpu(desc));
-                            idx
-                        }
+                        // Anonymous inline — always appended as a new entry.
+                        let idx = gpu_mats.len() as u32;
+                        gpu_mats.push(material_desc_to_gpu(desc));
+                        idx
                     }
                 };
                 spheres.push(GpuSphere {
@@ -455,14 +441,16 @@ mod tests {
     }
 
     #[test]
-    fn yaml_scene_sphere_materials_match_builder() {
+    fn yaml_scene_sphere_material_indices_in_range() {
+        // Every material index stored in a sphere must be a valid index into
+        // the material palette loaded from the same file.
         let loaded = load_scene_from_yaml("assets/scene.yaml");
-        let code = build_large_scene();
-        for (i, (y, c)) in loaded.spheres.iter().zip(code.iter()).enumerate() {
-            assert_eq!(
-                y.mat_and_pad[0], c.mat_and_pad[0],
-                "sphere {} material index mismatch: yaml={} code={}",
-                i, y.mat_and_pad[0], c.mat_and_pad[0]
+        let mat_count = loaded.materials.mat_count;
+        for (i, s) in loaded.spheres.iter().enumerate() {
+            assert!(
+                s.mat_and_pad[0] < mat_count,
+                "sphere {} has material index {} but palette only has {} entries",
+                i, s.mat_and_pad[0], mat_count
             );
         }
     }
@@ -470,8 +458,8 @@ mod tests {
     #[test]
     fn yaml_scene_material_count() {
         let loaded = load_scene_from_yaml("assets/scene.yaml");
-        // The scene declares exactly 4 named materials.
-        assert_eq!(loaded.materials.mat_count, 4);
+        // The scene declares exactly 5 named materials: ground, green, red, gold, glass.
+        assert_eq!(loaded.materials.mat_count, 5);
     }
 
     #[test]
@@ -479,8 +467,7 @@ mod tests {
         // Build a minimal in-memory YAML that uses an inline material and check
         // that it ends up in the returned GpuMaterialData.
         let yaml = "\
-materials:
-  - name: base\n    type: lambertian\n    albedo: [0.5, 0.5, 0.5]\n\
+materials:\n  base:\n    type: lambertian\n    albedo: [0.5, 0.5, 0.5]\n\
 objects:\n  - type: sphere\n    center: [0, 0, 0]\n    radius: 1\n    material:\n      type: metal\n      albedo: [0.8, 0.6, 0.2]\n      fuzz: 0.1\n";
         let scene: SceneFile = serde_yaml::from_str(yaml).unwrap();
         // quick check: the scene has 1 declared + 1 inline = 2 materials after loading

@@ -1,7 +1,10 @@
 # assets/scene.yaml - declarative description of the large demo scene.
 #
 # Format (Phase 12+):
-#   materials: named palette; indices assigned in declaration order.
+#   materials: named palette as a mapping; keys are names, values are
+#              definitions.  Indices are assigned in declaration order.
+#              Duplicate keys are a YAML parse error (uniqueness is enforced
+#              by the format itself).
 #   objects:   list of scene primitives; each entry has a type field.
 #
 # The material field on an object may be:
@@ -9,33 +12,34 @@
 #   - an inline mapping with type, albedo, fuzz, ior, ... fields.
 
 # ---------------------------------------------------------------------------
-# Material palette
+# Material palette  (dict: key = name, value = definition)
 # ---------------------------------------------------------------------------
 #   index 0 - ground (Lambertian grey + checker texture)
-#   index 1 - red    (Lambertian)
-#   index 2 - gold   (metal, fuzz 0.1)
-#   index 3 - glass  (dielectric, IOR 1.5)
+#   index 1 - green  (Lambertian)
+#   index 2 - red    (Lambertian)
+#   index 3 - gold   (metal, fuzz 0.1)
+#   index 4 - glass  (dielectric, IOR 1.5)
 
 materials:
-  - name: ground
+  ground:
     type: lambertian
     albedo: [0.5, 0.5, 0.5]
     texture_layer: 1
 
-  - name: green
+  green:
     type: lambertian
     albedo: [0.1, 0.7, 0.1]
 
-  - name: red
+  red:
     type: lambertian
     albedo: [0.7, 0.1, 0.1]
 
-  - name: gold
+  gold:
     type: metal
     albedo: [0.8, 0.6, 0.2]
     fuzz: 0.1
 
-  - name: glass
+  glass:
     type: dielectric
     ior: 1.5
 
