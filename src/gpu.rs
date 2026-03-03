@@ -32,9 +32,9 @@ use winit::{
 
 use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
-use crate::material::{GpuMaterialData, build_materials};
+use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh, build_torus_mesh};
-use crate::scene::{GpuSphere, load_scene_from_yaml};
+use crate::scene::{GpuSphere, LoadedScene, load_scene_from_yaml};
 use crate::texture::{
     ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures,
 };
@@ -362,10 +362,15 @@ impl GpuState {
         });
 
         // ---- sphere list + BVH --------------------------------------------
-        // Build the BVH on the CPU from the large demo scene, then upload
-        // both the reordered sphere list and the flat node array as storage
-        // buffers.  Storage buffers accept dynamic sizes, removing MAX_SPHERES.
-        let bvh_result = build_bvh(&load_scene_from_yaml("assets/scene.yaml"));
+        // Load the declarative scene from YAML, then build the BVH on the CPU
+        // and upload both the reordered sphere list and the flat node array as
+        // storage buffers.  The loaded scene also carries the material table
+        // that replaces the hard-coded build_materials() call below.
+        let LoadedScene {
+            spheres: loaded_spheres,
+            materials: loaded_materials,
+        } = load_scene_from_yaml("assets/scene.yaml");
+        let bvh_result = build_bvh(&loaded_spheres);
 
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sphere storage"),
@@ -437,7 +442,7 @@ impl GpuState {
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb,       // sRGB→linear decode on fetch
+            format: TextureFormat::Rgba8UnormSrgb, // sRGB→linear decode on fetch
             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -519,7 +524,7 @@ impl GpuState {
         // Linear/clamp sampler for the albedo texture array.
         let tex_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("linear sampler"),
-            address_mode_u: AddressMode::Repeat,       // wrap for sphere/mesh UV
+            address_mode_u: AddressMode::Repeat, // wrap for sphere/mesh UV
             address_mode_v: AddressMode::Repeat,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
@@ -543,7 +548,8 @@ impl GpuState {
         });
 
         // ---- material buffer -----------------------------------------------
-        let material_data = build_materials();
+        // Use the material table parsed from the YAML scene file.
+        let material_data = loaded_materials;
         let material_buffer = device.create_buffer(&BufferDescriptor {
             label: Some("material buffer"),
             size: size_of::<GpuMaterialData>() as u64,

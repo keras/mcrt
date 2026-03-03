@@ -57,9 +57,9 @@ pub struct GpuMaterialData {
 // Material type constants (for readability in build_materials)
 // ---------------------------------------------------------------------------
 
-const MAT_LAMBERTIAN:  u32 = 0;
-const MAT_METAL:       u32 = 1;
-const MAT_DIELECTRIC:  u32 = 2;
+#[allow(dead_code)] const MAT_LAMBERTIAN:  u32 = 0;
+#[allow(dead_code)] const MAT_METAL:       u32 = 1;
+#[allow(dead_code)] const MAT_DIELECTRIC:  u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Material builder
@@ -73,6 +73,10 @@ const MAT_DIELECTRIC:  u32 = 2;
 /// |   1   | Lambertian red (centre)   |
 /// |   2   | Metal gold, fuzz = 0.1    |
 /// |   3   | Dielectric glass, IOR 1.5 |
+///
+/// Superseded for the main render path by [`crate::scene::load_scene_from_yaml`];
+/// retained for unit tests and as a reference implementation.
+#[allow(dead_code)]
 pub fn build_materials() -> GpuMaterialData {
     let raw: &[GpuMaterial] = &[
         // 0: Lambertian grey — ground (checker texture, layer 1)
