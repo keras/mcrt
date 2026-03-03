@@ -12,15 +12,17 @@ use glam::Vec3;
 use log::info;
 use wgpu::util::DeviceExt;
 use wgpu::{
-    BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
-    BindingResource, BindingType, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-    ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor, Extent3d, FragmentState,
-    InstanceDescriptor, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor,
-    PowerPreference, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
-    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StorageTextureAccess, StoreOp, SurfaceError, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
-    VertexState,
+    AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
+    CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
+    Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState,
+    RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
+    RequestAdapterOptions, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
+    ShaderSource, ShaderStages, StorageTextureAccess, StoreOp, SurfaceError,
+    TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
+    TextureViewDimension, VertexState,
 };
 use winit::{
     dpi::PhysicalPosition,
@@ -34,6 +36,7 @@ use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, c
 use crate::material::{GpuMaterialData, build_materials};
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh, build_torus_mesh};
 use crate::scene::{GpuSphere, build_large_scene};
+use crate::texture::{load_all_textures, ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE};
 
 // ---------------------------------------------------------------------------
 // Render / input constants
@@ -230,6 +233,16 @@ pub struct GpuState {
     triangle_buffer: wgpu::Buffer,
     /// Flat mesh BVH node array (storage buffer, binding 8).
     mesh_bvh_buffer: wgpu::Buffer,
+    // ---- Phase 11: texture resources ----------------------------------------
+    /// Albedo texture 2D array (RGBA8 Unorm, MAX_TEXTURES layers; binding 10).
+    /// Stored alongside the view so the Texture Arc is not dropped early.
+    _albedo_tex: wgpu::Texture,
+    albedo_tex_view: wgpu::TextureView,
+    /// HDR equirectangular environment map (RGBA32 Float; binding 11).
+    _env_map_tex: wgpu::Texture,
+    env_map_view: wgpu::TextureView,
+    /// Linear sampler shared by the albedo texture array (binding 9).
+    tex_sampler: wgpu::Sampler,
 
     /// Monotonically increasing frame index; resets to 0 on camera move / resize.
     frame_count: u32,
@@ -409,6 +422,111 @@ impl GpuState {
             mesh_result.nodes.len()
         );
 
+        // ---- Phase 11: textures + environment map --------------------------
+        let (albedo_layers, env_map_data) = load_all_textures();
+
+        // RGBA8 Unorm 2D texture array — MAX_TEXTURES layers, TEXTURE_SIZE².
+        let albedo_tex = device.create_texture(&TextureDescriptor {
+            label: Some("albedo texture array"),
+            size: Extent3d {
+                width: TEXTURE_SIZE,
+                height: TEXTURE_SIZE,
+                depth_or_array_layers: MAX_TEXTURES,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        // Upload each layer by offsetting the z-origin (array slice index).
+        for (layer_idx, layer_data) in albedo_layers.iter().enumerate() {
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &albedo_tex,
+                    mip_level: 0,
+                    origin: Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: layer_idx as u32,
+                    },
+                    aspect: TextureAspect::All,
+                },
+                layer_data,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(TEXTURE_SIZE * 4),
+                    rows_per_image: Some(TEXTURE_SIZE),
+                },
+                Extent3d {
+                    width: TEXTURE_SIZE,
+                    height: TEXTURE_SIZE,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        let albedo_tex_view = albedo_tex.create_view(&TextureViewDescriptor {
+            dimension: Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        info!(
+            "Albedo texture array: {MAX_TEXTURES} layers @ {TEXTURE_SIZE}×{TEXTURE_SIZE}"
+        );
+
+        // RGBA32 Float equirectangular environment map.
+        let env_map_tex = device.create_texture(&TextureDescriptor {
+            label: Some("env map"),
+            size: Extent3d {
+                width: ENV_MAP_WIDTH,
+                height: ENV_MAP_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba32Float,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &env_map_tex,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            bytemuck::cast_slice(&env_map_data),
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4), // 4 channels × 4 bytes
+                rows_per_image: Some(ENV_MAP_HEIGHT),
+            },
+            Extent3d {
+                width: ENV_MAP_WIDTH,
+                height: ENV_MAP_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
+
+        info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
+
+        // Linear/clamp sampler for the albedo texture array.
+        let tex_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("linear sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh vertex storage"),
             contents: bytemuck::cast_slice(&mesh_result.vertices),
@@ -553,6 +671,35 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // 9: linear sampler for albedo texture array
+                    BindGroupLayoutEntry {
+                        binding: 9,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // 10: albedo 2D texture array (RGBA8 Unorm, MAX_TEXTURES layers)
+                    BindGroupLayoutEntry {
+                        binding: 10,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: true },
+                            view_dimension: TextureViewDimension::D2Array,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // 11: HDR environment map (RGBA32 Float; non-filterable, textureLoad)
+                    BindGroupLayoutEntry {
+                        binding: 11,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Texture {
+                            sample_type: TextureSampleType::Float { filterable: false },
+                            view_dimension: TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -594,6 +741,9 @@ impl GpuState {
             &vertex_buffer,
             &triangle_buffer,
             &mesh_bvh_buffer,
+            &tex_sampler,
+            &albedo_tex_view,
+            &env_map_view,
         );
 
         Self {
@@ -617,6 +767,11 @@ impl GpuState {
             vertex_buffer,
             triangle_buffer,
             mesh_bvh_buffer,
+            _albedo_tex: albedo_tex,
+            albedo_tex_view,
+            _env_map_tex: env_map_tex,
+            env_map_view,
+            tex_sampler,
             frame_count: 0,
             camera,
             input: InputState::default(),
@@ -665,6 +820,9 @@ impl GpuState {
             &self.vertex_buffer,
             &self.triangle_buffer,
             &self.mesh_bvh_buffer,
+            &self.tex_sampler,
+            &self.albedo_tex_view,
+            &self.env_map_view,
         );
     }
 
@@ -893,6 +1051,9 @@ fn make_compute_bind_groups(
     vertex_buffer: &wgpu::Buffer,
     triangle_buffer: &wgpu::Buffer,
     mesh_bvh_buffer: &wgpu::Buffer,
+    tex_sampler: &wgpu::Sampler,
+    albedo_tex_view: &wgpu::TextureView,
+    env_map_view: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -934,6 +1095,18 @@ fn make_compute_bind_groups(
                 BindGroupEntry {
                     binding: 8,
                     resource: mesh_bvh_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 9,
+                    resource: BindingResource::Sampler(tex_sampler),
+                },
+                BindGroupEntry {
+                    binding: 10,
+                    resource: BindingResource::TextureView(albedo_tex_view),
+                },
+                BindGroupEntry {
+                    binding: 11,
+                    resource: BindingResource::TextureView(env_map_view),
                 },
             ],
         })

@@ -45,6 +45,12 @@ const PCG_MULT: u32 = 747796405u;
 const PCG_INC:  u32 = 2891336453u;
 const PCG_MIX:  u32 = 277803737u;
 
+/// π (tau / 2).  Used in spherical UV mapping and environment map lookup.
+const PI: f32 = 3.141592653589793;
+
+/// Number of albedo texture array layers; must match MAX_TEXTURES in texture.rs.
+const ALBEDO_ARRAY_LAYERS: i32 = 4;
+
 // ---- shared primitives ----------------------------------------------------
 
 /// A ray in world space.  `dir` must be unit length.
@@ -61,6 +67,7 @@ struct HitRecord {
     normal:     vec3<f32>,  // always faces the incident ray
     front_face: bool,
     mat_index:  u32,        // sphere's material slot (used in Phase 7)
+    uv:         vec2<f32>,  // surface UV coordinates for texture sampling (Phase 11)
 }
 
 // ---- camera uniform -------------------------------------------------------
@@ -186,6 +193,18 @@ struct MaterialData {
 /// Flat mesh BVH node array.  Traversal always starts at index 0 (root).
 @group(0) @binding(8) var<storage, read> mesh_bvh_nodes: array<BvhNode>;
 
+/// Linear sampler for texture sampling.  Shared by the albedo texture array.
+@group(0) @binding(9) var tex_sampler: sampler;
+
+/// Albedo texture 2D array (RGBA8 Unorm, ALBEDO_ARRAY_LAYERS layers).
+/// Layer 0 is solid white — selecting it leaves mat.albedo_fuzz unchanged.
+/// Indexed by mat.type_pad.y, clamped to [0, ALBEDO_ARRAY_LAYERS - 1].
+@group(0) @binding(10) var albedo_textures: texture_2d_array<f32>;
+
+/// HDR equirectangular environment map (RGBA32 Float, non-filterable).
+/// Sampled on ray miss via textureLoad with nearest-neighbour lookup.
+@group(0) @binding(11) var env_map: texture_2d<f32>;
+
 // ---- PCG PRNG -------------------------------------------------------------
 //
 // PCG32/XSH-RR: one 32-bit state, 32-bit output.
@@ -214,6 +233,30 @@ fn rand_f32(rng: ptr<function, u32>) -> f32 {
 fn sky_color(unit_dir: vec3<f32>) -> vec3<f32> {
     let t = 0.5 * (unit_dir.y + 1.0);
     return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.5, 0.7, 1.0), t);
+}
+
+// ---- environment map lookup -----------------------------------------------
+
+/// Sample the HDR equirectangular environment map for a ray direction.
+///
+/// Uses an equirectangular (lat/long) projection:
+///   phi   = atan2(z, x)  → longitude ∈ (−π, π]  → u ∈ [0, 1]
+///   theta = asin(y)      → latitude  ∈ [−π/2, π/2]  → v ∈ [0, 1]
+///
+/// `textureLoad` is used (nearest-neighbour) because `Rgba32Float` textures
+/// are not filterable on all hardware without the FLOAT32_FILTERABLE feature.
+/// The env map resolution (ENV_MAP_WIDTH × ENV_MAP_HEIGHT) provides adequate
+/// smoothness for a path tracer where noise dominates visible aliasing.
+fn env_color(unit_dir: vec3<f32>) -> vec3<f32> {
+    let phi   = atan2(unit_dir.z, unit_dir.x);        // ∈ (−π, π]
+    let theta = asin(clamp(unit_dir.y, -1.0, 1.0));   // ∈ [−π/2, π/2]
+    let u = (phi + PI) / TAU;                          // ∈ [0, 1]
+    let v = 0.5 + theta / PI;                          // ∈ [0, 1]
+    let dims = vec2<i32>(textureDimensions(env_map));
+    // Flip vertical: image row 0 is the zenith (v→1 → iy→0).
+    let ix = clamp(i32(u * f32(dims.x)), 0, dims.x - 1);
+    let iy = clamp(i32((1.0 - v) * f32(dims.y)), 0, dims.y - 1);
+    return textureLoad(env_map, vec2<i32>(ix, iy), 0).xyz;
 }
 
 // ---- ray-sphere intersection ----------------------------------------------
@@ -252,6 +295,11 @@ fn ray_sphere_hit(r: Ray, sphere: Sphere, t_min: f32, t_max: f32) -> HitRecord {
     // Normal always faces the incident ray (required for refraction in Phase 7).
     hit.normal    = select(-outward_n, outward_n, hit.front_face);
     hit.mat_index = sphere.mat_and_pad.x;
+    // Spherical UV mapping: phi ∈ (−π, π], theta ∈ [−π/2, π/2].
+    // u wraps around the equator; v is 0 at the south pole, 1 at the north.
+    let phi   = atan2(outward_n.z, outward_n.x);
+    let theta = asin(clamp(outward_n.y, -1.0, 1.0));
+    hit.uv    = vec2<f32>((phi + PI) / TAU, 0.5 + theta / PI);
     return hit;
 }
 
@@ -323,6 +371,11 @@ fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord 
     // Normal always faces the incident ray, consistent with ray_sphere_hit.
     hit.normal    = select(-interp_n, interp_n, hit.front_face);
     hit.mat_index = tri.mat_idx;
+    // UV via barycentric interpolation of the three vertex UV coordinates.
+    let uv0 = vertices[tri.v.x].uv.xy;
+    let uv1 = vertices[tri.v.y].uv.xy;
+    let uv2 = vertices[tri.v.z].uv.xy;
+    hit.uv  = w * uv0 + u_bary * uv1 + v_bary * uv2;
     return hit;
 }
 
@@ -535,7 +588,12 @@ fn scatter_lambertian(mat: Material, hit: HitRecord,
                       rng: ptr<function, u32>) -> ScatterResult {
     var r: ScatterResult;
     r.direction   = cosine_scatter(rng, hit.normal);
-    r.attenuation = mat.albedo_fuzz.xyz;
+    // Texture index 0 = white (solid-colour mat); 1..N = albedo texture layer.
+    // Layer 0 is a solid-white fill so tex_idx=0 leaves mat.albedo_fuzz unchanged.
+    let layer = clamp(i32(mat.type_pad.y), 0, ALBEDO_ARRAY_LAYERS - 1);
+    let tex_color = textureSampleLevel(
+        albedo_textures, tex_sampler, hit.uv, layer, 0.0).xyz;
+    r.attenuation = mat.albedo_fuzz.xyz * tex_color;
     r.absorbed    = false;
     return r;
 }
@@ -553,7 +611,10 @@ fn scatter_metal(mat: Material, ray_in: Ray, hit: HitRecord,
     // reflected, the sum approaches zero and normalize would yield NaN.
     let perturbed = reflected + fuzz * random_unit_sphere(rng);
     r.direction   = normalize(select(reflected, perturbed, dot(perturbed, perturbed) >= 1e-6));
-    r.attenuation = mat.albedo_fuzz.xyz;
+    let layer     = clamp(i32(mat.type_pad.y), 0, ALBEDO_ARRAY_LAYERS - 1);
+    let tex_color = textureSampleLevel(
+        albedo_textures, tex_sampler, hit.uv, layer, 0.0).xyz;
+    r.attenuation = mat.albedo_fuzz.xyz * tex_color;
     r.absorbed    = dot(r.direction, hit.normal) <= 0.0;
     return r;
 }
@@ -629,8 +690,8 @@ fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
         let hit = scene_hit(ray, T_MIN, T_MAX);
 
         if hit.t < 0.0 {
-            // Ray escaped — multiply throughput by sky radiance and return.
-            return throughput * sky_color(ray.dir);
+            // Ray escaped — sample environment map (HDR or procedural gradient).
+            return throughput * env_color(ray.dir);
         }
 
         // Clamp to valid range; guards against corrupt sphere mat_index data.

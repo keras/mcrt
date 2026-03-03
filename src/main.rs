@@ -8,6 +8,8 @@
 //   bvh      — GpuBvhNode and build_bvh() (Phase 9 SAH acceleration structure)
 //   mesh     — GpuVertex, GpuTriangle, build_mesh_bvh(), UV-sphere / OBJ loader
 //              (Phase 10 triangle mesh support)
+//   texture  — Albedo texture layers and HDR env map loading / generation
+//              (Phase 11 textures & environment maps)
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
 
@@ -18,6 +20,7 @@ mod gpu;
 mod material;
 mod mesh;
 mod scene;
+mod texture;
 
 use winit::event_loop::EventLoop;
 

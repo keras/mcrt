@@ -24,12 +24,13 @@ pub const MAX_MATERIALS: usize = 8;
 /// Each field uses vec4 packing to keep the Rust `repr(C)` layout identical
 /// to the WGSL `struct Material` layout.
 ///
-/// | Field          | Meaning                                              |
-/// |----------------|------------------------------------------------------|
-/// | `type_pad[0]`  | Material type: 0=Lambertian, 1=metal, 2=dielectric   |
-/// | `albedo_fuzz[0..3]` | Albedo / metal tint colour                      |
-/// | `albedo_fuzz[3]`    | Fuzz radius (metal: 0=mirror, 1=fully rough)    |
-/// | `ior_pad[0]`   | Index of refraction (dielectric, e.g. 1.5 for glass) |
+/// | Field          | Meaning                                                      |
+/// |----------------|--------------------------------------------------------------|
+/// | `type_pad[0]`  | Material type: 0=Lambertian, 1=metal, 2=dielectric           |
+/// | `type_pad[1]`  | Albedo texture layer index (0 = white/no-texture; Phase 11)  |
+/// | `albedo_fuzz[0..3]` | Albedo / metal tint colour                            |
+/// | `albedo_fuzz[3]`    | Fuzz radius (metal: 0=mirror, 1=fully rough)          |
+/// | `ior_pad[0]`   | Index of refraction (dielectric, e.g. 1.5 for glass)         |
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterial {
@@ -74,13 +75,13 @@ const MAT_DIELECTRIC:  u32 = 2;
 /// |   3   | Dielectric glass, IOR 1.5 |
 pub fn build_materials() -> GpuMaterialData {
     let raw: &[GpuMaterial] = &[
-        // 0: Lambertian grey — ground
+        // 0: Lambertian grey — ground (checker texture, layer 1)
         GpuMaterial {
-            type_pad:    [MAT_LAMBERTIAN, 0, 0, 0],
+            type_pad:    [MAT_LAMBERTIAN, 1, 0, 0], // type_pad[1]=1 → albedo layer 1
             albedo_fuzz: [0.5, 0.5, 0.5, 0.0],
             ior_pad:     [1.0, 0.0, 0.0, 0.0],
         },
-        // 1: Lambertian red — centre sphere
+        // 1: Lambertian red — centre sphere (no texture)
         GpuMaterial {
             type_pad:    [MAT_LAMBERTIAN, 0, 0, 0],
             albedo_fuzz: [0.7, 0.3, 0.3, 0.0],

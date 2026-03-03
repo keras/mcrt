@@ -157,11 +157,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Add image-based textures and HDR environment lighting.
 
-- [ ] Load image textures (PNG/JPG) on the CPU, upload as GPU textures
-- [ ] Sample albedo textures in the shader using UV coordinates from hit data
-- [ ] Load an HDR equirectangular environment map
-- [ ] Sample the environment map on ray miss instead of the procedural sky
-- [ ] Optional: importance-sample the environment map for reduced noise
+- [x] Load image textures (PNG/JPG) on the CPU, upload as GPU textures
+- [x] Sample albedo textures in the shader using UV coordinates from hit data
+- [x] Load an HDR equirectangular environment map
+- [x] Sample the environment map on ray miss instead of the procedural sky
+- [x] Optional: importance-sample the environment map for reduced noise
 
 **Output:** Textured objects lit by an HDR environment.
 
