@@ -11,9 +11,9 @@ use wgpu::{
     InstanceDescriptor, LoadOp, MultisampleState, Operations, PipelineLayoutDescriptor,
     PowerPreference, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
     RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StorageTextureAccess, StoreOp, SurfaceError, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor,
-    TextureViewDimension, VertexState,
+    ShaderStages, StorageTextureAccess, StoreOp, SurfaceError, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+    VertexState,
 };
 use winit::{
     application::ApplicationHandler,
@@ -192,6 +192,56 @@ fn build_scene() -> GpuSceneData {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 7: material buffer
+// ---------------------------------------------------------------------------
+
+/// Maximum number of materials in a `GpuMaterialData` buffer.
+/// Must match `array<Material, 8>` in path_trace.wgsl.
+const MAX_MATERIALS: usize = 8;
+
+/// GPU-side material descriptor.  Each field uses vec4 packing to keep the
+/// Rust `repr(C)` layout identical to the WGSL `struct Material` layout.
+///
+/// - `type_pad[0]`     : material type  (0 = Lambertian, 1 = metal, 2 = dielectric)
+/// - `albedo_fuzz[0..3]`: albedo colour  (diffuse / metal tint)
+/// - `albedo_fuzz[3]`  : fuzz radius    (metal: 0 = mirror, 1 = fully rough)
+/// - `ior_pad[0]`      : index of refraction (dielectric, e.g. 1.5 for glass)
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMaterial {
+    type_pad:    [u32; 4],   // .x = mat_type
+    albedo_fuzz: [f32; 4],   // .xyz = albedo, .w = fuzz
+    ior_pad:     [f32; 4],   // .x = IOR
+}
+
+/// Full material table uploaded to the GPU.  Size = 16 + 8 × 48 = 400 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct GpuMaterialData {
+    mat_count: u32,
+    _pad: [u32; 3],
+    materials: [GpuMaterial; MAX_MATERIALS],
+}
+
+/// Build the material table to match the scene defined in `build_scene()`:
+///   0 — Lambertian grey  (ground)
+///   1 — Lambertian red   (centre sphere)
+///   2 — Metal gold, fuzz=0.1 (left sphere)
+///   3 — Dielectric glass, IOR=1.5 (right sphere)
+fn build_materials() -> GpuMaterialData {
+    let raw: &[GpuMaterial] = &[
+        GpuMaterial { type_pad: [0, 0, 0, 0], albedo_fuzz: [0.5, 0.5, 0.5, 0.0], ior_pad: [1.0, 0.0, 0.0, 0.0] },
+        GpuMaterial { type_pad: [0, 0, 0, 0], albedo_fuzz: [0.7, 0.3, 0.3, 0.0], ior_pad: [1.0, 0.0, 0.0, 0.0] },
+        GpuMaterial { type_pad: [1, 0, 0, 0], albedo_fuzz: [0.8, 0.6, 0.2, 0.1], ior_pad: [1.0, 0.0, 0.0, 0.0] },
+        GpuMaterial { type_pad: [2, 0, 0, 0], albedo_fuzz: [1.0, 1.0, 1.0, 0.0], ior_pad: [1.5, 0.0, 0.0, 0.0] },
+    ];
+    let mut data = GpuMaterialData::zeroed();
+    data.mat_count = raw.len() as u32;
+    data.materials[..raw.len()].copy_from_slice(raw);
+    data
+}
+
+// ---------------------------------------------------------------------------
 // GPU state — created inside `resumed()`, lives for the rest of the session.
 // ---------------------------------------------------------------------------
 
@@ -227,6 +277,8 @@ struct GpuState {
 
     // Phase 4: sphere scene
     scene_buffer: wgpu::Buffer,
+    // Phase 7: material descriptors
+    material_buffer: wgpu::Buffer,
     /// Monotonically increasing frame index; resets to 0 on resize so the
     /// accumulation restarts from a clean state.
     frame_count: u32,
@@ -272,10 +324,8 @@ impl GpuState {
         // Two Rgba32Float textures ping-pong every frame: the compute shader
         // writes to accum[f_idx] and reads from accum[1 - f_idx]; the display
         // pass reads from accum[f_idx] for tone-mapping.
-        let (accum_tex0, accum_view0) =
-            create_accum_texture(&device, config.width, config.height);
-        let (accum_tex1, accum_view1) =
-            create_accum_texture(&device, config.width, config.height);
+        let (accum_tex0, accum_view0) = create_accum_texture(&device, config.width, config.height);
+        let (accum_tex1, accum_view1) = create_accum_texture(&device, config.width, config.height);
         let accum_textures = [accum_tex0, accum_tex1];
         let accum_views = [accum_view0, accum_view1];
 
@@ -379,6 +429,16 @@ impl GpuState {
         });
         queue.write_buffer(&scene_buffer, 0, bytes_of(&scene_data));
 
+        // ---- material buffer -----------------------------------------------
+        let material_data = build_materials();
+        let material_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("material buffer"),
+            size: size_of::<GpuMaterialData>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&material_buffer, 0, bytes_of(&material_data));
+
         // ---- compute bind group layout ------------------------------------
         let compute_bind_group_layout =
             device.create_bind_group_layout(&BindGroupLayoutDescriptor {
@@ -432,6 +492,19 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // binding 4: material descriptors uniform
+                    BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                size_of::<GpuMaterialData>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -458,6 +531,10 @@ impl GpuState {
                         BindGroupEntry {
                             binding: 3,
                             resource: BindingResource::TextureView(read_view),
+                        },
+                        BindGroupEntry {
+                            binding: 4,
+                            resource: material_buffer.as_entire_binding(),
                         },
                     ],
                 })
@@ -505,6 +582,7 @@ impl GpuState {
             compute_bind_groups,
             compute_pipeline,
             scene_buffer,
+            material_buffer,
             frame_count: 0,
         }
     }
@@ -566,6 +644,10 @@ impl GpuState {
                         binding: 3,
                         resource: BindingResource::TextureView(&self.accum_views[1]),
                     },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: self.material_buffer.as_entire_binding(),
+                    },
                 ],
             }),
             self.device.create_bind_group(&BindGroupDescriptor {
@@ -588,6 +670,10 @@ impl GpuState {
                         binding: 3,
                         resource: BindingResource::TextureView(&self.accum_views[0]),
                     },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: self.material_buffer.as_entire_binding(),
+                    },
                 ],
             }),
         ];
@@ -600,8 +686,7 @@ impl GpuState {
         // Static camera for Phase 6 (orbit disabled so the image converges).
         // Phase 8 will restore interactive controls.
         let look_from = Vec3::new(0.0, 1.0, 3.5);
-        let mut cam =
-            compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
+        let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
 
         // Derive the ping-pong index *before* incrementing frame_count so the
         // formula is a simple modulo with no subtraction — avoids any risk of

@@ -1,8 +1,8 @@
-// path_trace.wgsl — Phase 6: progressive HDR accumulation
+// path_trace.wgsl — Phase 7: metal & dielectric materials
 //
-// Each invocation shoots one diffuse path per pixel and blends the new sample
-// into a running per-pixel average stored in the Rgba32Float accumulation
-// texture.  The display pass tone-maps the average each frame.
+// Each invocation shoots one full path per pixel, dispatching to the correct
+// scatter function (Lambertian / metal / dielectric) based on the material
+// buffer, and accumulates the HDR result into the ping-pong texture pair.
 
 // ---- shared primitives ----------------------------------------------------
 
@@ -57,6 +57,31 @@ struct SceneData {
     spheres: array<Sphere, 8>,
 }
 
+// ---- material buffer -----------------------------------------------------
+
+/// Per-material descriptor; layout must match `GpuMaterial` in main.rs.
+///
+/// mat_type:  0 = Lambertian diffuse
+///            1 = metal  (specular reflect + fuzz perturbation)
+///            2 = dielectric (glass: Snell refraction + Schlick reflection)
+struct Material {
+    /// .x = mat_type (u32), .yzw = unused padding.
+    type_pad:    vec4<u32>,
+    /// .xyz = albedo (diffuse colour / metal tint), .w = fuzz ∈ [0, 1].
+    albedo_fuzz: vec4<f32>,
+    /// .x = index of refraction (dielectric), .yzw = unused.
+    ior_pad:     vec4<f32>,
+}
+
+/// Fixed-capacity material table; must match `MAX_MATERIALS` in main.rs.
+struct MaterialData {
+    mat_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    mats: array<Material, 8>,
+}
+
 // ---- bindings -------------------------------------------------------------
 
 /// Accumulation write target: the compute shader writes the blended average here.
@@ -72,6 +97,9 @@ struct SceneData {
 /// Accumulation read source: the previous frame's running average.
 /// Ping-pongs with accum_write every frame.
 @group(0) @binding(3) var accum_read: texture_2d<f32>;
+
+/// Material descriptors for all spheres in the scene.
+@group(0) @binding(4) var<uniform> materials: MaterialData;
 
 // ---- PCG PRNG -------------------------------------------------------------
 //
@@ -187,19 +215,123 @@ fn random_unit_sphere(rng: ptr<function, u32>) -> vec3<f32> {
 /// the normal, which would produce a near-zero direction.
 fn cosine_scatter(rng: ptr<function, u32>, normal: vec3<f32>) -> vec3<f32> {
     let scatter = normal + random_unit_sphere(rng);
-    if dot(scatter, scatter) < 1e-10 { return normal; }
+    if dot(scatter, scatter) < 1e-6 { return normal; }
     return normalize(scatter);
 }
 
-// ---- material albedos (Phase 5: hardcoded; replaced by buffer in Phase 7) -
+// ---- reflect / refract helpers -------------------------------------------
 
-fn albedo_for_material(mat_index: u32) -> vec3<f32> {
-    switch mat_index {
-        case 0u: { return vec3<f32>(0.5, 0.5, 0.5); } // ground: grey
-        case 1u: { return vec3<f32>(0.7, 0.3, 0.3); } // centre: warm red
-        case 2u: { return vec3<f32>(0.3, 0.7, 0.3); } // left:   green
-        case 3u: { return vec3<f32>(0.3, 0.3, 0.7); } // right:  blue
-        default: { return vec3<f32>(1.0, 0.0, 1.0); } // error:  magenta
+/// Mirror reflection: `v` reflected about unit normal `n`.
+fn reflect_vec(v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+    return v - 2.0 * dot(v, n) * n;
+}
+
+/// Snell's law refraction.
+///   v         : unit incident direction
+///   n         : unit surface normal pointing toward the incident medium
+///   eta_ratio : η_incident / η_transmitted
+fn refract_vec(v: vec3<f32>, n: vec3<f32>, eta_ratio: f32) -> vec3<f32> {
+    let cos_theta = min(dot(-v, n), 1.0);
+    let r_perp    = eta_ratio * (v + cos_theta * n);
+    let r_para    = -sqrt(max(0.0, 1.0 - dot(r_perp, r_perp))) * n;
+    return r_perp + r_para;
+}
+
+/// Schlick's approximation for Fresnel reflectance at a dielectric interface.
+///   cos_theta : cosine of the angle of incidence
+///   eta_ratio : η_incident / η_transmitted (same ratio used in refract_vec)
+fn schlick(cos_theta: f32, eta_ratio: f32) -> f32 {
+    var r0 = (1.0 - eta_ratio) / (1.0 + eta_ratio);
+    r0     = r0 * r0;
+    return r0 + (1.0 - r0) * pow(1.0 - cos_theta, 5.0);
+}
+
+// ---- scatter --------------------------------------------------------------
+
+/// Result of a material scatter event.
+struct ScatterResult {
+    /// New ray direction (unit length) after scattering.
+    direction:   vec3<f32>,
+    /// Throughput multiplier (albedo / attenuation).
+    attenuation: vec3<f32>,
+    /// True when the ray is absorbed and the path must terminate.
+    absorbed:    bool,
+}
+
+/// Lambertian (diffuse) scatter: cosine-weighted random hemisphere direction.
+fn scatter_lambertian(mat: Material, hit: HitRecord,
+                      rng: ptr<function, u32>) -> ScatterResult {
+    var r: ScatterResult;
+    r.direction   = cosine_scatter(rng, hit.normal);
+    r.attenuation = mat.albedo_fuzz.xyz;
+    r.absorbed    = false;
+    return r;
+}
+
+/// Metal scatter: perfect mirror reflect + fuzz perturbation.
+/// Absorbed when fuzz pushes the scattered ray below the surface.
+fn scatter_metal(mat: Material, ray_in: Ray, hit: HitRecord,
+                 rng: ptr<function, u32>) -> ScatterResult {
+    var r: ScatterResult;
+    let fuzz      = mat.albedo_fuzz.w;
+    // Normalise incoming direction defensively against floating-point drift.
+    let reflected = reflect_vec(normalize(ray_in.dir), hit.normal);
+    // Perturb by a random unit-sphere vector scaled by fuzz; re-normalise.
+    r.direction   = normalize(reflected + fuzz * random_unit_sphere(rng));
+    r.attenuation = mat.albedo_fuzz.xyz;
+    r.absorbed    = dot(r.direction, hit.normal) <= 0.0;
+    return r;
+}
+
+/// Dielectric scatter: Snell refraction with probabilistic Schlick reflection.
+/// Handles total internal reflection and the air↔glass direction swap.
+fn scatter_dielectric(mat: Material, ray_in: Ray, hit: HitRecord,
+                      rng: ptr<function, u32>) -> ScatterResult {
+    var r: ScatterResult;
+    r.absorbed    = false;
+    r.attenuation = vec3<f32>(1.0); // glass transmits all wavelengths equally
+
+    let ior = mat.ior_pad.x;
+    // Air-to-glass (front face): η_ratio = 1/ior.
+    // Glass-to-air (back face) : η_ratio = ior.
+    let eta_ratio = select(ior, 1.0 / ior, hit.front_face);
+
+    let cos_theta = min(dot(-ray_in.dir, hit.normal), 1.0);
+    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+
+    // Total internal reflection: refraction is geometrically impossible.
+    let cannot_refract = eta_ratio * sin_theta > 1.0;
+
+    // Schlick approximation: when exiting a dense medium (glass→air) and
+    // refraction is possible, the formula should use the transmitted-side
+    // cosine rather than the incident cosine, for physically correct Fresnel
+    // at grazing angles.
+    //   cos_theta_t = sqrt(1 - eta_ratio² · sin²θ_i)
+    let schlick_cos = select(
+        cos_theta,
+        sqrt(max(0.0, 1.0 - eta_ratio * eta_ratio * (1.0 - cos_theta * cos_theta))),
+        !hit.front_face && !cannot_refract);
+
+    // Probabilistic Fresnel via Schlick: even when refraction is possible,
+    // randomly choose to reflect with probability equal to reflectance.
+    let reflectance = schlick(schlick_cos, eta_ratio);
+
+    if cannot_refract || reflectance > rand_f32(rng) {
+        r.direction = reflect_vec(ray_in.dir, hit.normal);
+    } else {
+        // Re-normalise to guard against floating-point drift near TIR boundary.
+        r.direction = normalize(refract_vec(ray_in.dir, hit.normal, eta_ratio));
+    }
+    return r;
+}
+
+/// Dispatch to the correct scatter function based on material type.
+fn scatter(mat: Material, ray_in: Ray, hit: HitRecord,
+           rng: ptr<function, u32>) -> ScatterResult {
+    switch mat.type_pad.x {
+        case 1u: { return scatter_metal(mat, ray_in, hit, rng); }
+        case 2u: { return scatter_dielectric(mat, ray_in, hit, rng); }
+        default: { return scatter_lambertian(mat, hit, rng); }
     }
 }
 
@@ -226,10 +358,17 @@ fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
             return throughput * sky_color(ray.dir);
         }
 
-        // Lambertian BRDF: attenuate by albedo, scatter diffusely.
-        throughput *= albedo_for_material(hit.mat_index);
-        let scatter_dir = cosine_scatter(rng, hit.normal);
-        ray = Ray(hit.point, scatter_dir);
+        // Clamp to valid range; guards against corrupt sphere mat_index data.
+        // Using 7u (MAX_MATERIALS - 1) instead of mat_count-1 avoids underflow
+        // when mat_count is 0.
+        let mat_idx = min(hit.mat_index, 7u);
+        let mat     = materials.mats[mat_idx];
+
+        let sr = scatter(mat, ray, hit, rng);
+        if sr.absorbed { return vec3<f32>(0.0, 0.0, 0.0); }
+
+        throughput *= sr.attenuation;
+        ray = Ray(hit.point, sr.direction);
     }
 
     // Path absorbed after MAX_BOUNCES with no sky contribution.

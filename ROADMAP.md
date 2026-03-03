@@ -100,11 +100,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Support reflective and refractive materials alongside diffuse.
 
-- [ ] Define a material struct: type (diffuse/metal/dielectric), albedo, fuzz, IOR
-- [ ] Pass materials via a storage buffer, index from sphere hit data
-- [ ] Implement metal reflection with optional fuzz (perturbed reflection vector)
-- [ ] Implement dielectric refraction (Snell's law + Schlick's approximation)
-- [ ] Randomly choose reflect vs refract for dielectrics
+- [x] Define a material struct: type (diffuse/metal/dielectric), albedo, fuzz, IOR
+- [x] Pass materials via a storage buffer, index from sphere hit data
+- [x] Implement metal reflection with optional fuzz (perturbed reflection vector)
+- [x] Implement dielectric refraction (Snell's law + Schlick's approximation)
+- [x] Randomly choose reflect vs refract for dielectrics
 
 **Output:** A scene with diffuse, metallic, and glass spheres.
 
