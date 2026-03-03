@@ -234,6 +234,10 @@ pub struct GpuState {
     triangle_buffer: wgpu::Buffer,
     /// Flat mesh BVH node array (storage buffer, binding 8).
     mesh_bvh_buffer: wgpu::Buffer,
+    // ---- Phase 13: emissive sphere list ----------------------------------
+    /// Emissive sphere list for NEE direct-light sampling (storage buffer, binding 12).
+    /// Contains a stub sphere at [1e9,1e9,1e9] r=0 when there are no emissives.
+    emissive_buffer: wgpu::Buffer,
     // ---- Phase 11: texture resources ----------------------------------------
     /// Albedo texture 2D array (RGBA8 Unorm, MAX_TEXTURES layers; binding 10).
     /// Stored alongside the view so the Texture Arc is not dropped early.
@@ -527,6 +531,20 @@ impl GpuState {
             usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         });
 
+        // ---- Phase 13: emissive sphere buffer (binding 12) ---------------
+        // Always non-empty: pad with a stub sphere far away so the shader
+        // can unconditionally index the array (no out-of-bounds).
+        let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
+            vec![GpuSphere { center_r: [1.0e9, 1.0e9, 1.0e9, 0.0], mat_and_pad: [0; 4] }]
+        } else {
+            loaded.emissive_spheres.clone()
+        };
+        let emissive_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label:    Some("emissive sphere storage"),
+            contents: bytemuck::cast_slice(&emissive_data),
+            usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        });
+
         // ---- material buffer -----------------------------------------------
         // Use the material table parsed from the YAML scene file.
         let material_data = loaded.materials;
@@ -685,6 +703,19 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // 12: emissive sphere list for NEE (Phase 13)
+                    BindGroupLayoutEntry {
+                        binding:    12,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Buffer {
+                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size:   wgpu::BufferSize::new(
+                                size_of::<GpuSphere>() as u64
+                            ),
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -772,6 +803,7 @@ impl GpuState {
             &tex_sampler,
             &albedo_tex_view,
             &env_map_view,
+            &emissive_buffer,
         );
 
         Self {
@@ -795,6 +827,7 @@ impl GpuState {
             vertex_buffer,
             triangle_buffer,
             mesh_bvh_buffer,
+            emissive_buffer,
             _albedo_tex: albedo_tex,
             albedo_tex_view,
             _env_map_tex: env_map_tex,
@@ -854,6 +887,7 @@ impl GpuState {
             &self.tex_sampler,
             &self.albedo_tex_view,
             &self.env_map_view,
+            &self.emissive_buffer,
         );
     }
 
@@ -921,6 +955,19 @@ impl GpuState {
 
         // Material buffer has a fixed GPU layout — just overwrite in place.
         self.queue.write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
+
+        // Recreate emissive buffer (count may have changed after hot-reload).
+        let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
+            vec![GpuSphere { center_r: [1.0e9, 1.0e9, 1.0e9, 0.0], mat_and_pad: [0; 4] }]
+        } else {
+            loaded.emissive_spheres.clone()
+        };
+        self.emissive_buffer =
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label:    Some("emissive sphere storage"),
+                contents: bytemuck::cast_slice(&emissive_data),
+                usage:    BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            });
 
         self.rebuild_bind_groups();
         self.frame_count = 0;
@@ -1172,6 +1219,7 @@ fn make_compute_bind_groups(
     tex_sampler: &wgpu::Sampler,
     albedo_tex_view: &wgpu::TextureView,
     env_map_view: &wgpu::TextureView,
+    emissive_buffer: &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -1225,6 +1273,10 @@ fn make_compute_bind_groups(
                 BindGroupEntry {
                     binding: 11,
                     resource: BindingResource::TextureView(env_map_view),
+                },
+                BindGroupEntry {
+                    binding: 12,
+                    resource: emissive_buffer.as_entire_binding(),
                 },
             ],
         })

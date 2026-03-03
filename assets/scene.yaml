@@ -32,6 +32,7 @@ camera:
 #   index 3 - gold   (metal, fuzz 0.1)
 #   index 4 - glass  (dielectric, IOR 1.5)
 #   index 5 - bunny  (polished gold-white metal)
+#   index 6 - light  (emissive warm area light, Phase 13)
 
 materials:
   ground:
@@ -60,6 +61,13 @@ materials:
     type: lambertian
     albedo: [0.1, 0.1, 0.65]
 
+  # Phase 13: warm area-light sphere.
+  # albedo = emission colour, emission_strength = intensity multiplier.
+  light:
+    type: emissive
+    albedo: [1.0, 0.85, 0.7]
+    emission_strength: 10.0
+
 # ---------------------------------------------------------------------------
 # Objects
 # ---------------------------------------------------------------------------
@@ -71,6 +79,13 @@ objects:
     center: [0.0, -100.5, 0.0]
     radius: 100.0
     material: ground
+
+  # Phase 13 emissive area-light sphere
+  # (above and slightly to the left of the large glass sphere)
+  - type: sphere
+    center: [-2.0, 5.0, -1.0]
+    radius: 1.5
+    material: light
 
   # Three large accent spheres
   - type: sphere

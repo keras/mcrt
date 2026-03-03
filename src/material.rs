@@ -44,22 +44,34 @@ pub struct GpuMaterial {
 
 /// Full material table uploaded to the GPU.
 ///
+/// The 16-byte header packs two logical fields plus two padding words:
+/// - `mat_count`  : number of active materials (≤ MAX_MATERIALS)
+/// - `n_emissive` : number of emissive spheres in the companion `emissive_buffer`
+///                  (Phase 13); `0` disables Next-Event Estimation in the shader.
+///
 /// Size = 16 + [`MAX_MATERIALS`] × 48 = 400 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuMaterialData {
-    pub mat_count: u32,
-    pub _pad:      [u32; 3],
-    pub materials: [GpuMaterial; MAX_MATERIALS],
+    pub mat_count:  u32,
+    /// Phase 13: number of emissive spheres in the companion emissive buffer.
+    /// Must be kept in sync with `emissive_buffer` in `gpu.rs`.
+    pub n_emissive: u32,
+    pub _pad:       [u32; 2],
+    pub materials:  [GpuMaterial; MAX_MATERIALS],
 }
 
 // ---------------------------------------------------------------------------
-// Material type constants (for readability in build_materials)
+// Material type constants (for readability in build_materials and scene.rs)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)] const MAT_LAMBERTIAN:  u32 = 0;
-#[allow(dead_code)] const MAT_METAL:       u32 = 1;
-#[allow(dead_code)] const MAT_DIELECTRIC:  u32 = 2;
+/// **Must match** the `mat_type` values in `path_trace.wgsl`.
+pub const MAT_LAMBERTIAN: u32 = 0;
+pub const MAT_METAL:      u32 = 1;
+pub const MAT_DIELECTRIC: u32 = 2;
+/// Phase 13: emissive surface; `albedo_fuzz.xyz` = emission colour,
+/// `ior_pad.x` = emission strength multiplier.
+pub const MAT_EMISSIVE:   u32 = 3;
 
 // ---------------------------------------------------------------------------
 // Material builder

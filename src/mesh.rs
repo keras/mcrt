@@ -8,7 +8,7 @@
 //
 // No wgpu types are present; this module is independently testable.
 
-use crate::bvh::{Aabb, GpuBvhNode, BVH_LEAF_MAX, SAH_BINS};
+use crate::bvh::{Aabb, BVH_LEAF_MAX, GpuBvhNode, SAH_BINS};
 use bytemuck::Zeroable;
 
 // ---------------------------------------------------------------------------
@@ -62,9 +62,9 @@ pub struct MeshBvhResult {
 // ---------------------------------------------------------------------------
 
 struct TriPrimInfo {
-    bounds:   Aabb,
+    bounds: Aabb,
     centroid: [f32; 3],
-    tri_idx:  usize, // index into the original (unordered) triangle slice
+    tri_idx: usize, // index into the original (unordered) triangle slice
 }
 
 // ---------------------------------------------------------------------------
@@ -102,7 +102,11 @@ pub fn build_mesh_bvh(verts: &[GpuVertex], tris: &[GpuTriangle]) -> MeshBvhResul
         .map(|(i, t)| {
             let bounds = triangle_aabb(verts, t);
             let centroid = bounds.centroid();
-            TriPrimInfo { bounds, centroid, tri_idx: i }
+            TriPrimInfo {
+                bounds,
+                centroid,
+                tri_idx: i,
+            }
         })
         .collect();
 
@@ -123,24 +127,26 @@ pub fn build_mesh_bvh(verts: &[GpuVertex], tris: &[GpuTriangle]) -> MeshBvhResul
 // ---------------------------------------------------------------------------
 
 fn build_recursive(
-    prims:   &mut [TriPrimInfo],
-    nodes:   &mut Vec<GpuBvhNode>,
+    prims: &mut [TriPrimInfo],
+    nodes: &mut Vec<GpuBvhNode>,
     ordered: &mut Vec<GpuTriangle>,
-    all:     &[GpuTriangle],
+    all: &[GpuTriangle],
 ) -> usize {
     let node_idx = nodes.len();
     nodes.push(GpuBvhNode::zeroed()); // placeholder
 
-    let bounds = prims.iter().fold(Aabb::empty(), |acc, p| acc.union(&p.bounds));
+    let bounds = prims
+        .iter()
+        .fold(Aabb::empty(), |acc, p| acc.union(&p.bounds));
 
     if prims.len() <= BVH_LEAF_MAX {
         nodes[node_idx] = make_leaf(bounds, ordered, prims, all);
         return node_idx;
     }
 
-    let centroid_bounds = prims.iter().fold(Aabb::empty(), |acc, p| {
-        acc.union(&Aabb::point(p.centroid))
-    });
+    let centroid_bounds = prims
+        .iter()
+        .fold(Aabb::empty(), |acc, p| acc.union(&Aabb::point(p.centroid)));
 
     match find_best_split(prims, &centroid_bounds, &bounds) {
         Some((axis, split_idx)) => {
@@ -177,10 +183,10 @@ fn build_recursive(
 }
 
 fn make_leaf(
-    bounds:  Aabb,
+    bounds: Aabb,
     ordered: &mut Vec<GpuTriangle>,
-    prims:   &[TriPrimInfo],
-    all:     &[GpuTriangle],
+    prims: &[TriPrimInfo],
+    all: &[GpuTriangle],
 ) -> GpuBvhNode {
     let prim_start = ordered.len() as u32;
     for p in prims {
@@ -198,9 +204,9 @@ fn make_leaf(
 
 /// Binned SAH split for triangles.  Identical algorithm to the sphere version.
 fn find_best_split(
-    prims:           &[TriPrimInfo],
+    prims: &[TriPrimInfo],
     centroid_bounds: &Aabb,
-    node_bounds:     &Aabb,
+    node_bounds: &Aabb,
 ) -> Option<(usize, usize)> {
     let parent_half_area = node_bounds.half_area().max(1e-8);
     let leaf_cost = prims.len() as f32;
@@ -293,17 +299,17 @@ pub fn triangle_aabb(verts: &[GpuVertex], tri: &GpuTriangle) -> Aabb {
 /// Material index `mat_idx` is assigned to every triangle.
 #[allow(dead_code)] // used in tests and available as public API for future scenes
 pub fn build_uv_sphere_mesh(
-    center:  [f32; 3],
-    radius:  f32,
-    stacks:  u32,
-    slices:  u32,
+    center: [f32; 3],
+    radius: f32,
+    stacks: u32,
+    slices: u32,
     mat_idx: u32,
 ) -> (Vec<GpuVertex>, Vec<GpuTriangle>) {
     use std::f32::consts::PI;
     let stacks = stacks.max(2);
     let slices = slices.max(3);
 
-    let mut vertices  = Vec::new();
+    let mut vertices = Vec::new();
     let mut triangles = Vec::new();
 
     // Build a (stacks+1) × (slices+1) grid of vertices.
@@ -348,10 +354,16 @@ pub fn build_uv_sphere_mesh(
 
             // Skip cap triangles that would degenerate at the poles.
             if i > 0 {
-                triangles.push(GpuTriangle { v: [v00, v10, v01], mat_idx });
+                triangles.push(GpuTriangle {
+                    v: [v00, v10, v01],
+                    mat_idx,
+                });
             }
             if i + 1 < stacks {
-                triangles.push(GpuTriangle { v: [v01, v10, v11], mat_idx });
+                triangles.push(GpuTriangle {
+                    v: [v01, v10, v11],
+                    mat_idx,
+                });
             }
         }
     }
@@ -367,18 +379,18 @@ pub fn build_uv_sphere_mesh(
 /// Material index `mat_idx` is assigned to every triangle.
 #[allow(dead_code)] // used in tests and available as public API for future scenes
 pub fn build_torus_mesh(
-    center:    [f32; 3],
-    major_r:   f32,
-    minor_r:   f32,
+    center: [f32; 3],
+    major_r: f32,
+    minor_r: f32,
     major_seg: u32,
     minor_seg: u32,
-    mat_idx:   u32,
+    mat_idx: u32,
 ) -> (Vec<GpuVertex>, Vec<GpuTriangle>) {
     use std::f32::consts::PI;
     let major_seg = major_seg.max(3);
     let minor_seg = minor_seg.max(3);
 
-    let mut vertices  = Vec::new();
+    let mut vertices = Vec::new();
     let mut triangles = Vec::new();
 
     for i in 0..=major_seg {
@@ -403,7 +415,7 @@ pub fn build_torus_mesh(
 
             vertices.push(GpuVertex {
                 position: [px, py, pz, 1.0],
-                normal:   [nx, ny, nz, 0.0],
+                normal: [nx, ny, nz, 0.0],
                 uv: [
                     i as f32 / major_seg as f32,
                     j as f32 / minor_seg as f32,
@@ -423,8 +435,14 @@ pub fn build_torus_mesh(
             let v01 = i * ring + (j + 1);
             let v11 = (i + 1) * ring + (j + 1);
 
-            triangles.push(GpuTriangle { v: [v00, v10, v01], mat_idx });
-            triangles.push(GpuTriangle { v: [v01, v10, v11], mat_idx });
+            triangles.push(GpuTriangle {
+                v: [v00, v10, v01],
+                mat_idx,
+            });
+            triangles.push(GpuTriangle {
+                v: [v01, v10, v11],
+                mat_idx,
+            });
         }
     }
 
@@ -455,9 +473,9 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
         std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals:   Vec<[f32; 3]> = Vec::new();
-    let mut uvs:       Vec<[f32; 2]> = Vec::new();
-    let mut vertices:  Vec<GpuVertex> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
+    let mut vertices: Vec<GpuVertex> = Vec::new();
     let mut triangles: Vec<GpuTriangle> = Vec::new();
 
     // Map (pos_idx, uv_idx, norm_idx) → GpuVertex index for deduplication.
@@ -484,7 +502,7 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
         let mut parts = line.split_ascii_whitespace();
         let tag = match parts.next() {
             Some(t) => t,
-            None    => continue,
+            None => continue,
         };
         let rest: Vec<&str> = parts.collect();
 
@@ -511,13 +529,22 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                 let mut face_verts: Vec<u32> = Vec::with_capacity(rest.len());
                 for token in &rest {
                     let parts: Vec<&str> = token.split('/').collect();
-                    let pi = parts.first()
+                    let pi = parts
+                        .first()
                         .and_then(|s| resolve(s, positions.len()))
                         .unwrap_or(0);
-                    let ti = parts.get(1)
-                        .and_then(|s| if s.is_empty() { None } else { resolve(s, uvs.len()) })
+                    let ti = parts
+                        .get(1)
+                        .and_then(|s| {
+                            if s.is_empty() {
+                                None
+                            } else {
+                                resolve(s, uvs.len())
+                            }
+                        })
                         .unwrap_or(u32::MAX);
-                    let ni = parts.get(2)
+                    let ni = parts
+                        .get(2)
                         .and_then(|s| resolve(s, normals.len()))
                         .unwrap_or(u32::MAX);
 
@@ -529,14 +556,19 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                     let vert_idx = if ni != u32::MAX {
                         let key = (pi, ti, ni);
                         *vert_cache.entry(key).or_insert_with(|| {
-                            let pos    = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
-                            let normal = normals.get(ni as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
-                            let uv     = if ti != u32::MAX { uvs.get(ti as usize).copied().unwrap_or([0.0; 2]) } else { [0.0; 2] };
-                            let idx    = vertices.len() as u32;
+                            let pos = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
+                            let normal =
+                                normals.get(ni as usize).copied().unwrap_or([0.0, 1.0, 0.0]);
+                            let uv = if ti != u32::MAX {
+                                uvs.get(ti as usize).copied().unwrap_or([0.0; 2])
+                            } else {
+                                [0.0; 2]
+                            };
+                            let idx = vertices.len() as u32;
                             vertices.push(GpuVertex {
                                 position: [pos[0], pos[1], pos[2], 1.0],
-                                normal:   [normal[0], normal[1], normal[2], 0.0],
-                                uv:       [uv[0], uv[1], 0.0, 0.0],
+                                normal: [normal[0], normal[1], normal[2], 0.0],
+                                uv: [uv[0], uv[1], 0.0, 0.0],
                             });
                             idx
                         })
@@ -545,12 +577,16 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                         // The geometric normal will be patched below after all three
                         // vertex indices for this triangle are known.
                         let pos = positions.get(pi as usize).copied().unwrap_or([0.0; 3]);
-                        let uv  = if ti != u32::MAX { uvs.get(ti as usize).copied().unwrap_or([0.0; 2]) } else { [0.0; 2] };
+                        let uv = if ti != u32::MAX {
+                            uvs.get(ti as usize).copied().unwrap_or([0.0; 2])
+                        } else {
+                            [0.0; 2]
+                        };
                         let idx = vertices.len() as u32;
                         vertices.push(GpuVertex {
                             position: [pos[0], pos[1], pos[2], 1.0],
-                            normal:   [0.0, 1.0, 0.0, 0.0], // placeholder; patched below
-                            uv:       [uv[0], uv[1], 0.0, 0.0],
+                            normal: [0.0, 1.0, 0.0, 0.0], // placeholder; patched below
+                            uv: [uv[0], uv[1], 0.0, 0.0],
                         });
                         idx
                     };
@@ -567,7 +603,9 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                     // u32::MAX), patch it with this triangle's geometric normal.
                     let keys = [rest[0], rest[i], rest.get(i + 1).copied().unwrap_or("")];
                     for (vi, token) in [(v0, keys[0]), (v1, keys[1]), (v2, keys[2])] {
-                        let has_norm = token.split('/').nth(2)
+                        let has_norm = token
+                            .split('/')
+                            .nth(2)
                             .map(|s| !s.is_empty() && s.parse::<i64>().is_ok())
                             .unwrap_or(false);
                         if !has_norm {
@@ -578,12 +616,14 @@ pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTria
                             let e1 = sub3(p1, p0);
                             let e2 = sub3(p2, p0);
                             let gn = normalize3(cross3(e1, e2));
-                            vertices[vi as usize].normal =
-                                [gn[0], gn[1], gn[2], 0.0];
+                            vertices[vi as usize].normal = [gn[0], gn[1], gn[2], 0.0];
                         }
                     }
 
-                    triangles.push(GpuTriangle { v: [v0, v1, v2], mat_idx });
+                    triangles.push(GpuTriangle {
+                        v: [v0, v1, v2],
+                        mat_idx,
+                    });
                 }
             }
             _ => {}
@@ -665,7 +705,10 @@ mod tests {
         for v in &verts {
             let n = v.normal;
             let len_sq = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
-            assert!((len_sq - 1.0).abs() < 1e-5, "normal not unit length: {len_sq}");
+            assert!(
+                (len_sq - 1.0).abs() < 1e-5,
+                "normal not unit length: {len_sq}"
+            );
         }
     }
 
@@ -679,7 +722,10 @@ mod tests {
             let dy = v.position[1] - center[1];
             let dz = v.position[2] - center[2];
             let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-            assert!((dist - radius).abs() < 1e-4, "vertex not on sphere surface: dist={dist}");
+            assert!(
+                (dist - radius).abs() < 1e-4,
+                "vertex not on sphere surface: dist={dist}"
+            );
         }
     }
 
@@ -734,10 +780,7 @@ mod tests {
         let n = result.nodes.len();
         for (i, node) in result.nodes.iter().enumerate() {
             if node.prim_count == 0 {
-                assert!(
-                    (i + 1) < n,
-                    "internal node {i}: left child {}", i + 1
-                );
+                assert!((i + 1) < n, "internal node {i}: left child {}", i + 1);
                 assert!(
                     (node.right_or_offset as usize) < n,
                     "internal node {i}: right child {} out of bounds (n={n})",
@@ -755,23 +798,42 @@ mod tests {
         let result = build_mesh_bvh(&verts, &tris);
 
         let rays: &[([f32; 3], [f32; 3])] = &[
-            ([0.0, 5.0,  0.0], [0.0, -1.0,  0.0]),
-            ([0.0, 0.0,  5.0], [0.0,  0.0, -1.0]),
-            ([2.0, 2.0,  2.0], [-1.0, -1.0, -1.0]),
+            ([0.0, 5.0, 0.0], [0.0, -1.0, 0.0]),
+            ([0.0, 0.0, 5.0], [0.0, 0.0, -1.0]),
+            ([2.0, 2.0, 2.0], [-1.0, -1.0, -1.0]),
         ];
 
         for &(origin, dir) in rays {
-            let len = (dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]).sqrt();
-            let d = [dir[0]/len, dir[1]/len, dir[2]/len];
+            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let d = [dir[0] / len, dir[1] / len, dir[2] / len];
 
-            let bf_t  = brute_force_tri_hit(&result.vertices, &result.ordered_triangles, origin, d, 1e-4, 1e9);
-            let bvh_t = bvh_tri_traverse(&result.nodes, &result.vertices, &result.ordered_triangles, origin, d, 1e-4, 1e9);
+            let bf_t = brute_force_tri_hit(
+                &result.vertices,
+                &result.ordered_triangles,
+                origin,
+                d,
+                1e-4,
+                1e9,
+            );
+            let bvh_t = bvh_tri_traverse(
+                &result.nodes,
+                &result.vertices,
+                &result.ordered_triangles,
+                origin,
+                d,
+                1e-4,
+                1e9,
+            );
 
             match (bf_t, bvh_t) {
                 (None, None) => {}
-                (Some(a), Some(b)) => assert!((a-b).abs() < 1e-3, "bf={a} bvh={b}"),
-                (Some(a), None)    => panic!("brute-force hit t={a} but BVH missed, ray {origin:?} {d:?}"),
-                (None, Some(b))    => panic!("BVH hit t={b} but brute-force missed, ray {origin:?} {d:?}"),
+                (Some(a), Some(b)) => assert!((a - b).abs() < 1e-3, "bf={a} bvh={b}"),
+                (Some(a), None) => {
+                    panic!("brute-force hit t={a} but BVH missed, ray {origin:?} {d:?}")
+                }
+                (None, Some(b)) => {
+                    panic!("BVH hit t={b} but brute-force missed, ray {origin:?} {d:?}")
+                }
             }
         }
     }
@@ -780,9 +842,9 @@ mod tests {
 
     fn brute_force_tri_hit(
         verts: &[GpuVertex],
-        tris:  &[GpuTriangle],
-        o:     [f32; 3],
-        d:     [f32; 3],
+        tris: &[GpuTriangle],
+        o: [f32; 3],
+        d: [f32; 3],
         t_min: f32,
         t_max: f32,
     ) -> Option<f32> {
@@ -800,14 +862,16 @@ mod tests {
     fn bvh_tri_traverse(
         nodes: &[crate::bvh::GpuBvhNode],
         verts: &[GpuVertex],
-        tris:  &[GpuTriangle],
-        o:     [f32; 3],
-        d:     [f32; 3],
+        tris: &[GpuTriangle],
+        o: [f32; 3],
+        d: [f32; 3],
         t_min: f32,
         t_max: f32,
     ) -> Option<f32> {
         use crate::bvh::GpuBvhNode;
-        if nodes.is_empty() { return None; }
+        if nodes.is_empty() {
+            return None;
+        }
         let mut best = t_max;
         let mut found = false;
         let mut stack = [0u32; 32];
@@ -822,7 +886,7 @@ mod tests {
             }
             if node.prim_count > 0 {
                 let start = node.right_or_offset as usize;
-                let end   = start + node.prim_count as usize;
+                let end = start + node.prim_count as usize;
                 for tri in &tris[start..end] {
                     if let Some(t) = moller_trumbore(verts, tri, o, d, t_min, best) {
                         best = t;
@@ -830,16 +894,18 @@ mod tests {
                     }
                 }
             } else if sp < 30 {
-                sp += 1; stack[sp as usize] = node.right_or_offset;
-                sp += 1; stack[sp as usize] = (idx + 1) as u32;
+                sp += 1;
+                stack[sp as usize] = node.right_or_offset;
+                sp += 1;
+                stack[sp as usize] = (idx + 1) as u32;
             }
         }
         if found { Some(best) } else { None }
     }
 
     fn cpu_aabb_hit(
-        o:     [f32; 3],
-        d:     [f32; 3],
+        o: [f32; 3],
+        d: [f32; 3],
         bb_min: [f32; 4],
         bb_max: [f32; 4],
         t_min: f32,
@@ -857,7 +923,9 @@ mod tests {
             let tb = (bb_max[i] - o[i]) * inv_d;
             t0 = t0.max(ta.min(tb));
             t1 = t1.min(ta.max(tb));
-            if t1 <= t0 { return false; }
+            if t1 <= t0 {
+                return false;
+            }
         }
         true
     }
@@ -865,9 +933,9 @@ mod tests {
     /// CPU Möller-Trumbore for the test traversal.
     fn moller_trumbore(
         verts: &[GpuVertex],
-        tri:   &GpuTriangle,
-        o:     [f32; 3],
-        d:     [f32; 3],
+        tri: &GpuTriangle,
+        o: [f32; 3],
+        d: [f32; 3],
         t_min: f32,
         t_max: f32,
     ) -> Option<f32> {
@@ -875,20 +943,30 @@ mod tests {
         let p1 = &verts[tri.v[1] as usize].position;
         let p2 = &verts[tri.v[2] as usize].position;
 
-        let e1 = [p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2]];
-        let e2 = [p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2]];
+        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
 
         let h = cross3(d, e2);
-        let a = e1[0]*h[0]+e1[1]*h[1]+e1[2]*h[2]; // dot(e1, h)
-        if a.abs() < 1e-8 { return None; }
-        let f  = 1.0 / a;
-        let s  = [o[0]-p0[0], o[1]-p0[1], o[2]-p0[2]];
-        let u  = f * (s[0]*h[0]+s[1]*h[1]+s[2]*h[2]);
-        if u < 0.0 || u > 1.0 { return None; }
-        let q  = cross3(s, e1);
-        let v  = f * (d[0]*q[0]+d[1]*q[1]+d[2]*q[2]);
-        if v < 0.0 || u + v > 1.0 { return None; }
-        let t  = f * (e2[0]*q[0]+e2[1]*q[1]+e2[2]*q[2]);
-        if t > t_min && t < t_max { Some(t) } else { None }
+        let a = e1[0] * h[0] + e1[1] * h[1] + e1[2] * h[2]; // dot(e1, h)
+        if a.abs() < 1e-8 {
+            return None;
+        }
+        let f = 1.0 / a;
+        let s = [o[0] - p0[0], o[1] - p0[1], o[2] - p0[2]];
+        let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
+        if u < 0.0 || u > 1.0 {
+            return None;
+        }
+        let q = cross3(s, e1);
+        let v = f * (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]);
+        if v < 0.0 || u + v > 1.0 {
+            return None;
+        }
+        let t = f * (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]);
+        if t > t_min && t < t_max {
+            Some(t)
+        } else {
+            None
+        }
     }
 }

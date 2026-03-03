@@ -187,10 +187,10 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Support emissive surfaces and reduce noise with next-event estimation.
 
-- [ ] Add emissive material type (emission color + strength)
-- [ ] Implement direct light sampling (next-event estimation / shadow rays)
-- [ ] Multiple Importance Sampling (MIS) to combine BSDF sampling and light sampling
-- [ ] Maintain a list of emissive primitives for direct sampling
+- [x] Add emissive material type (emission color + strength)
+- [x] Implement direct light sampling (next-event estimation / shadow rays)
+- [x] Multiple Importance Sampling (MIS) to combine BSDF sampling and light sampling
+- [x] Maintain a list of emissive primitives for direct sampling
 
 **Output:** Scenes with area lights and significantly reduced noise.
 

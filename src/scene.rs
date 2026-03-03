@@ -43,6 +43,10 @@ enum MaterialKind {
     Lambertian,
     Metal,
     Dielectric,
+    /// Phase 13: emissive surface / area light.
+    /// `albedo` is the emission colour; `emission_strength` is the luminance
+    /// multiplier (defaults to 1.0).  Emissive materials do not scatter rays.
+    Emissive,
 }
 
 /// Camera placement and lens settings parsed from the YAML `camera:` block.
@@ -86,13 +90,15 @@ pub struct SceneCameraSettings {
 /// - `albedo` → `[1.0, 1.0, 1.0]`
 /// - `fuzz` → `0.0`  (metal roughness)
 /// - `ior` → `1.5`   (dielectric index of refraction)
+/// - `emission_strength` → `1.0`  (emissive luminance multiplier)
 /// - `texture_layer` → `0` (no albedo texture)
 #[derive(serde::Deserialize, Clone, Debug)]
 struct MaterialDesc {
-    /// Shading model: `lambertian`, `metal`, or `dielectric`.
+    /// Shading model: `lambertian`, `metal`, `dielectric`, or `emissive`.
     #[serde(rename = "type")]
     kind: MaterialKind,
-    /// RGB albedo colour.  Defaults to `[1.0, 1.0, 1.0]`.
+    /// RGB albedo colour.  For `emissive` materials this is the emission colour.
+    /// Defaults to `[1.0, 1.0, 1.0]`.
     #[serde(default)]
     albedo: Option<[f32; 3]>,
     /// Metal roughness ∈ [0, 1].  Defaults to `0.0` (mirror).
@@ -101,6 +107,10 @@ struct MaterialDesc {
     /// Index of refraction for dielectrics.  Defaults to `1.5`.
     #[serde(default)]
     ior: Option<f32>,
+    /// Phase 13: emission luminance multiplier for `emissive` materials.
+    /// Higher values produce brighter lights.  Defaults to `1.0`.
+    #[serde(default)]
+    emission_strength: Option<f32>,
     /// Albedo texture array layer (Phase 11).  `0` = no texture / white.
     #[serde(default)]
     texture_layer: u32,
@@ -202,22 +212,45 @@ pub struct LoadedScene {
     /// Camera placement & lens settings.  `Some` when the YAML includes a
     /// `camera:` block; `None` when the built-in defaults should be used.
     pub camera: Option<SceneCameraSettings>,
+    /// Phase 13: flat list of emissive sphere primitives for direct light
+    /// sampling (Next-Event Estimation).
+    ///
+    /// Contains only spheres whose material type is `emissive`.  The count is
+    /// also stored in `materials.n_emissive` for the GPU shader.
+    /// May be empty when the scene has no emissive spheres; `gpu.rs` appends a
+    /// stub entry to satisfy wgpu's minimum-buffer-binding-size requirement.
+    ///
+    /// Note: emissive *mesh* triangles are not tracked here (Phase 13 scope).
+    pub emissive_spheres: Vec<GpuSphere>,
 }
 
 // Convert a YAML MaterialDesc into a GPU-ready GpuMaterial.
 fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
-    let mat_type: u32 = match desc.kind {
-        MaterialKind::Lambertian => 0,
-        MaterialKind::Metal => 1,
-        MaterialKind::Dielectric => 2,
-    };
+    use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};
     let albedo = desc.albedo.unwrap_or([1.0, 1.0, 1.0]);
-    let fuzz = desc.fuzz.unwrap_or(0.0);
-    let ior = desc.ior.unwrap_or(1.5);
-    crate::material::GpuMaterial {
-        type_pad: [mat_type, desc.texture_layer, 0, 0],
-        albedo_fuzz: [albedo[0], albedo[1], albedo[2], fuzz],
-        ior_pad: [ior, 0.0, 0.0, 0.0],
+    match desc.kind {
+        MaterialKind::Lambertian => crate::material::GpuMaterial {
+            type_pad:    [MAT_LAMBERTIAN, desc.texture_layer, 0, 0],
+            albedo_fuzz: [albedo[0], albedo[1], albedo[2], 0.0],
+            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+        },
+        MaterialKind::Metal => crate::material::GpuMaterial {
+            type_pad:    [MAT_METAL, desc.texture_layer, 0, 0],
+            albedo_fuzz: [albedo[0], albedo[1], albedo[2], desc.fuzz.unwrap_or(0.0)],
+            ior_pad:     [1.0, 0.0, 0.0, 0.0],
+        },
+        MaterialKind::Dielectric => crate::material::GpuMaterial {
+            type_pad:    [MAT_DIELECTRIC, 0, 0, 0],
+            albedo_fuzz: [1.0, 1.0, 1.0, 0.0],
+            ior_pad:     [desc.ior.unwrap_or(1.5), 0.0, 0.0, 0.0],
+        },
+        // Emissive: albedo_fuzz.xyz = emission colour; ior_pad.x = strength.
+        // These materials terminate paths and serve as area lights for NEE.
+        MaterialKind::Emissive => crate::material::GpuMaterial {
+            type_pad:    [MAT_EMISSIVE, 0, 0, 0],
+            albedo_fuzz: [albedo[0], albedo[1], albedo[2], 0.0],
+            ior_pad:     [desc.emission_strength.unwrap_or(1.0), 0.0, 0.0, 0.0],
+        },
     }
 }
 
@@ -343,6 +376,20 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
     mat_data.mat_count = gpu_mats.len() as u32;
     mat_data.materials[..gpu_mats.len()].copy_from_slice(&gpu_mats);
 
+    // Phase 13: build the flat list of emissive sphere primitives.
+    // The GPU shader uses this list for Next-Event Estimation (NEE).
+    // Only sphere objects are tracked; emissive mesh triangles are out of scope.
+    let emissive_spheres: Vec<GpuSphere> = spheres
+        .iter()
+        .filter(|s| {
+            let idx = s.mat_and_pad[0] as usize;
+            idx < gpu_mats.len()
+                && gpu_mats[idx].type_pad[0] == crate::material::MAT_EMISSIVE
+        })
+        .copied()
+        .collect();
+    mat_data.n_emissive = emissive_spheres.len() as u32;
+
     // Convert the optional camera block.
     let camera = scene.camera.as_ref().map(|c| {
         let look_from = c.look_from;
@@ -370,6 +417,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
         mesh_vertices,
         mesh_triangles,
         camera,
+        emissive_spheres,
     }
 }
 
@@ -582,11 +630,11 @@ mod tests {
     // All tests use self-contained inline YAML so they are independent of the
     // contents of `assets/scene.yaml` on disk.
 
-    /// Minimal self-contained scene fixture used by multiple Phase 12 tests.
+    /// Minimal self-contained scene fixture used by multiple Phase 12/13 tests.
     ///
     /// Contains:
-    ///   - 5 named materials (ground, glass, metal, red, bunny)
-    ///   - 4 spheres with known positions and material indices 0-3
+    ///   - 6 named materials (ground, glass, metal, red, bunny, light)
+    ///   - 5 spheres (4 non-emissive + 1 emissive area light at [-2,4,0] r=0.5)
     ///   - 1 mesh object (models/bunny.obj, scale 8, translated onto ground)
     ///   - camera block (look_from=[4,3,8], look_at=[0,0.5,0], vfov=40, aperture=0.1)
     const FIXTURE_SCENE: &str = r#"
@@ -602,12 +650,14 @@ materials:
   metal:  { type: metal,      albedo: [0.8, 0.6, 0.2], fuzz: 0.1 }
   red:    { type: lambertian, albedo: [0.7, 0.1, 0.1] }
   bunny:  { type: lambertian, albedo: [0.1, 0.1, 0.65] }
+  light:  { type: emissive,   albedo: [1.0, 0.85, 0.7], emission_strength: 8.0 }
 
 objects:
   - { type: sphere, center: [0.0, -100.0, 0.0], radius: 100.0, material: ground }
   - { type: sphere, center: [0.0,   2.5,  0.0], radius: 1.0,   material: glass  }
   - { type: sphere, center: [-4.0,  1.0,  0.0], radius: 1.0,   material: metal  }
   - { type: sphere, center: [4.0,   1.0,  0.0], radius: 1.0,   material: red    }
+  - { type: sphere, center: [-2.0,  4.0,  0.0], radius: 0.5,   material: light  }
   - type: mesh
     path: models/bunny.obj
     material: bunny
@@ -618,8 +668,8 @@ objects:
     #[test]
     fn yaml_scene_sphere_count() {
         let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
-        // FIXTURE_SCENE has exactly 4 sphere objects.
-        assert_eq!(loaded.spheres.len(), 4);
+        // FIXTURE_SCENE has 5 sphere objects (4 non-emissive + 1 light).
+        assert_eq!(loaded.spheres.len(), 5);
     }
 
     #[test]
@@ -647,8 +697,58 @@ objects:
     #[test]
     fn yaml_scene_material_count() {
         let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
-        // FIXTURE_SCENE declares 5 named materials: ground, glass, metal, red, bunny.
-        assert_eq!(loaded.materials.mat_count, 5);
+        // FIXTURE_SCENE declares 6 named materials: ground, glass, metal, red, bunny, light.
+        assert_eq!(loaded.materials.mat_count, 6);
+    }
+
+    // ----- Phase 13: emissive material tests -------------------------------
+
+    #[test]
+    fn yaml_scene_emissive_sphere_tracked() {
+        // FIXTURE_SCENE has exactly one emissive sphere (the `light` material).
+        let loaded = load_scene_from_str(FIXTURE_SCENE, "<fixture>");
+        assert_eq!(
+            loaded.emissive_spheres.len(), 1,
+            "expected 1 emissive sphere, got {}",
+            loaded.emissive_spheres.len()
+        );
+        assert_eq!(loaded.materials.n_emissive, 1);
+        // Verify the emissive sphere's position and radius match the fixture.
+        assert_eq!(loaded.emissive_spheres[0].center_r, [-2.0_f32, 4.0, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn yaml_scene_no_emissive_when_none_declared() {
+        let yaml = r#"
+materials:
+  wall: { type: lambertian, albedo: [0.8, 0.8, 0.8] }
+objects:
+  - { type: sphere, center: [0, 0, 0], radius: 1, material: wall }
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        assert_eq!(loaded.emissive_spheres.len(), 0, "expected no emissive spheres");
+        assert_eq!(loaded.materials.n_emissive, 0);
+    }
+
+    #[test]
+    fn yaml_scene_emissive_material_gpu_type() {
+        // The GPU material type field must be MAT_EMISSIVE (3) for emissive mats.
+        let yaml = r#"
+materials:
+  sun: { type: emissive, albedo: [1.0, 0.9, 0.7], emission_strength: 10.0 }
+objects:
+  - { type: sphere, center: [0, 5, 0], radius: 1.0, material: sun }
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        assert_eq!(loaded.materials.mat_count, 1);
+        assert_eq!(
+            loaded.materials.materials[0].type_pad[0],
+            crate::material::MAT_EMISSIVE,
+            "emissive material must have GPU type = MAT_EMISSIVE"
+        );
+        // Emission colour stored in albedo_fuzz.xyz, strength in ior_pad.x.
+        assert!((loaded.materials.materials[0].albedo_fuzz[0] - 1.0).abs() < 1e-5);
+        assert!((loaded.materials.materials[0].ior_pad[0] - 10.0).abs() < 1e-5);
     }
 
     #[test]
