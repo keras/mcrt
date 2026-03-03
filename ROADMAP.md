@@ -114,11 +114,11 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Interactive camera with mouse/keyboard input.
 
-- [ ] Implement an orbit camera (yaw, pitch, distance) controlled by mouse drag
-- [ ] Keyboard WASD for translation, scroll for zoom / FOV adjustment
-- [ ] Defocus blur (depth of field): thin lens model with aperture radius + focus distance
-- [ ] Upload updated camera uniform each frame; reset accumulation on change
-- [ ] Smooth interpolation for camera movement
+- [x] Implement an orbit camera (yaw, pitch, distance) controlled by mouse drag
+- [x] Keyboard WASD for translation, scroll for zoom / FOV adjustment
+- [x] Defocus blur (depth of field): thin lens model with aperture radius + focus distance
+- [x] Upload updated camera uniform each frame; reset accumulation on change
+- [x] Smooth interpolation for camera movement
 
 **Output:** Freely navigable scene with optional depth-of-field effect.
 

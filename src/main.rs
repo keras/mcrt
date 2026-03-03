@@ -17,8 +17,9 @@ use wgpu::{
 };
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
 };
 
@@ -60,65 +61,93 @@ fn create_accum_texture(
 // Phase 3: camera uniform
 // ---------------------------------------------------------------------------
 
-/// GPU-side camera layout.  All fields are vec4 so the struct is naturally
-/// 16-byte aligned without any padding — safe to cast directly with bytemuck.
+/// GPU-side camera layout.  All fields use vec4 packing (16-byte aligned),
+/// matching the WGSL `Camera` struct exactly.  Total size = 112 bytes.
+///
+/// Phase 8 adds `defocus_u` / `defocus_v` for the thin-lens depth-of-field
+/// model:
+///   defocus_u = cam_right × lens_radius
+///   defocus_v = cam_up    × lens_radius
+/// Both are zero for a pinhole camera (aperture = 0).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
-    /// Eye position in world space.  `.w` is unused padding.
-    origin: [f32; 4],
-    /// Lower-left corner of the virtual screen in world space.  `.w` unused.
+    /// Eye position in world space.  `.w` unused.
+    origin:     [f32; 4],
+    /// Lower-left corner of the virtual screen on the focus plane.  `.w` unused.
     lower_left: [f32; 4],
-    /// Full horizontal extent of the virtual screen (right − left).  `.w` unused.
+    /// Full horizontal extent of the screen on the focus plane.  `.w` unused.
     horizontal: [f32; 4],
-    /// Full vertical extent of the virtual screen (top − bottom).  `.w` unused.
-    vertical: [f32; 4],
-    /// Monotonically increasing frame index.  Stored as `u32` (not `f32`) so it
-    /// remains exact beyond 2²⁴ frames (~77 h at 60 fps with f32 precision).
-    /// Read directly as `u32` in WGSL to seed the per-pixel PRNG.
+    /// Full vertical extent of the screen on the focus plane.  `.w` unused.
+    vertical:   [f32; 4],
+    /// Camera right-basis scaled by lens radius.  Zero for pinhole camera.
+    defocus_u:  [f32; 4],
+    /// Camera up-basis   scaled by lens radius.  Zero for pinhole camera.
+    defocus_v:  [f32; 4],
+    /// Monotonically increasing frame index.  `u32` to stay exact beyond 2²⁴.
     frame_count: u32,
     _pad: [u32; 3],
 }
 
-/// Compute the camera uniform for a pinhole camera.
+/// Compute the camera uniform for a thin-lens camera with optional depth of field.
 ///
-/// - `width` / `height`: viewport dimensions (used to derive aspect ratio)
-/// - `look_from`: eye position in world space
-/// - `look_at`:   point the camera is aimed at
+/// - `width` / `height`:  viewport dimensions (aspect ratio source)
+/// - `look_from`:         eye position in world space
+/// - `look_at`:           orbit target / aim point
+/// - `vfov_deg`:          vertical field of view in degrees
+/// - `aperture`:          lens diameter in world units (0 = pinhole, no blur)
+/// - `focus_dist`:        distance from eye to the plane of sharp focus
 ///
-/// `vup` (world up) and `vfov` (60°) are fixed; they will become parameters
-/// in Phase 8 when interactive camera controls are added.
-fn compute_camera(width: u32, height: u32, look_from: Vec3, look_at: Vec3) -> CameraUniform {
-    let aspect = width as f32 / height as f32;
-    let vup = Vec3::new(0.0, 1.0, 0.0);
-    let vfov_rad = 60.0_f32.to_radians();
+/// The virtual screen (lower_left / horizontal / vertical) is placed on the
+/// focus plane so all rays passing through the same screen point converge there,
+/// regardless of aperture.
+fn compute_camera(
+    width: u32,
+    height: u32,
+    look_from: Vec3,
+    look_at: Vec3,
+    vfov_deg: f32,
+    aperture: f32,
+    focus_dist: f32,
+) -> CameraUniform {
+    let aspect   = width as f32 / height as f32;
+    let vup      = Vec3::new(0.0, 1.0, 0.0);
+    let vfov_rad = vfov_deg.to_radians();
 
-    // Half-height of the near plane at unit focal distance.
-    let h = (vfov_rad * 0.5).tan();
+    // Half-height at unit distance from the eye.
+    let h              = (vfov_rad * 0.5).tan();
     let viewport_height = 2.0 * h;
-    let viewport_width = aspect * viewport_height;
+    let viewport_width  = aspect * viewport_height;
 
     // Orthonormal camera basis (right-handed, Z points toward the viewer).
     let w = (look_from - look_at).normalize(); // backward
-                                               // Guard: if vup is parallel to w the cross product is zero → NaN.
+    // Guard: if vup is parallel to w, cross product is zero → NaN.
     debug_assert!(
         vup.cross(w).length_squared() > 1e-10,
         "camera vup is parallel to view direction (gimbal lock)"
     );
-    let u = vup.cross(w).normalize(); // right
-    let v = w.cross(u); // up (already unit: w⊥u, both unit)
+    let cam_u = vup.cross(w).normalize(); // right
+    let cam_v = w.cross(cam_u);           // up (already unit: w⊥cam_u, both unit)
 
-    let horizontal = viewport_width * u;
-    let vertical = viewport_height * v;
-    let lower_left = look_from - horizontal * 0.5 - vertical * 0.5 - w;
+    // Scale screen extents by focus_dist so the virtual screen sits exactly
+    // on the plane of sharp focus.
+    let horizontal = focus_dist * viewport_width  * cam_u;
+    let vertical   = focus_dist * viewport_height * cam_v;
+    let lower_left = look_from - horizontal * 0.5 - vertical * 0.5 - focus_dist * w;
+
+    // Lens disk basis vectors (zero for pinhole where aperture = 0).
+    let lens_radius = aperture * 0.5;
+    let defocus_u   = cam_u * lens_radius;
+    let defocus_v   = cam_v * lens_radius;
 
     CameraUniform {
-        origin: look_from.extend(0.0).to_array(),
+        origin:     look_from.extend(0.0).to_array(),
         lower_left: lower_left.extend(0.0).to_array(),
         horizontal: horizontal.extend(0.0).to_array(),
-        vertical: vertical.extend(0.0).to_array(),
-        // frame_count is set by the caller (render()) after camera construction.
-        frame_count: 0,
+        vertical:   vertical.extend(0.0).to_array(),
+        defocus_u:  defocus_u.extend(0.0).to_array(),
+        defocus_v:  defocus_v.extend(0.0).to_array(),
+        frame_count: 0, // caller sets this before uploading
         _pad: [0; 3],
     }
 }
@@ -279,9 +308,36 @@ struct GpuState {
     scene_buffer: wgpu::Buffer,
     // Phase 7: material descriptors
     material_buffer: wgpu::Buffer,
-    /// Monotonically increasing frame index; resets to 0 on resize so the
-    /// accumulation restarts from a clean state.
+    /// Monotonically increasing frame index; resets to 0 on camera movement or resize.
     frame_count: u32,
+
+    // ---- Phase 8: orbit camera state ----------------------------------------
+    /// Current (smoothed) yaw: rotation around the Y axis, radians.
+    cam_yaw:        f32,
+    /// Current (smoothed) pitch: elevation angle, radians.  Clamped to ±85°.
+    cam_pitch:      f32,
+    /// Current (smoothed) orbital radius: metres from look_at to eye.
+    cam_distance:   f32,
+    /// Orbit target point (world space).
+    cam_look_at:    Vec3,
+    /// Vertical field of view in degrees (user-controllable via scroll FOV mode).
+    cam_vfov:       f32,
+    /// Lens aperture diameter in world units (0 = pinhole, no DoF blur).
+    cam_aperture:   f32,
+    /// Distance from eye to the plane of sharp focus.
+    cam_focus_dist: f32,
+
+    // Smooth-interpolation targets — user input writes here; render() lerps actual → target.
+    tgt_yaw:        f32,
+    tgt_pitch:      f32,
+    tgt_distance:   f32,
+    tgt_look_at:    Vec3,
+
+    // Mouse drag state.
+    drag_active:  bool,
+    last_cursor:  Option<winit::dpi::PhysicalPosition<f64>>,
+    /// Held WASD keys: index 0=W, 1=A, 2=S, 3=D.
+    wasd_held:    [bool; 4],
 }
 
 impl GpuState {
@@ -566,6 +622,16 @@ impl GpuState {
             cache: None,
         });
 
+        // ---- Phase 8: orbit camera initial state -------------------------
+        // Derive orbit parameters from the Phase 6 static camera position so
+        // the scene looks identical on first launch.
+        let init_look_from = Vec3::new(0.0, 1.0, 3.5);
+        let init_look_at   = Vec3::ZERO;
+        let delta          = init_look_from - init_look_at;
+        let init_dist      = delta.length();
+        let init_pitch     = (delta.y / init_dist).asin();
+        let init_yaw       = f32::atan2(delta.x, delta.z);
+
         Self {
             surface,
             device,
@@ -584,6 +650,21 @@ impl GpuState {
             scene_buffer,
             material_buffer,
             frame_count: 0,
+            // Phase 8: orbit camera
+            cam_yaw:        init_yaw,
+            cam_pitch:      init_pitch,
+            cam_distance:   init_dist,
+            cam_look_at:    init_look_at,
+            cam_vfov:       60.0,
+            cam_aperture:   0.0,          // pinhole — no DoF blur
+            cam_focus_dist: init_dist,    // focus at orbit distance
+            tgt_yaw:        init_yaw,
+            tgt_pitch:      init_pitch,
+            tgt_distance:   init_dist,
+            tgt_look_at:    init_look_at,
+            drag_active:    false,
+            last_cursor:    None,
+            wasd_held:      [false; 4],
         }
     }
 
@@ -682,11 +763,48 @@ impl GpuState {
         self.frame_count = 0;
     }
 
+    /// Returns the eye position in world space derived from the current orbit params.
+    fn look_from(&self) -> Vec3 {
+        let cos_p = self.cam_pitch.cos();
+        self.cam_look_at
+            + Vec3::new(
+                self.cam_distance * self.cam_yaw.sin() * cos_p,
+                self.cam_distance * self.cam_pitch.sin(),
+                self.cam_distance * self.cam_yaw.cos() * cos_p,
+            )
+    }
+
     fn render(&mut self) -> Result<(), SurfaceError> {
-        // Static camera for Phase 6 (orbit disabled so the image converges).
-        // Phase 8 will restore interactive controls.
-        let look_from = Vec3::new(0.0, 1.0, 3.5);
-        let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
+        // ---- Phase 8: smooth interpolation toward camera targets ----------
+        // Exponential ease: each frame covers `LERP` fraction of the remaining gap.
+        // At 60 fps this settles to < 1 % error in ~30 frames (~0.5 s).
+        const LERP: f32 = 0.15;
+        let prev_look_from = self.look_from();
+
+        self.cam_yaw      += (self.tgt_yaw      - self.cam_yaw)      * LERP;
+        self.cam_pitch    += (self.tgt_pitch     - self.cam_pitch)    * LERP;
+        self.cam_distance += (self.tgt_distance  - self.cam_distance) * LERP;
+        self.cam_look_at  += (self.tgt_look_at   - self.cam_look_at)  * LERP;
+        // Keep focus_dist tracking orbit distance so the scene stays sharp.
+        self.cam_focus_dist = self.cam_distance;
+
+        let look_from   = self.look_from();
+        let look_at     = self.cam_look_at;
+
+        // Reset accumulation whenever the camera has moved (even by the lerp step).
+        if (look_from - prev_look_from).length_squared() > 1e-12 {
+            self.frame_count = 0;
+        }
+
+        let mut cam = compute_camera(
+            self.config.width,
+            self.config.height,
+            look_from,
+            look_at,
+            self.cam_vfov,
+            self.cam_aperture,
+            self.cam_focus_dist,
+        );
 
         // Derive the ping-pong index *before* incrementing frame_count so the
         // formula is a simple modulo with no subtraction — avoids any risk of
@@ -827,15 +945,80 @@ impl ApplicationHandler for App {
                 }
             }
 
+            // ---- Phase 8: mouse drag → orbit yaw / pitch -----------------
+            WindowEvent::MouseInput { button, state: btn_state, .. } => {
+                if button == MouseButton::Left {
+                    state.drag_active = btn_state == ElementState::Pressed;
+                    if !state.drag_active {
+                        state.last_cursor = None;
+                    }
+                }
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                if state.drag_active {
+                    if let Some(last) = state.last_cursor {
+                        let dx = (position.x - last.x) as f32;
+                        let dy = (position.y - last.y) as f32;
+                        state.tgt_yaw   -= dx * 0.005;
+                        // Normalise so the lerp always takes the short arc around the
+                        // Y axis, preventing a "long-way-round" spin after fast drags.
+                        let diff = state.tgt_yaw - state.cam_yaw;
+                        if diff > std::f32::consts::PI {
+                            state.tgt_yaw -= std::f32::consts::TAU;
+                        } else if diff < -std::f32::consts::PI {
+                            state.tgt_yaw += std::f32::consts::TAU;
+                        }
+                        state.tgt_pitch  = (state.tgt_pitch + dy * 0.005)
+                            .clamp(-1.483, 1.483); // ±85°
+                    }
+                    state.last_cursor = Some(position);
+                }
+            }
+
+            // Scroll: zoom by changing orbital distance (hold Shift for FOV tweak).
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p)   => p.y as f32 * 0.01,
+                };
+                state.tgt_distance = (state.tgt_distance - scroll * 0.3).clamp(0.3, 50.0);
+            }
+
+            // WASD: update held-key flags; translation is applied in about_to_wait.
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                match event.physical_key {
+                    PhysicalKey::Code(KeyCode::KeyW) => state.wasd_held[0] = pressed,
+                    PhysicalKey::Code(KeyCode::KeyA) => state.wasd_held[1] = pressed,
+                    PhysicalKey::Code(KeyCode::KeyS) => state.wasd_held[2] = pressed,
+                    PhysicalKey::Code(KeyCode::KeyD) => state.wasd_held[3] = pressed,
+                    _ => {}
+                }
+            }
+
             _ => {}
         }
     }
 
     /// Called after all pending events for a frame are processed.
-    /// Requesting a redraw here drives the render loop at display refresh rate
-    /// without needing to set ControlFlow::Poll explicitly.
+    /// Continuous WASD translation is applied here (once per event-loop tick)
+    /// so movement is smooth while a key is held.  The redraw request drives
+    /// the render loop at display refresh rate.
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = self.state.as_ref() {
+        if let Some(state) = self.state.as_mut() {
+            // Apply held WASD: translate the orbit target in the horizontal plane.
+            if state.wasd_held.iter().any(|&h| h) {
+                // Forward / right directions ignore pitch so WASD feels like
+                // moving on a flat plane regardless of camera elevation.
+                let forward = Vec3::new(-state.cam_yaw.sin(), 0.0, -state.cam_yaw.cos());
+                let right   = Vec3::new( state.cam_yaw.cos(), 0.0, -state.cam_yaw.sin());
+                let speed   = 0.04_f32;
+                if state.wasd_held[0] { state.tgt_look_at += forward * speed; } // W
+                if state.wasd_held[1] { state.tgt_look_at -= right   * speed; } // A
+                if state.wasd_held[2] { state.tgt_look_at -= forward * speed; } // S
+                if state.wasd_held[3] { state.tgt_look_at += right   * speed; } // D
+            }
             state.window.request_redraw();
         }
     }

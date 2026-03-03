@@ -1,8 +1,10 @@
-// path_trace.wgsl — Phase 7: metal & dielectric materials
+// path_trace.wgsl — Phase 8: interactive orbit camera + depth of field
 //
 // Each invocation shoots one full path per pixel, dispatching to the correct
 // scatter function (Lambertian / metal / dielectric) based on the material
 // buffer, and accumulates the HDR result into the ping-pong texture pair.
+// Depth-of-field is implemented via the thin-lens model: rays originate from
+// a random point on the aperture disk and converge on the focus plane.
 
 // ---- shared primitives ----------------------------------------------------
 
@@ -30,7 +32,12 @@ struct Camera {
     origin:     vec4<f32>,  // .xyz = eye position; .w unused
     lower_left: vec4<f32>,  // .xyz = lower-left corner of the virtual screen
     horizontal: vec4<f32>,  // .xyz = full horizontal extent of the screen
-    vertical:   vec4<f32>,  // .xyz = full vertical extent of the screen
+    vertical:   vec4<f32>,  // .xyz = full vertical extent (on the focus plane)
+    /// Camera right-basis scaled by lens radius — used to offset the ray origin
+    /// across the aperture disk (depth of field).  Zero when aperture = 0.
+    defocus_u:  vec4<f32>,
+    /// Camera up-basis scaled by lens radius — paired with defocus_u above.
+    defocus_v:  vec4<f32>,
     // Monotonically increasing frame index.  Stored as u32 (not f32) so it
     // remains exact beyond 2²⁴ (~77 h at 60 fps with a f32 representation).
     frame_count: u32,
@@ -219,6 +226,16 @@ fn cosine_scatter(rng: ptr<function, u32>, normal: vec3<f32>) -> vec3<f32> {
     return normalize(scatter);
 }
 
+/// Uniform point inside the unit disk via inverse-CDF polar sampling.
+/// O(1), no rejection loop, no thread divergence.
+///   r     = sqrt(uniform[0,1])  — inverse CDF of f(r) = 2r gives uniform area density
+///   theta = uniform[0, 2π)      — uniform azimuth
+fn random_in_unit_disk(rng: ptr<function, u32>) -> vec2<f32> {
+    let r     = sqrt(rand_f32(rng));
+    let theta = 6.283185307179586 * rand_f32(rng);
+    return r * vec2<f32>(cos(theta), sin(theta));
+}
+
 // ---- reflect / refract helpers -------------------------------------------
 
 /// Mirror reflection: `v` reflected about unit normal `n`.
@@ -277,7 +294,10 @@ fn scatter_metal(mat: Material, ray_in: Ray, hit: HitRecord,
     // Normalise incoming direction defensively against floating-point drift.
     let reflected = reflect_vec(normalize(ray_in.dir), hit.normal);
     // Perturb by a random unit-sphere vector scaled by fuzz; re-normalise.
-    r.direction   = normalize(reflected + fuzz * random_unit_sphere(rng));
+    // Guard: when fuzz≈1 and the random vector is exactly anti-parallel to
+    // reflected, the sum approaches zero and normalize would yield NaN.
+    let perturbed = reflected + fuzz * random_unit_sphere(rng);
+    r.direction   = normalize(select(reflected, perturbed, dot(perturbed, perturbed) >= 1e-6));
     r.attenuation = mat.albedo_fuzz.xyz;
     r.absorbed    = dot(r.direction, hit.normal) <= 0.0;
     return r;
@@ -399,12 +419,20 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let u = (f32(coord.x) + rand_f32(&rng)) / f32(dims.x);
     let v = 1.0 - (f32(coord.y) + rand_f32(&rng)) / f32(dims.y);
 
-    let raw_dir =
+    // Focal point on the focus plane.  lower_left / horizontal / vertical are
+    // already scaled by focus_dist in compute_camera() on the CPU side.
+    let focal_point =
           camera.lower_left.xyz
         + u * camera.horizontal.xyz
-        + v * camera.vertical.xyz
-        - camera.origin.xyz;
-    let ray = Ray(camera.origin.xyz, normalize(raw_dir));
+        + v * camera.vertical.xyz;
+
+    // Sample a random point on the thin-lens aperture disk (depth of field).
+    // When aperture = 0 (pinhole), defocus_u/v are zero vectors → no offset.
+    let lds        = random_in_unit_disk(&rng);
+    let lens_offset = lds.x * camera.defocus_u.xyz
+                    + lds.y * camera.defocus_v.xyz;
+    let ray_origin  = camera.origin.xyz + lens_offset;
+    let ray = Ray(ray_origin, normalize(focal_point - ray_origin));
 
     let sample = path_color(ray, &rng);
 
