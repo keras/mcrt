@@ -26,17 +26,19 @@ materials:
 objects:
   # Floor  (y = 0, normal points up)
   - type: plane
-    center: [0.0, 0.0, 0]
     normal: [0.0, 1.0, 0.0]
     half_extents: [5, 5]
     material: white
     backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0]
 
   - type: mesh
     path: models/bunny.obj
     material: white
-    scale: 8.0
-    translate: [0.5, -0.264, 0.0]
+    transform:
+      scale: 8.0
+      translate: [0.5, -0.264, 0.0]
 
   # Glass sphere.
   - type: sphere

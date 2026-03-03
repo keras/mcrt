@@ -49,85 +49,94 @@ materials:
 objects:
   # Floor  (y = 0, normal points up)
   - type: plane
-    center: [0.0, 0.0, 0]
     normal: [0.0, 1.0, 0.0]
     half_extents: [5, 5]
     material: white
     backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0]
 
   # Ceiling  (y = 10, normal points down into the box)
   - type: plane
-    center: [0.0, 10, 0]
     normal: [0.0, -1.0, 0.0]
     half_extents: [5, 5]
     material: white
     backface_culling: true
+    transform:
+      translate: [0.0, 10, 0]
 
   # Back wall  (z = -5, normal points toward camera)
   - type: plane
-    center: [0.0, 5, -5]
     normal: [0.0, 0.0, 1.0]
     half_extents: [5, 5]
     material: white
     backface_culling: true
+    transform:
+      translate: [0.0, 5, -5]
 
   # Front wall
   - type: plane
-    center: [0.0, 5, 5]
     normal: [0.0, 0.0, -1.0]
     half_extents: [5, 5]
     material: white
     backface_culling: true
+    transform:
+      translate: [0.0, 5, 5]
 
   # Left wall — red  (x = -5, normal points into the box)
   - type: plane
-    center: [-5, 5, 0]
     normal: [1.0, 0.0, 0.0]
     half_extents: [5, 5]
     material: red
     backface_culling: true
+    transform:
+      translate: [-5, 5, 0]
 
-  # Right wall — green  (x = +2.75, normal points into the box)
+  # Right wall — green  (x = +5, normal points into the box)
   - type: plane
-    center: [5, 5, 0]
     normal: [-1.0, 0.0, 0.0]
     half_extents: [5, 5]
     material: green
     backface_culling: true
+    transform:
+      translate: [5, 5, 0]
 
   # ---- area light ----------------------------------------------------------
-  # Emissive sphere flush with the ceiling, centred over the box.
-  # radius = 0.41 ≈ (0.15 × 5.5) / 2  →  diameter ≈ 15 % of box width.
+  # Emissive plane flush with the ceiling, centred over the box.
   - type: plane
-    center: [0.0, 9.9, -2.75]
     normal: [0.0, -1.0, 0.0]
     half_extents: [0.6, 0.6]
-    rotate: [0, 0, 90]
     material: ceiling_light
+    transform:
+      translate: [0.0, 9.9, -2.75]
+      rotate: [0, 0, 90]
 
   - type: plane
-    center: [0.1, 9.9, -2.75]
     normal: [0.0, -1.0, 0.0]
     half_extents: [0.7, 0.7]
-    rotate: [0, 0, 90]
     material: white
+    transform:
+      translate: [0.1, 9.9, -2.75]
+      rotate: [0, 0, 90]
 
   # ---- interior objects ----------------------------------------------------
 
   # White diffuse box.
   ## left
   - type: box
-    center: [-2.2, 2, -3.2]
-    rotate: [0, 30, 0]  # rotate 30 degrees around y axis
     half_extents: [1.2, 2, 1.2]
     material: white
+    transform:
+      translate: [-2.2, 2, -3.2]
+      rotate: [0, 30, 0]  # rotate 30 degrees around y axis
 
   ## right
   - type: box
-    center: [2.2, 1.4, -0.5]
-    rotate: [0, -15, 0]  # rotate -15 degrees around y axis
     half_extents: [1, 1.4, 1]
     material: white
+    transform:
+      translate: [2.2, 1.4, -0.5]
+      rotate: [0, -15, 0]  # rotate -15 degrees around y axis
 
   # Glass sphere.
   - type: sphere

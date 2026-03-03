@@ -155,58 +155,50 @@ enum ObjectDesc {
     /// - type: mesh
     ///   path: models/bunny.obj
     ///   material: gold
-    ///   scale: 8.0
-    ///   translate: [0.0, -0.267, 0.0]
-    ///   rotate: [0.0, 45.0, 0.0]   # optional XYZ Euler degrees
+    ///   transform:
+    ///     scale:     8.0
+    ///     translate: [0.0, -0.267, 0.0]
+    ///     rotate:    [0.0, 45.0, 0.0]   # XYZ Euler degrees
     /// ```
     Mesh {
         /// Path to a Wavefront OBJ file (relative to the working directory).
         path: String,
         /// Material for all triangles in this mesh.
         material: MaterialRef,
-        /// Uniform scale applied to every vertex position before upload.
-        /// Defaults to 1.0 (no scaling).
+        /// Placement, orientation, and scale expressed as a single TRS block.
+        /// All sub-fields (`translate`, `rotate`, `scale`) are optional and
+        /// default to identity values.  The `transform` key itself may be
+        /// omitted entirely when no transformation is needed.
         #[serde(default)]
-        scale: Option<f32>,
-        /// Translation `[x, y, z]` added to every vertex position after
-        /// scaling.  Defaults to `[0, 0, 0]` (no translation).
-        #[serde(default)]
-        translate: Option<[f32; 3]>,
-        /// Optional Euler rotation angles in **degrees** applied in XYZ order
-        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
-        /// Rotation is applied around the mesh origin after scaling but before
-        /// translation.  Defaults to `[0, 0, 0]` (no rotation).
-        #[serde(default)]
-        rotate: Option<[f32; 3]>,
+        transform: TransformDesc,
     },
     /// A finite rectangular plane tessellated into two triangles and added to
     /// the mesh buffer.  The normal determines which side is "front" (outward).
     ///
     /// ```yaml
     /// - type: plane
-    ///   center: [0.0, 0.0, -5.5]
-    ///   normal: [0.0, 0.0,  1.0]
+    ///   normal: [0.0, 0.0, 1.0]
     ///   half_extents: [2.75, 2.75]
     ///   material: white
-    ///   rotate: [0.0, 15.0, 0.0]   # optional XYZ Euler degrees
+    ///   transform:
+    ///     translate: [0.0, 0.0, -5.5]
+    ///     rotate:    [0.0, 15.0, 0.0]   # XYZ Euler degrees
     /// ```
     Plane {
-        /// World-space centre of the rectangle.
-        center: [f32; 3],
-        /// Outward-facing unit normal.  Two tangent axes are derived
-        /// automatically via Gram–Schmidt so no extra orientation is needed.
+        /// Outward-facing unit normal in the plane's local frame.  Two tangent
+        /// axes are derived automatically via Gram–Schmidt.
         normal: [f32; 3],
         /// Half-extents `[half_width, half_height]` of the rectangle.
         /// The total patch is `2*half_width × 2*half_height`.
         half_extents: [f32; 2],
         /// Material reference: a name string or an inline definition.
         material: MaterialRef,
-        /// Optional Euler rotation angles in **degrees** applied in XYZ order
-        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
-        /// Rotates the plane normal (and the derived tangent frame) around the
-        /// plane centre.  Defaults to `[0, 0, 0]` (no rotation).
+        /// Placement and orientation.  `translate` positions the plane centre;
+        /// `rotate` rotates the normal (and derived tangent frame) around that
+        /// centre.  `scale` is accepted but ignored (use `half_extents` to
+        /// size the plane).  The `transform` key may be omitted.
         #[serde(default)]
-        rotate: Option<[f32; 3]>,
+        transform: TransformDesc,
         /// When `true` rays hitting the back face (i.e. `dot(ray_dir, normal) > 0`)
         /// produce no intersection.  Useful for wall planes that will never be
         /// seen from behind, cutting the number of triangles the BVH has to test.
@@ -218,23 +210,23 @@ enum ObjectDesc {
     ///
     /// ```yaml
     /// - type: box
-    ///   center: [-1.5, 0.7, -4.0]
     ///   half_extents: [0.7, 0.7, 0.7]
     ///   material: white
+    ///   transform:
+    ///     translate: [-1.5, 0.7, -4.0]
+    ///     rotate:    [0.0, 30.0, 0.0]   # XYZ Euler degrees
     /// ```
     #[serde(rename = "box")]
     BoxPrim {
-        /// World-space centre of the box.
-        center: [f32; 3],
         /// Half-extents along each axis `[hx, hy, hz]`; full dimensions are
         /// `2*hx × 2*hy × 2*hz`.
         half_extents: [f32; 3],
-        /// Optional Euler rotation angles in **degrees** applied in XYZ order
-        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
-        /// Rotation is applied around the box centre before placement.
-        /// Defaults to `[0, 0, 0]` (identity — axis-aligned).
+        /// Placement and orientation.  `translate` positions the box centre;
+        /// `rotate` rotates the box around that centre.  `scale` is accepted
+        /// but ignored (use `half_extents` to size the box).  The `transform`
+        /// key may be omitted entirely for an axis-aligned box at the origin.
         #[serde(default)]
-        rotate: Option<[f32; 3]>,
+        transform: TransformDesc,
         /// Material applied to all six faces.
         material: MaterialRef,
     },
@@ -332,8 +324,7 @@ fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Rotation helpers for BoxPrim
+// Rotation helpers (shared by TransformDesc and tessellation utilities)
 // ---------------------------------------------------------------------------
 
 /// Convert degrees → radians.
@@ -364,6 +355,86 @@ fn rot3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
         m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Unified object transform  (scale → rotate → translate)
+// ---------------------------------------------------------------------------
+
+/// Object placement and orientation expressed as composable TRS components.
+///
+/// All fields are optional; omitted fields fall back to the identity value:
+/// - `translate` → `[0, 0, 0]`
+/// - `rotate`    → `[0, 0, 0]`  (Euler XYZ degrees, same convention as the
+///                               rest of the scene format)
+/// - `scale`     → `1.0`
+///
+/// Transforms are applied in **scale → rotate → translate** order, matching
+/// the standard TRS convention that puts the object in world space.
+///
+/// YAML example:
+/// ```yaml
+/// transform:
+///   translate: [0.0, 1.5, -3.0]
+///   rotate:    [0.0, 45.0, 0.0]   # degrees around Y axis
+///   scale:     2.0
+/// ```
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+struct TransformDesc {
+    /// World-space position.  Defaults to `[0, 0, 0]`.
+    #[serde(default)]
+    translate: Option<[f32; 3]>,
+    /// Euler rotation angles in **degrees**, applied in XYZ order.
+    /// Defaults to `[0, 0, 0]` (no rotation).
+    #[serde(default)]
+    rotate: Option<[f32; 3]>,
+    /// Uniform scale factor applied before rotation.  Must be positive.
+    /// Defaults to `1.0` (no scaling).
+    #[serde(default)]
+    scale: Option<f32>,
+}
+
+impl TransformDesc {
+    /// `true` when this transform produces no change (all fields at default).
+    fn is_identity(&self) -> bool {
+        self.translate.is_none() && self.rotate.is_none() && self.scale.is_none()
+    }
+
+    /// Translation vector, or `[0, 0, 0]` when omitted.
+    fn translation(&self) -> [f32; 3] {
+        self.translate.unwrap_or([0.0, 0.0, 0.0])
+    }
+
+    /// Uniform scale factor, or `1.0` when omitted.
+    fn scale_factor(&self) -> f32 {
+        self.scale.unwrap_or(1.0)
+    }
+
+    /// Rotation matrix, or `None` when `rotate` is absent / all-zero.
+    fn rotation_matrix(&self) -> Option<[[f32; 3]; 3]> {
+        self.rotate.map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz))
+    }
+
+    /// Transform a **position** vector: scale → rotate → translate.
+    fn apply_to_point(&self, p: [f32; 3]) -> [f32; 3] {
+        let s = self.scale_factor();
+        let t = self.translation();
+        let mut pos = [p[0] * s, p[1] * s, p[2] * s];
+        if let Some(m) = self.rotation_matrix() {
+            pos = rot3(&m, pos);
+        }
+        [pos[0] + t[0], pos[1] + t[1], pos[2] + t[2]]
+    }
+
+    /// Transform a **direction** vector (normal / tangent): rotate only.
+    /// Scale and translation do not affect directions.
+    fn apply_to_normal(&self, n: [f32; 3]) -> [f32; 3] {
+        if let Some(m) = self.rotation_matrix() {
+            rot3(&m, n)
+        } else {
+            n
+        }
+    }
 }
 
 // Float-3 helpers for plane / box tessellation
@@ -522,11 +593,10 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             }
 
             ObjectDesc::Plane {
-                center,
                 normal,
                 half_extents,
                 material,
-                rotate,
+                transform,
                 backface_culling,
             } => {
                 let base_idx = resolve_mat!(material);
@@ -541,17 +611,13 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                     base_idx
                 };
                 let [hw, hh] = *half_extents;
-                // Apply optional rotation to the plane normal.  The tangent
-                // axes are re-derived automatically inside push_quad_face via
-                // Gram–Schmidt, so rotating the normal is sufficient to orient
+                // Rotate the plane normal via the transform's rotation component.
+                // The tangent axes are re-derived automatically inside push_quad_face
+                // via Gram–Schmidt, so rotating the normal is sufficient to orient
                 // the plane in any direction.
-                let eff_normal = if let Some([rx, ry, rz]) = *rotate {
-                    rot3(&euler_to_mat3(rx, ry, rz), *normal)
-                } else {
-                    *normal
-                };
+                let eff_normal = transform.apply_to_normal(*normal);
                 push_quad_face(
-                    *center,
+                    transform.translation(),
                     eff_normal,
                     hw,
                     hh,
@@ -562,21 +628,21 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             }
 
             ObjectDesc::BoxPrim {
-                center,
                 half_extents,
-                rotate,
+                transform,
                 material,
             } => {
                 let mat_idx = resolve_mat!(material);
-                let [cx, cy, cz] = *center;
+                let [cx, cy, cz] = transform.translation();
                 let [hx, hy, hz] = *half_extents;
 
-                // Build optional rotation matrix from Euler angles (degrees).
-                // When rotate is None or [0,0,0] the identity is used and the
-                // box is axis-aligned.
-                let rot = rotate
-                    .map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz))
-                    .unwrap_or([[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]]);
+                // Build rotation matrix from the transform's rotate component.
+                // When absent the identity is used and the box is axis-aligned.
+                let rot = transform.rotation_matrix().unwrap_or([
+                    [1., 0., 0.],
+                    [0., 1., 0.],
+                    [0., 0., 1.],
+                ]);
 
                 // Six faces defined as (outward local normal, 4 CCW corner offsets).
                 // Corner offsets are in the box's local space (centred at origin);
@@ -657,47 +723,35 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
             ObjectDesc::Mesh {
                 path: obj_path,
                 material,
-                scale,
-                translate,
-                rotate,
+                transform,
             } => {
                 let mat_idx = resolve_mat!(material);
                 let (mut verts, tris) = crate::mesh::load_obj(obj_path, mat_idx)
                     .unwrap_or_else(|e| panic!("failed to load mesh '{}': {}", obj_path, e));
 
-                // Apply optional uniform scale + rotation + translation to vertex positions.
-                let s = scale.unwrap_or(1.0);
-                // Negative scale would flip handedness without inverting stored normals,
-                // producing inside-out lighting.  Zero scale collapses geometry into a
-                // degenerate point.  Both are almost certainly unintentional.
+                // Apply the TRS transform (scale → rotate → translate) to every vertex.
+                let s = transform.scale_factor();
+                // Negative scale flips handedness without inverting stored normals,
+                // producing inside-out lighting.  Zero scale collapses geometry.
                 assert!(
                     s > 0.0,
-                    "mesh '{}' scale must be positive (got {s})",
+                    "mesh '{}' transform.scale must be positive (got {s})",
                     obj_path
                 );
-                let t = translate.unwrap_or([0.0f32; 3]);
-                // Build optional rotation matrix from Euler angles (degrees).
-                // Applied after scaling but before translation — i.e. the mesh
-                // rotates around its (scaled) local origin.
-                let rot = rotate.map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz));
-                if s != 1.0 || t != [0.0f32; 3] || rot.is_some() {
+                if !transform.is_identity() {
                     for v in &mut verts {
                         // Scale → rotate → translate position.
-                        let mut pos = [v.position[0] * s, v.position[1] * s, v.position[2] * s];
-                        if let Some(m) = &rot {
-                            pos = rot3(m, pos);
-                        }
-                        v.position[0] = pos[0] + t[0];
-                        v.position[1] = pos[1] + t[1];
-                        v.position[2] = pos[2] + t[2];
-                        // Rotate normals.  Uniform scale preserves direction;
-                        // translation does not affect direction vectors.
-                        if let Some(m) = &rot {
-                            let rn = rot3(m, [v.normal[0], v.normal[1], v.normal[2]]);
-                            v.normal[0] = rn[0];
-                            v.normal[1] = rn[1];
-                            v.normal[2] = rn[2];
-                        }
+                        let pos =
+                            transform.apply_to_point([v.position[0], v.position[1], v.position[2]]);
+                        v.position[0] = pos[0];
+                        v.position[1] = pos[1];
+                        v.position[2] = pos[2];
+                        // Rotate normals only (uniform scale preserves direction;
+                        // translation does not affect direction vectors).
+                        let n = transform.apply_to_normal([v.normal[0], v.normal[1], v.normal[2]]);
+                        v.normal[0] = n[0];
+                        v.normal[1] = n[1];
+                        v.normal[2] = n[2];
                     }
                 }
 
@@ -1047,8 +1101,9 @@ objects:
   - type: mesh
     path: models/bunny.obj
     material: bunny
-    scale: 8.0
-    translate: [0.5, -0.264, 0.0]
+    transform:
+      scale: 8.0
+      translate: [0.5, -0.264, 0.0]
 "#;
 
     #[test]
@@ -1209,7 +1264,7 @@ objects:
 
     #[test]
     fn yaml_plane_produces_two_triangles_and_correct_normal() {
-        // A floor plane: center at origin, normal up, half_extents 1×1.
+        // A floor plane: centre at origin, normal up, half_extents 1×1.
         // Expected: 4 vertices added to mesh buffer, 2 triangles.
         // The cross product of the two triangle edges must equal the plane normal.
         let yaml = r#"
@@ -1217,10 +1272,11 @@ materials:
   floor: { type: lambertian, albedo: [0.5, 0.5, 0.5] }
 objects:
   - type: plane
-    center: [0.0, 0.0, 0.0]
     normal: [0.0, 1.0, 0.0]
     half_extents: [1.0, 1.0]
     material: floor
+    transform:
+      translate: [0.0, 0.0, 0.0]
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
         // 4 real vertices + 0 stub (mesh is non-empty)
@@ -1267,10 +1323,11 @@ materials:
   wall: { type: lambertian, albedo: [0.8, 0.1, 0.1] }
 objects:
   - type: plane
-    center: [0.0, 2.0, -5.0]
-    normal: [0.0, 0.0,  1.0]
+    normal: [0.0, 0.0, 1.0]
     half_extents: [2.0, 2.0]
     material: wall
+    transform:
+      translate: [0.0, 2.0, -5.0]
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
         let mat_count = loaded.materials.mat_count;
@@ -1296,16 +1353,18 @@ materials:
   wall: { type: lambertian, albedo: [0.7, 0.7, 0.7] }
 objects:
   - type: plane
-    center: [0.0, 0.0, 0.0]
     normal: [0.0, 1.0, 0.0]
     half_extents: [1.0, 1.0]
     material: wall
     backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0.0]
   - type: plane
-    center: [0.0, 5.0, 0.0]
     normal: [0.0, -1.0, 0.0]
     half_extents: [1.0, 1.0]
     material: wall
+    transform:
+      translate: [0.0, 5.0, 0.0]
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
         // First 2 triangles belong to the culled plane; next 2 to the double-sided one.
@@ -1332,23 +1391,14 @@ objects:
         // A unit box should produce 6 faces × 4 vertices = 24 vertices and
         // 6 × 2 = 12 triangles.
         let yaml = r#"
-Materials:
-  wall: { type: lambertian, albedo: [0.8, 0.8, 0.8] }
-objects:
-  - type: box
-    center: [0.0, 0.5, 0.0]
-    half_extents: [0.5, 0.5, 0.5]
-    material: { type: lambertian }
-"#;
-        // Lowercase keys required; reconstruct with valid YAML.
-        let yaml = r#"
 materials:
   wall: { type: lambertian, albedo: [0.8, 0.8, 0.8] }
 objects:
   - type: box
-    center: [0.0, 0.5, 0.0]
     half_extents: [0.5, 0.5, 0.5]
     material: wall
+    transform:
+      translate: [0.0, 0.5, 0.0]
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
         assert_eq!(
@@ -1382,7 +1432,6 @@ materials:
   m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
 objects:
   - type: box
-    center: [0.0, 0.0, 0.0]
     half_extents: [1.0, 2.0, 3.0]
     material: m
 "#;
@@ -1418,7 +1467,6 @@ materials:
   m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
 objects:
   - type: box
-    center: [0.0, 0.0, 0.0]
     half_extents: [1.0, 2.0, 3.0]
     material: m
 "#;
@@ -1491,10 +1539,10 @@ materials:
   m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
 objects:
   - type: box
-    center: [0.0, 0.0, 0.0]
     half_extents: [1.0, 1.0, 1.0]
-    rotate: [0, 90, 0]
     material: m
+    transform:
+      rotate: [0, 90, 0]
 "#;
         let loaded = load_scene_from_str(yaml, "<inline>");
         let tol = 1e-5_f32;

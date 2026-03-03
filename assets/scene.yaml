@@ -181,5 +181,6 @@ objects:
   - type: mesh
     path: models/bunny.obj
     material: bunny
-    scale: 8.0
-    translate: [0.5, -0.264, 0.0]
+    transform:
+      scale: 8.0
+      translate: [0.5, -0.264, 0.0]

@@ -1,46 +1,18 @@
-// path_trace.wgsl — Phase 14: G-buffer + denoiser support
+// path_trace.wgsl — Phase 8: interactive orbit camera + depth of field
 //
-// Phase 14 additions over Phase 13:
-//   - Binding 13: gbuffer_write (texture_storage_2d<rgba32float, write>).
-//     Written every frame by cs_main using a centre-of-pixel, pinhole ray.
-//     Stores (world-space normal xyz, Euclidean linear depth w) at the first
-//     scene hit; depth = −1, normal = vec3(0) for sky misses.
-//     Read by the denoiser to guide the joint-bilateral filter.
-//
-// Phase 13 additions (still present):
-//   - HitRecord gains a `uv: vec2<f32>` field populated by both
-//     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
-//   - HitRecord gains a `uv: vec2<f32>` field populated by both
-//     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
-//   - Three new bindings: 9 (sampler), 10 (albedo texture_2d_array<f32>),
-//     11 (HDR equirectangular env map as texture_2d<f32>).
-//   - scatter_lambertian and scatter_metal sample the albedo texture array
-//     using mat.type_pad[1] as the layer index (0 = white / no texture).
-//   - env_color() replaces the procedural sky_color() in path_color()
-//     for HDR environment lighting or a procedural fallback gradient.
-//
-// Phase 10 changes (still present):
-//   - A Vertex struct (position/normal/UV) and Triangle struct (v[3] + mat_idx)
-//     are added on bindings 6 and 7 respectively.
-//   - A second BVH (mesh_bvh_nodes, binding 8) is added for the triangle mesh.
-//   - ray_triangle_hit() implements Möller-Trumbore intersection with barycentric
-//     vertex-normal interpolation for smooth shading.
-//   - scene_hit() now traverses BOTH the sphere BVH (binding 5) and the mesh BVH
-//     (binding 8) and returns the closest of the two hits.
-//
-// Phase 9 changes (still present):
-//   - Scene spheres are now in a runtime-sized storage buffer (binding 2)
-//     instead of a fixed-capacity SceneData uniform.  This removes MAX_SPHERES.
-//   - A flat BVH node array is added on binding 5.  Each frame the compute
-//     kernel traverses the BVH to find intersections instead of a O(N) loop.
-//   - Ray-AABB slab test + iterative stack-based BVH traversal are implemented
-//     below.  The rest of the pipeline (camera, materials, accumulation) is
-//     unchanged from Phase 8.
+// Each invocation shoots one full path per pixel, dispatching to the correct
+// scatter function (Lambertian / metal / dielectric) based on the material
+// buffer, and accumulates the HDR result into the ping-pong texture pair.
+// Depth-of-field is implemented via the thin-lens model: rays originate from
+// a random point on the aperture disk and converge on the focus plane.
 
 // ---- module-level constants -----------------------------------------------
 
 /// Full circle in radians (2π).  Used in spherical- and disk-sampling functions.
 const TAU: f32 = 6.283185307179586;
+
+/// Maximum sphere count; must match MAX_SPHERES in scene.rs.
+const MAX_SPHERES: u32 = 8u;
 
 /// Maximum material count; must match MAX_MATERIALS in material.rs.
 const MAX_MATERIALS: u32 = 8u;
@@ -64,12 +36,6 @@ const PCG_MULT: u32 = 747796405u;
 const PCG_INC:  u32 = 2891336453u;
 const PCG_MIX:  u32 = 277803737u;
 
-/// π (tau / 2).  Used in spherical UV mapping and environment map lookup.
-const PI: f32 = 3.141592653589793;
-
-/// Number of albedo texture array layers; must match MAX_TEXTURES in texture.rs.
-const ALBEDO_ARRAY_LAYERS: i32 = 4;
-
 // ---- shared primitives ----------------------------------------------------
 
 /// A ray in world space.  `dir` must be unit length.
@@ -86,7 +52,6 @@ struct HitRecord {
     normal:     vec3<f32>,  // always faces the incident ray
     front_face: bool,
     mat_index:  u32,        // sphere's material slot (used in Phase 7)
-    uv:         vec2<f32>,  // surface UV coordinates for texture sampling (Phase 11)
 }
 
 // ---- camera uniform -------------------------------------------------------
@@ -111,48 +76,22 @@ struct Camera {
     _pad2: u32,
 }
 
-// ---- sphere storage buffer -----------------------------------------------
-// Phase 9: the sphere list is a runtime-sized storage buffer, replacing the
-// fixed-capacity SceneData uniform.  Leaf BVH nodes index into this array.
+// ---- sphere scene buffer --------------------------------------------------
+// Each sphere packs centre + radius into one vec4 to keep the Rust-side layout
+// identical without any manual padding.
 
 struct Sphere {
     center_r:    vec4<f32>,  // .xyz = centre, .w = radius
     mat_and_pad: vec4<u32>,  // .x = material index, .yzw = unused
 }
 
-// ---- BVH node buffer ------------------------------------------------------
-// Flat BVH node layout (48 bytes, 3 × 16-byte chunks — vec4-aligned).
-// Must match GpuBvhNode in bvh.rs.
-//
-//   prim_count == 0  →  internal node
-//       left child  = this_index + 1      (pre-order invariant)
-//       right child = right_or_offset
-//   prim_count >  0  →  leaf node
-//       sphere range = spheres[right_or_offset .. right_or_offset + prim_count]
-struct BvhNode {
-    aabb_min:        vec4<f32>,  // .xyz = AABB minimum corner, .w = unused
-    aabb_max:        vec4<f32>,  // .xyz = AABB maximum corner, .w = unused
-    right_or_offset: u32,        // internal: right child index; leaf: sphere start
-    prim_count:      u32,        // 0 = internal node; > 0 = leaf (primitive count)
-    _pad0:           u32,
-    _pad1:           u32,
-}
-
-// ---- mesh vertex buffer --------------------------------------------------
-// Phase 10: vertex positions, normals, and UVs for triangle meshes.
-// Layout must match GpuVertex in mesh.rs (48 bytes / 3 × vec4).
-struct Vertex {
-    position: vec4<f32>,  // .xyz = world-space position, .w = unused
-    normal:   vec4<f32>,  // .xyz = vertex normal (unit length), .w = unused
-    uv:       vec4<f32>,  // .xy = UV coordinates, .zw = unused
-}
-
-// ---- mesh triangle buffer -------------------------------------------------
-// Phase 10: triangles as three vertex indices plus a material slot.
-// Layout must match GpuTriangle in mesh.rs (16 bytes / vec4<u32>).
-struct Triangle {
-    v:       vec3<u32>,  // indices into the vertex buffer
-    mat_idx: u32,        // material slot (same table as sphere materials)
+// Fixed-capacity scene; must match MAX_SPHERES in scene.rs (and this file).
+struct SceneData {
+    sphere_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    spheres: array<Sphere, MAX_SPHERES>,
 }
 
 // ---- material buffer -----------------------------------------------------
@@ -162,7 +101,6 @@ struct Triangle {
 /// mat_type:  0 = Lambertian diffuse
 ///            1 = metal  (specular reflect + fuzz perturbation)
 ///            2 = dielectric (glass: Snell refraction + Schlick reflection)
-///            3 = emissive (albedo_fuzz.xyz = emission colour; ior_pad.x = strength)
 struct Material {
     /// .x = mat_type (u32), .yzw = unused padding.
     type_pad:    vec4<u32>,
@@ -174,10 +112,8 @@ struct Material {
 
 /// Fixed-capacity material table; must match MAX_MATERIALS in material.rs (and this file).
 struct MaterialData {
-    mat_count:  u32,
-    /// Number of emissive spheres available for NEE (Phase 13).
-    /// When 0, the NEE block in path_color is skipped entirely.
-    n_emissive: u32,
+    mat_count: u32,
+    _pad0: u32,
     _pad1: u32,
     _pad2: u32,
     mats: array<Material, MAX_MATERIALS>,
@@ -192,8 +128,8 @@ struct MaterialData {
 /// Camera uniform; updated every frame with the current frame index for PRNG.
 @group(0) @binding(1) var<uniform> camera: Camera;
 
-/// BVH-reordered sphere list.  Indexed by leaf-node primitive ranges.
-@group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
+/// Scene: static sphere list.
+@group(0) @binding(2) var<uniform> scene: SceneData;
 
 /// Accumulation read source: the previous frame's running average.
 /// Ping-pongs with accum_write every frame.
@@ -201,46 +137,6 @@ struct MaterialData {
 
 /// Material descriptors for all spheres in the scene.
 @group(0) @binding(4) var<uniform> materials: MaterialData;
-
-/// Flat BVH node array.  Traversal always starts at index 0 (root).
-@group(0) @binding(5) var<storage, read> bvh_nodes: array<BvhNode>;
-
-/// Mesh vertex buffer (world-space positions, smooth normals, UVs).
-/// Indexed by triangle vertex indices in `mesh_triangles`.
-@group(0) @binding(6) var<storage, read> vertices: array<Vertex>;
-
-/// Mesh triangle index buffer.  BVH-reordered so leaf ranges are contiguous.
-@group(0) @binding(7) var<storage, read> mesh_triangles: array<Triangle>;
-
-/// Flat mesh BVH node array.  Traversal always starts at index 0 (root).
-@group(0) @binding(8) var<storage, read> mesh_bvh_nodes: array<BvhNode>;
-
-/// Linear sampler for texture sampling.  Shared by the albedo texture array.
-@group(0) @binding(9) var tex_sampler: sampler;
-
-/// Albedo texture 2D array (RGBA8 Unorm, ALBEDO_ARRAY_LAYERS layers).
-/// Layer 0 is solid white — selecting it leaves mat.albedo_fuzz unchanged.
-/// Indexed by mat.type_pad.y, clamped to [0, ALBEDO_ARRAY_LAYERS - 1].
-@group(0) @binding(10) var albedo_textures: texture_2d_array<f32>;
-
-/// HDR equirectangular environment map (RGBA32 Float, non-filterable).
-/// Sampled on ray miss via textureLoad with nearest-neighbour lookup.
-@group(0) @binding(11) var env_map: texture_2d<f32>;
-
-/// Emissive sphere list for NEE direct-light sampling (Phase 13).
-/// Always has at least one entry (a stub sphere at [1e9,1e9,1e9] r=0 when empty)
-/// so array indexing is unconditionally safe.
-@group(0) @binding(12) var<storage, read> emissive_spheres: array<Sphere>;
-
-/// G-buffer write target (Phase 14).
-///   .xyz = world-space surface normal at the primary hit (unit length).
-///   .w   = linear ray depth at the primary hit, or −1 for sky/miss.
-/// Written once per pixel per frame using a centre-of-pixel ray (no jitter,
-/// no DOF) so the denoiser always receives a stable, noise-free guide.
-@group(0) @binding(13) var gbuffer_write: texture_storage_2d<rgba32float, write>;
-
-/// Material type 3 — emissive surface.
-const MAT_EMISSIVE: u32 = 3u;
 
 // ---- PCG PRNG -------------------------------------------------------------
 //
@@ -264,30 +160,12 @@ fn rand_f32(rng: ptr<function, u32>) -> f32 {
     return bitcast<f32>((*rng >> 9u) | 0x3f800000u) - 1.0;
 }
 
-// ---- environment map lookup -----------------------------------------------
+// ---- sky gradient ---------------------------------------------------------
 
-/// Sample the HDR equirectangular environment map for a ray direction.
-///
-/// Uses an equirectangular (lat/long) projection:
-///   phi   = atan2(z, x)  → longitude ∈ (−π, π]  → u ∈ [0, 1]
-///   theta = asin(y)      → latitude  ∈ [−π/2, π/2]  → v ∈ [0, 1]
-///
-/// `textureLoad` is used (nearest-neighbour) because `Rgba32Float` textures
-/// are not filterable on all hardware without the FLOAT32_FILTERABLE feature.
-/// The env map resolution (ENV_MAP_WIDTH × ENV_MAP_HEIGHT) provides adequate
-/// smoothness for a path tracer where noise dominates visible aliasing.
-fn env_color(unit_dir: vec3<f32>) -> vec3<f32> {
-    let phi   = atan2(unit_dir.z, unit_dir.x);        // ∈ (−π, π]
-    let theta = asin(clamp(unit_dir.y, -1.0, 1.0));   // ∈ [−π/2, π/2]
-    let u = (phi + PI) / TAU;                          // ∈ [0, 1]
-    let v = 0.5 + theta / PI;                          // ∈ [0, 1]
-    let dims = vec2<i32>(textureDimensions(env_map));
-    // Flip vertical: image row 0 is the zenith (v→1 → iy→0).
-    let ix = clamp(i32(u * f32(dims.x)), 0, dims.x - 1);
-    let iy = clamp(i32((1.0 - v) * f32(dims.y)), 0, dims.y - 1);
-    // Clamp HDR values to [0, 1]: overexposed pixels (e.g. sun disk) become
-    // pure white rather than contributing unbounded radiance / fireflies.
-    return min(textureLoad(env_map, vec2<i32>(ix, iy), 0).xyz, vec3<f32>(1.0));
+/// Classic RTIOW sky: white at the horizon, sky-blue at the zenith.
+fn sky_color(unit_dir: vec3<f32>) -> vec3<f32> {
+    let t = 0.5 * (unit_dir.y + 1.0);
+    return mix(vec3<f32>(1.0, 1.0, 1.0), vec3<f32>(0.5, 0.7, 1.0), t);
 }
 
 // ---- ray-sphere intersection ----------------------------------------------
@@ -326,236 +204,29 @@ fn ray_sphere_hit(r: Ray, sphere: Sphere, t_min: f32, t_max: f32) -> HitRecord {
     // Normal always faces the incident ray (required for refraction in Phase 7).
     hit.normal    = select(-outward_n, outward_n, hit.front_face);
     hit.mat_index = sphere.mat_and_pad.x;
-    // Spherical UV mapping: phi ∈ (−π, π], theta ∈ [−π/2, π/2].
-    // u wraps around the equator; v is 0 at the south pole, 1 at the north.
-    let phi   = atan2(outward_n.z, outward_n.x);
-    let theta = asin(clamp(outward_n.y, -1.0, 1.0));
-    hit.uv    = vec2<f32>((phi + PI) / TAU, 0.5 + theta / PI);
     return hit;
 }
 
-// ---- ray-triangle intersection (Möller-Trumbore) -------------------------
+// ---- scene traversal ------------------------------------------------------
 
-/// Tests ray `r` against the triangle `tri` using the Möller-Trumbore algorithm.
-///
-/// On hit: returns a `HitRecord` with
-///   - `t`         = intersection distance (t_min < t < t_max)
-///   - `normal`    = barycentric-interpolated vertex normal, front-facing toward ray
-///   - `mat_index` = triangle's material slot
-///
-/// On miss: returns a record with `t = -1`.
-///
-/// Smooth shading is achieved by interpolating the three vertex normals with the
-/// Möller-Trumbore barycentric coordinates (u, v); the third weight w = 1 - u - v.
-/// The interpolated normal is normalised to defend against near-degenerate cases.
-// Bit 31 of Triangle.mat_idx: when set, the triangle is single-sided.
-// Rays whose direction has a positive dot product with the interpolated
-// surface normal (i.e. hitting the back face) are rejected.
-// The actual material index is stored in bits 0-30.
-const BACKFACE_CULL_FLAG: u32 = 0x80000000u;
-
-fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord {
-    let cull_backface = (tri.mat_idx & BACKFACE_CULL_FLAG) != 0u;
-    let real_mat_idx  = tri.mat_idx & ~BACKFACE_CULL_FLAG;
-
-    let p0 = vertices[tri.v.x].position.xyz;
-    let p1 = vertices[tri.v.y].position.xyz;
-    let p2 = vertices[tri.v.z].position.xyz;
-
-    let e1 = p1 - p0;
-    let e2 = p2 - p0;
-
-    // h = cross(r.dir, e2).  `a = dot(e1, h)` is the triple product det.
-    let h = cross(r.dir, e2);
-    let a = dot(e1, h);
-
-    var hit: HitRecord;
-    hit.t = -1.0;
-
-    // Near-zero determinant means ray is parallel to the triangle plane.
-    if abs(a) < 1e-8 { return hit; }
-
-    let f = 1.0 / a;
-    let s = r.origin - p0;
-
-    // Barycentric u coordinate.
-    let u_bary = f * dot(s, h);
-    if u_bary < 0.0 || u_bary > 1.0 { return hit; }
-
-    // Barycentric v coordinate.
-    let q      = cross(s, e1);
-    let v_bary = f * dot(r.dir, q);
-    if v_bary < 0.0 || u_bary + v_bary > 1.0 { return hit; }
-
-    // Ray-plane intersection distance.
-    let t = f * dot(e2, q);
-    if t <= t_min || t >= t_max { return hit; }
-
-    // ---- smooth normal via barycentric interpolation ----------------------
-    // w = 1 - u - v is the weight for vertex 0; u for vertex 1; v for vertex 2.
-    let n0 = vertices[tri.v.x].normal.xyz;
-    let n1 = vertices[tri.v.y].normal.xyz;
-    let n2 = vertices[tri.v.z].normal.xyz;
-    let w = 1.0 - u_bary - v_bary;
-    // normalize() is undefined in WGSL when the input has zero length.
-    // Guard: if the interpolated sum degenerates (e.g. opposing normals at a hard
-    // crease), fall back to vertex 0's normal.  This is safe because vertex 0 is
-    // always unit-length for all procedural meshes built in this application; an
-    // OBJ mesh with a zero-length stored normal is itself malformed.
-    let raw_n    = w * n0 + u_bary * n1 + v_bary * n2;
-    let interp_n = select(n0, normalize(raw_n), dot(raw_n, raw_n) > 1e-10);
-
-    hit.t         = t;
-    hit.point     = r.origin + t * r.dir;
-    hit.front_face = dot(r.dir, interp_n) < 0.0;
-
-    // Backface culling: discard the hit when the ray is coming from behind
-    // and single-sided geometry was requested.
-    if cull_backface && !hit.front_face {
-        hit.t = -1.0;   // signal miss to callers
-        return hit;
-    }
-
-    // Normal always faces the incident ray, consistent with ray_sphere_hit.
-    hit.normal    = select(-interp_n, interp_n, hit.front_face);
-    hit.mat_index = real_mat_idx;
-    // UV via barycentric interpolation of the three vertex UV coordinates.
-    let uv0 = vertices[tri.v.x].uv.xy;
-    let uv1 = vertices[tri.v.y].uv.xy;
-    let uv2 = vertices[tri.v.z].uv.xy;
-    hit.uv  = w * uv0 + u_bary * uv1 + v_bary * uv2;
-    return hit;
-}
-
-// ---- ray-AABB intersection (slab method) ----------------------------------
-
-/// Test ray `r` against axis-aligned bounding box [bb_min, bb_max] within the
-/// open interval (t_min, t_max).  Uses branchless min/max per axis so there is
-/// no divergence for rays with negative direction components.
-///
-/// **NaN guard**: direction components with magnitude < 1e-7 are replaced by
-/// a large finite reciprocal (±1e30) so `0 * ∞ = NaN` cannot occur on slab
-/// boundaries.  This is the Kensler sign-safe variant.
-fn ray_aabb_hit(r: Ray, bb_min: vec3<f32>, bb_max: vec3<f32>, t_min: f32, t_max: f32) -> bool {
-    // Clamp near-zero direction components to avoid NaN when origin sits exactly
-    // on a slab boundary (0 * ±Inf = NaN in IEEE 754, GPU-undefined in WGSL).
-    let safe_d = select(r.dir, sign(r.dir + vec3(1e-30)) * vec3(1e-7), abs(r.dir) < vec3(1e-7));
-    let inv_d = 1.0 / safe_d;
-    let ta    = (bb_min - r.origin) * inv_d;
-    let tb    = (bb_max - r.origin) * inv_d;
-    // Narrow the interval [t0, t1] with each axis slab.
-    let t0 = max(t_min, max(min(ta.x, tb.x), max(min(ta.y, tb.y), min(ta.z, tb.z))));
-    let t1 = min(t_max, min(max(ta.x, tb.x), min(max(ta.y, tb.y), max(ta.z, tb.z))));
-    // Use >= (not >) so that a zero-thickness plane AABB (min == max on one
-    // axis) is accepted when the ray hits exactly that axis-aligned plane.
-    // A strict > would make every axis-aligned plane primitive invisible.
-    return t1 >= t0;
-}
-
-// ---- BVH traversal --------------------------------------------------------
-
-/// `scene_hit` traverses both the sphere BVH (binding 5) and the mesh BVH
-/// (binding 8) and returns the closest hit across all primitives.  The two
-/// traversals share a running `closest` bound so each benefits from early-exit
-/// via the other's hits.
-///
-/// Neither traversal uses an early return — even an empty sphere BVH must not
-/// skip the mesh traversal (and vice versa), so both are always attempted.
+/// Finds the closest sphere hit along ray `r` in (t_min, t_max).
 fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
     var best: HitRecord;
-    best.t     = -1.0;
+    best.t = -1.0;
     var closest = t_max;
 
-    // ---- Sphere BVH traversal (Phase 9) -----------------------------------
-    // Guarded by arrayLength so a sphere-free scene still reaches the mesh pass.
-    if i32(arrayLength(&bvh_nodes)) > 0 {
-        // Fixed traversal stack — large enough for trees with ≤ 512 leaf primitives.
-        var stack: array<u32, 32>;
-        var sp: i32 = 0;  // index of the top-of-stack element
-        stack[0] = 0u;    // push root (index 0)
-
-        while sp >= 0 {
-            let node_idx = stack[u32(sp)];
-            sp -= 1;
-
-            let node = bvh_nodes[node_idx];
-
-            // Reject immediately if this node's AABB is not hit.
-            if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, closest) {
-                continue;
-            }
-
-            if node.prim_count > 0u {
-                // Leaf: test every primitive in the range.
-                let prim_end = node.right_or_offset + node.prim_count;
-                for (var i = node.right_or_offset; i < prim_end; i++) {
-                    let hit = ray_sphere_hit(r, spheres[i], t_min, closest);
-                    if hit.t > 0.0 {
-                        best    = hit;
-                        closest = hit.t;
-                    }
-                }
-            } else {
-                // Internal node: push right child first, then left.
-                // Guard: stack capacity is 32 entries (indices 0..31).  For scenes with
-                // ≤ 512 primitives the SAH tree depth is ≤ 9, so sp never exceeds ~18
-                // during normal traversal.  The guard at sp < 30 ensures two safe pushes
-                // (sp would reach at most 31 = last valid index).  If sp ≥ 30 the subtree
-                // is silently skipped; this cannot happen for any scene registered in this
-                // application, but a future scene with ≥32 nesting levels would need a
-                // larger stack or an iterative builder.
-                if sp < 30 {
-                    sp += 1;
-                    stack[u32(sp)] = node.right_or_offset;  // right child
-                    sp += 1;
-                    stack[u32(sp)] = node_idx + 1u;          // left child (pre-order)
-                }
-            }
-        }
-    } // end sphere BVH
-
-    // ---- Mesh BVH traversal (Phase 10) ------------------------------------
-    // Reuses `closest` already narrowed by any sphere hit above, so the mesh
-    // traversal automatically benefits from early-exit AABB culling.
-    let mesh_count = i32(arrayLength(&mesh_bvh_nodes));
-    if mesh_count > 0 {
-        var mstack: array<u32, 32>;
-        var msp: i32 = 0;
-        mstack[0] = 0u;  // push mesh BVH root
-
-        while msp >= 0 {
-            let midx = mstack[u32(msp)];
-            msp -= 1;
-
-            let mnode = mesh_bvh_nodes[midx];
-
-            if !ray_aabb_hit(r, mnode.aabb_min.xyz, mnode.aabb_max.xyz, t_min, closest) {
-                continue;
-            }
-
-            if mnode.prim_count > 0u {
-                // Leaf: test every triangle in the range.
-                let prim_end = mnode.right_or_offset + mnode.prim_count;
-                for (var i = mnode.right_or_offset; i < prim_end; i++) {
-                    let hit = ray_triangle_hit(r, mesh_triangles[i], t_min, closest);
-                    if hit.t > 0.0 {
-                        best    = hit;
-                        closest = hit.t;
-                    }
-                }
-            } else {
-                // Internal node: same stack-safe push pattern as the sphere traversal.
-                // The guard at msp < 30 leaves room for two pushes (max index = 31).
-                if msp < 30 {
-                    msp += 1;
-                    mstack[u32(msp)] = mnode.right_or_offset;  // right child
-                    msp += 1;
-                    mstack[u32(msp)] = midx + 1u;               // left child (pre-order)
-                }
-            }
+    // Cap to array size to guard against a corrupt sphere_count from the CPU.
+    let count = min(scene.sphere_count, MAX_SPHERES);
+    for (var i = 0u; i < count; i++) {
+        let hit = ray_sphere_hit(r, scene.spheres[i], t_min, closest);
+        // ray_sphere_hit returns t > t_min (1e-4) on a hit; the `> 0.0` check
+        // is equivalent here because t_min > 0.  (If t_min were ever negative,
+        // the check would need to be > t_min instead.)
+        if hit.t > 0.0 {
+            best    = hit;
+            closest = hit.t;
         }
     }
-
     return best;
 }
 
@@ -639,12 +310,7 @@ fn scatter_lambertian(mat: Material, hit: HitRecord,
                       rng: ptr<function, u32>) -> ScatterResult {
     var r: ScatterResult;
     r.direction   = cosine_scatter(rng, hit.normal);
-    // Texture index 0 = white (solid-colour mat); 1..N = albedo texture layer.
-    // Layer 0 is a solid-white fill so tex_idx=0 leaves mat.albedo_fuzz unchanged.
-    let layer = clamp(i32(mat.type_pad.y), 0, ALBEDO_ARRAY_LAYERS - 1);
-    let tex_color = textureSampleLevel(
-        albedo_textures, tex_sampler, hit.uv, layer, 0.0).xyz;
-    r.attenuation = mat.albedo_fuzz.xyz * tex_color;
+    r.attenuation = mat.albedo_fuzz.xyz;
     r.absorbed    = false;
     return r;
 }
@@ -662,10 +328,7 @@ fn scatter_metal(mat: Material, ray_in: Ray, hit: HitRecord,
     // reflected, the sum approaches zero and normalize would yield NaN.
     let perturbed = reflected + fuzz * random_unit_sphere(rng);
     r.direction   = normalize(select(reflected, perturbed, dot(perturbed, perturbed) >= 1e-6));
-    let layer     = clamp(i32(mat.type_pad.y), 0, ALBEDO_ARRAY_LAYERS - 1);
-    let tex_color = textureSampleLevel(
-        albedo_textures, tex_sampler, hit.uv, layer, 0.0).xyz;
-    r.attenuation = mat.albedo_fuzz.xyz * tex_color;
+    r.attenuation = mat.albedo_fuzz.xyz;
     r.absorbed    = dot(r.direction, hit.normal) <= 0.0;
     return r;
 }
@@ -677,8 +340,6 @@ fn scatter_dielectric(mat: Material, ray_in: Ray, hit: HitRecord,
     var r: ScatterResult;
     r.absorbed    = false;
     r.attenuation = vec3<f32>(1.0); // glass transmits all wavelengths equally
-    // type_pad[1] (texture layer index) is intentionally not used for glass:
-    // real glass has no surface albedo colour — tinting is a separate feature.
 
     let ior = mat.ior_pad.x;
     // Air-to-glass (front face): η_ratio = 1/ior.
@@ -720,228 +381,48 @@ fn scatter(mat: Material, ray_in: Ray, hit: HitRecord,
     switch mat.type_pad.x {
         case 1u: { return scatter_metal(mat, ray_in, hit, rng); }
         case 2u: { return scatter_dielectric(mat, ray_in, hit, rng); }
-        case 3u: {
-            // Emissive surfaces do not scatter — path_color returns before
-            // scatter() is called for emissive hits.  This explicit case
-            // ensures that any future refactor cannot silently treat an
-            // emissive surface as Lambertian.
-            var r: ScatterResult;
-            r.absorbed    = true;
-            r.direction   = vec3<f32>(0.0);
-            r.attenuation = vec3<f32>(0.0);
-            return r;
-        }
         default: { return scatter_lambertian(mat, hit, rng); }
     }
 }
 
 // ---- path tracing ---------------------------------------------------------
 
-// ---- Phase 13: NEE + MIS helpers -----------------------------------------
-
-/// MIS power heuristic (β = 2).
-/// Blends PDF `a` vs. PDF `b` so combined estimator is unbiased.
-fn mis_power_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
-    let a2 = pdf_a * pdf_a;
-    let b2 = pdf_b * pdf_b;
-    return a2 / max(a2 + b2, 1e-10);
-}
-
-/// Solid angle Ω = 2π(1 − cosθ_max) subtended by sphere at `origin`.
-/// Returns 0.0 if `origin` is inside the sphere (degenerate).
-fn sphere_solid_angle(origin: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
-    let d2 = dot(center - origin, center - origin);
-    let r2 = radius * radius;
-    if d2 <= r2 { return 0.0; }
-    let cos_theta_max = sqrt(1.0 - r2 / d2);
-    return TAU * (1.0 - cos_theta_max);
-}
-
-/// Sample a direction uniformly over the cone subtended by `(center, radius)`
-/// from `origin`.  Builds a local ONB with W toward the sphere centre.
-fn sample_sphere_cone(center: vec3<f32>, radius: f32, origin: vec3<f32>,
-                      rng: ptr<function, u32>) -> vec3<f32> {
-    let w   = normalize(center - origin);
-    var up  = vec3<f32>(0.0, 1.0, 0.0);
-    if abs(w.y) > 0.9 { up = vec3<f32>(1.0, 0.0, 0.0); }
-    let t   = normalize(cross(up, w));
-    let b   = cross(w, t);
-
-    let d2            = dot(center - origin, center - origin);
-    let cos_theta_max = sqrt(max(0.0, 1.0 - (radius * radius) / d2));
-
-    let u1    = rand_f32(rng);
-    let u2    = rand_f32(rng);
-    let cos_t = 1.0 - u1 * (1.0 - cos_theta_max);
-    let sin_t = sqrt(max(0.0, 1.0 - cos_t * cos_t));
-    let phi   = TAU * u2;
-
-    return normalize(sin_t * (cos(phi) * t + sin(phi) * b) + cos_t * w);
-}
-
-/// Nearest entry t of ray (origin, dir) into sphere (center, radius).
-/// Returns T_MAX if the ray misses or the sphere is fully behind T_MIN.
-fn sphere_ray_entry(origin: vec3<f32>, dir: vec3<f32>,
-                    center: vec3<f32>, radius: f32) -> f32 {
-    let oc     = origin - center;
-    let half_b = dot(oc, dir);
-    let c_val  = dot(oc, oc) - radius * radius;
-    let disc   = half_b * half_b - c_val;
-    if disc < 0.0 { return T_MAX; }
-    let sqrt_d = sqrt(disc);
-    let t1     = -half_b - sqrt_d;
-    if t1 > T_MIN { return t1; }
-    let t2 = -half_b + sqrt_d;
-    if t2 > T_MIN { return t2; }
-    return T_MAX;
-}
-
-/// NEE PDF: probability density (per steradian) of sampling a direction that
-/// connects `origin` to the emissive sphere whose material index is `mat_idx`.
-/// Averages over all n_emissive spheres (we always pick one at random).
-/// Returns 0 if n_emissive == 0 or the target sphere subtends no solid angle.
-///
-/// LIMITATION: matches emissive spheres by material index only.  If more than
-/// one emissive sphere shares `mat_idx` the returned value sums all their
-/// contributions / n, overcounting relative to the true per-direction NEE PDF.
-/// Keep each emissive sphere on a distinct material index until sphere-identity
-/// tracking is added to HitRecord.
-fn nee_sphere_pdf(origin: vec3<f32>, mat_idx: u32) -> f32 {
-    let n = materials.n_emissive;
-    if n == 0u { return 0.0; }
-    var pdf_sum: f32 = 0.0;
-    for (var i = 0u; i < n; i++) {
-        let s  = emissive_spheres[i];
-        if s.mat_and_pad.x != mat_idx { continue; }
-        let sa = sphere_solid_angle(origin, s.center_r.xyz, s.center_r.w);
-        if sa > 0.0 { pdf_sum += 1.0 / sa; }
-    }
-    return pdf_sum / f32(n);
-}
-
-// ---------------------------------------------------------------------------
-
 /// Maximum number of bounces per path.  Rays that exceed this depth return
 /// black (fully absorbed), introducing a small energy-loss bias.
 const MAX_BOUNCES: u32 = 8u;
 
-/// Trace `initial_ray` through the scene using path tracing with NEE + MIS.
+/// Trace `initial_ray` through the scene, scattering Lambertian at each hit.
+/// Returns the estimated radiance for this single-sample path.
 ///
-/// NEE (next-event estimation) is applied at every Lambertian bounce by
-/// casting a shadow ray toward a randomly chosen emissive sphere.  The
-/// contribution is combined with the BSDF-sampled emissive hits via the MIS
-/// power heuristic (β = 2) to avoid double-counting.
-///
-/// When the scene has no emissive spheres (`n_emissive == 0`) the NEE and MIS
-/// code paths are skipped and the function degenerates to the Phase 11 path
-/// tracer, so existing scenes render unchanged.
+/// `t_min = 1e-4` assumes world-scale geometry (sphere radii ~ 0.5–100 units).
+/// For very small or large  scenes this value should be adjusted accordingly.
 fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
-    var ray           = initial_ray;
-    var throughput    = vec3<f32>(1.0);
-    var radiance      = vec3<f32>(0.0);
-    // last_bsdf_pdf:
-    //   -1  = specular/delta bounce or first ray — full emission if emissive hit
-    //   ≥ 0 = Lambertian cosθ/π PDF — MIS weight applied at emissive hit
-    var last_bsdf_pdf: f32 = -1.0;
+    var ray        = initial_ray;
+    var throughput = vec3<f32>(1.0, 1.0, 1.0);
 
     for (var bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
         let hit = scene_hit(ray, T_MIN, T_MAX);
 
         if hit.t < 0.0 {
-            // Ray escaped — sample environment map (HDR or procedural gradient).
-            radiance += throughput * env_color(ray.dir);
-            return radiance;
+            // Ray escaped — multiply throughput by sky radiance and return.
+            return throughput * sky_color(ray.dir);
         }
 
-        // Clamp mat index to guard against corrupt scene data.
+        // Clamp to valid range; guards against corrupt sphere mat_index data.
+        // Using MAX_MAT_IDX instead of mat_count-1 avoids underflow when
+        // mat_count is 0, and ties the value to the array-size constant.
         let mat_idx = min(hit.mat_index, MAX_MAT_IDX);
         let mat     = materials.mats[mat_idx];
 
-        // ---- emissive surface hit ----------------------------------------
-        if mat.type_pad.x == MAT_EMISSIVE {
-            let emission = mat.albedo_fuzz.xyz * mat.ior_pad.x;
-            if last_bsdf_pdf < 0.0 {
-                // Primary hit or post-specular: full emission (delta = weight 1).
-                radiance += throughput * emission;
-            } else {
-                // Lambertian BSDF sampled this emissive: apply MIS weight so NEE
-                // and BSDF estimators combine without double-counting.
-                let p_nee  = nee_sphere_pdf(ray.origin, mat_idx);
-                let w_bsdf = mis_power_heuristic(last_bsdf_pdf, p_nee);
-                radiance  += throughput * emission * w_bsdf;
-            }
-            return radiance;
-        }
-
-        // ---- NEE direct light sampling (Lambertian surfaces only) ---------
-        let n_lights = materials.n_emissive;
-        if mat.type_pad.x == 0u && n_lights > 0u {
-            // Pick one random emissive sphere uniformly.
-            let li        = u32(rand_f32(rng) * f32(n_lights));
-            let ls        = emissive_spheres[min(li, n_lights - 1u)];
-            let lc        = ls.center_r.xyz;
-            let lr        = ls.center_r.w;
-            let l_mat_idx = ls.mat_and_pad.x;
-
-            let solid_angle = sphere_solid_angle(hit.point, lc, lr);
-            if solid_angle > 0.0 {
-                let light_dir = sample_sphere_cone(lc, lr, hit.point, rng);
-                let cos_wi    = dot(light_dir, hit.normal);
-
-                if cos_wi > 0.0 {
-                    // Shadow ray: T_MAX = entry of light sphere so only opaque
-                    // occluders (closer than the light surface) can block it.
-                    let t_entry      = sphere_ray_entry(hit.point, light_dir, lc, lr);
-                    let shadow_t_max = max(T_MIN, t_entry - T_MIN);
-                    let shadow_hit   = scene_hit(Ray(hit.point, light_dir), T_MIN, shadow_t_max);
-
-                    if shadow_hit.t < 0.0 {
-                        // Unoccluded — evaluate the NEE radiance contribution.
-                        let l_mat   = materials.mats[min(l_mat_idx, MAX_MAT_IDX)];
-                        let light_e = l_mat.albedo_fuzz.xyz * l_mat.ior_pad.x;
-
-                        // Lambertian albedo (including texture).
-                        let layer   = clamp(i32(mat.type_pad.y), 0, ALBEDO_ARRAY_LAYERS - 1);
-                        let tex_col = textureSampleLevel(
-                            albedo_textures, tex_sampler, hit.uv, layer, 0.0).xyz;
-                        let albedo  = mat.albedo_fuzz.xyz * tex_col;
-
-                        let p_nee  = 1.0 / (solid_angle * f32(n_lights));
-                        let p_bsdf = cos_wi / PI;
-                        let w_nee  = mis_power_heuristic(p_nee, p_bsdf);
-
-                        // Rendering equation: L_e * (albedo/π) * cosθ / p_nee,
-                        // multiplied by MIS weight and current path throughput.
-                        radiance += throughput * light_e * albedo * (cos_wi / PI)
-                                    / p_nee * w_nee;
-                    }
-                }
-            }
-        }
-
-        // ---- BSDF scatter -------------------------------------------------
         let sr = scatter(mat, ray, hit, rng);
-        if sr.absorbed { return radiance; }
-
-        // Record BSDF PDF for MIS at the next (potentially emissive) hit.
-        switch mat.type_pad.x {
-            case 0u: {
-                // Lambertian: PDF = cosθ / π.
-                let cos_out   = max(0.0, dot(sr.direction, hit.normal));
-                last_bsdf_pdf = cos_out / PI;
-            }
-            default: {
-                // Metal / Dielectric: delta distribution — full emission weight.
-                last_bsdf_pdf = -1.0;
-            }
-        }
+        if sr.absorbed { return vec3<f32>(0.0, 0.0, 0.0); }
 
         throughput *= sr.attenuation;
         ray = Ray(hit.point, sr.direction);
     }
 
     // Path absorbed after MAX_BOUNCES with no sky contribution.
-    return radiance;
+    return vec3<f32>(0.0, 0.0, 0.0);
 }
 
 // ---- compute entry point --------------------------------------------------
@@ -953,30 +434,6 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Discard out-of-bounds threads (non-multiple-of-16 resolutions).
     if coord.x >= dims.x || coord.y >= dims.y { return; }
-
-    // ---- G-buffer write (Phase 14) ----------------------------------------
-    // Shoot a stable centre-of-pixel primary ray (no sub-pixel jitter, no DOF)
-    // and record the first-hit normal + depth for the denoiser guide.
-    // This is done unconditionally every frame and is cheap (one scene_hit call).
-    {
-        let uc   = (f32(coord.x) + 0.5) / f32(dims.x);
-        let vc   = 1.0 - (f32(coord.y) + 0.5) / f32(dims.y);
-        let fp_c = camera.lower_left.xyz
-                 + uc * camera.horizontal.xyz
-                 + vc * camera.vertical.xyz;
-        let prim = Ray(camera.origin.xyz, normalize(fp_c - camera.origin.xyz));
-        let ghit = scene_hit(prim, T_MIN, T_MAX);
-        if ghit.t < 0.0 {
-            // Sky / miss: store a zero normal and depth sentinel −1.
-            // (The denoiser ignores .xyz for sky pixels, so the zero vector
-            // is semantically cleaner than storing prim.dir.)
-            textureStore(gbuffer_write, coord, vec4<f32>(0.0, 0.0, 0.0, -1.0));
-        } else {
-            // ghit.t is the Euclidean world-space distance along the ray
-            // (unit direction ⇒ ray parameter == distance in world units).
-            textureStore(gbuffer_write, coord, vec4<f32>(ghit.normal, ghit.t));
-        }
-    }
 
     let frame_count = camera.frame_count;
 
@@ -1019,19 +476,7 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 0 at u32::MAX (which would produce +Inf weight, corrupting pixels with NaN).
     let weight = 1.0 / f32(min(frame_count, MAX_FRAME_COUNT) + 1u);
     let prev   = textureLoad(accum_read, coord, 0).xyz;
-
-    // Sanitize: replace NaN or Inf in the sample before accumulating.
-    // NaN check: NaN != NaN. Inf check: abs() > a finite upper bound.
-    // Without this, a single NaN sample permanently corrupts the accumulator
-    // for that pixel (mix(prev, NaN, w) == NaN for all subsequent frames).
-    let safe = select(vec3<f32>(0.0), min(sample, vec3<f32>(1e10)), sample == sample);
-
-    // Also sanitize prev: if the accumulator already holds NaN (from a frame
-    // before this guard was added), recover immediately rather than waiting
-    // for a frame_count == 0 reset.
-    let safe_prev = select(vec3<f32>(0.0), prev, prev == prev);
-
-    let accum  = mix(safe_prev, safe, weight);
+    let accum  = mix(prev, sample, weight);
 
     // Store raw HDR radiance — tone-mapping is applied in the display pass.
     textureStore(accum_write, coord, vec4<f32>(accum, 1.0));
