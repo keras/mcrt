@@ -96,7 +96,10 @@ impl Aabb {
     /// propagate visibly instead of silently producing a finite-looking result.
     #[inline]
     pub(crate) fn empty() -> Self {
-        Self { min: [f32::INFINITY; 3], max: [f32::NEG_INFINITY; 3] }
+        Self {
+            min: [f32::INFINITY; 3],
+            max: [f32::NEG_INFINITY; 3],
+        }
     }
 
     /// A degenerate AABB that contains exactly one point (zero volume).
@@ -126,7 +129,10 @@ impl Aabb {
     /// Tight AABB around a sphere with the given centre and radius.
     #[inline]
     pub(crate) fn from_sphere(center: [f32; 3], radius: f32) -> Self {
-        debug_assert!(radius.is_finite() && radius >= 0.0, "sphere radius must be finite and non-negative, got {radius}");
+        debug_assert!(
+            radius.is_finite() && radius >= 0.0,
+            "sphere radius must be finite and non-negative, got {radius}"
+        );
         Self {
             min: [center[0] - radius, center[1] - radius, center[2] - radius],
             max: [center[0] + radius, center[1] + radius, center[2] + radius],
@@ -189,8 +195,8 @@ impl Aabb {
 // ---------------------------------------------------------------------------
 
 struct PrimInfo {
-    bounds:     Aabb,
-    centroid:   [f32; 3],
+    bounds: Aabb,
+    centroid: [f32; 3],
     sphere_idx: usize, // index into the original (unordered) sphere slice
 }
 
@@ -211,7 +217,7 @@ pub fn build_bvh(spheres: &[GpuSphere]) -> BvhBuildResult {
     if spheres.is_empty() {
         return BvhBuildResult {
             ordered_spheres: Vec::new(),
-            nodes:           Vec::new(),
+            nodes: Vec::new(),
         };
     }
 
@@ -222,16 +228,23 @@ pub fn build_bvh(spheres: &[GpuSphere]) -> BvhBuildResult {
             let center = [s.center_r[0], s.center_r[1], s.center_r[2]];
             let radius = s.center_r[3];
             let bounds = Aabb::from_sphere(center, radius);
-            PrimInfo { centroid: bounds.centroid(), bounds, sphere_idx: i }
+            PrimInfo {
+                centroid: bounds.centroid(),
+                bounds,
+                sphere_idx: i,
+            }
         })
         .collect();
 
-    let mut nodes           = Vec::with_capacity(2 * spheres.len());
+    let mut nodes = Vec::with_capacity(2 * spheres.len());
     let mut ordered_spheres = Vec::with_capacity(spheres.len());
 
     build_recursive(&mut prim_infos, &mut nodes, &mut ordered_spheres, spheres);
 
-    BvhBuildResult { ordered_spheres, nodes }
+    BvhBuildResult {
+        ordered_spheres,
+        nodes,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -247,16 +260,18 @@ pub fn build_bvh(spheres: &[GpuSphere]) -> BvhBuildResult {
 ///   - `right_or_offset` is set to the right child's index after the left
 ///     sub-tree has been fully inserted.
 fn build_recursive(
-    prims:      &mut [PrimInfo],
-    nodes:      &mut Vec<GpuBvhNode>,
-    ordered:    &mut Vec<GpuSphere>,
-    all:        &[GpuSphere],
+    prims: &mut [PrimInfo],
+    nodes: &mut Vec<GpuBvhNode>,
+    ordered: &mut Vec<GpuSphere>,
+    all: &[GpuSphere],
 ) -> usize {
     let node_idx = nodes.len();
     nodes.push(GpuBvhNode::zeroed()); // placeholder; overwritten below
 
     // Bounding box of all primitives in this sub-tree.
-    let bounds = prims.iter().fold(Aabb::empty(), |acc, p| acc.union(&p.bounds));
+    let bounds = prims
+        .iter()
+        .fold(Aabb::empty(), |acc, p| acc.union(&p.bounds));
 
     // ----- Leaf creation (forced for small groups) -------------------------
     if prims.len() <= BVH_LEAF_MAX {
@@ -265,10 +280,12 @@ fn build_recursive(
     }
 
     // ----- Try SAH split ---------------------------------------------------
-    let centroid_bounds =
-        prims.iter().fold(Aabb::empty(), |acc, p| {
-            acc.union(&Aabb { min: p.centroid, max: p.centroid })
-        });
+    let centroid_bounds = prims.iter().fold(Aabb::empty(), |acc, p| {
+        acc.union(&Aabb {
+            min: p.centroid,
+            max: p.centroid,
+        })
+    });
 
     match find_best_split(&prims, &centroid_bounds, &bounds) {
         Some((axis, split_idx)) => {
@@ -281,7 +298,11 @@ fn build_recursive(
 
             // Left child is always at node_idx + 1 (pre-order invariant).
             let left_child = build_recursive(&mut prims[..split_idx], nodes, ordered, all);
-            debug_assert_eq!(left_child, node_idx + 1, "pre-order invariant: left child must immediately follow parent");
+            debug_assert_eq!(
+                left_child,
+                node_idx + 1,
+                "pre-order invariant: left child must immediately follow parent"
+            );
             // Right child follows the entire left sub-tree.
             let right_child = nodes.len();
             build_recursive(&mut prims[split_idx..], nodes, ordered, all);
@@ -291,8 +312,8 @@ fn build_recursive(
                 aabb_min,
                 aabb_max,
                 right_or_offset: right_child as u32,
-                prim_count:      0, // internal node
-                _pad:            [0; 2],
+                prim_count: 0, // internal node
+                _pad: [0; 2],
             };
         }
         None => {
@@ -306,10 +327,10 @@ fn build_recursive(
 
 /// Construct a `GpuBvhNode` leaf and append this range's spheres to `ordered`.
 fn make_leaf(
-    bounds:  Aabb,
+    bounds: Aabb,
     ordered: &mut Vec<GpuSphere>,
-    prims:   &[PrimInfo],
-    all:     &[GpuSphere],
+    prims: &[PrimInfo],
+    all: &[GpuSphere],
 ) -> GpuBvhNode {
     let prim_start = ordered.len() as u32;
     for p in prims {
@@ -320,8 +341,8 @@ fn make_leaf(
         aabb_min,
         aabb_max,
         right_or_offset: prim_start,
-        prim_count:      prims.len() as u32,
-        _pad:            [0; 2],
+        prim_count: prims.len() as u32,
+        _pad: [0; 2],
     }
 }
 
@@ -342,17 +363,17 @@ fn make_leaf(
 /// primitives).  For production use, $C_t ≈ 1, C_i ≈ 4$ gives better trees
 /// by making splits cheaper relative to intersections.
 fn find_best_split(
-    prims:           &[PrimInfo],
+    prims: &[PrimInfo],
     centroid_bounds: &Aabb,
-    node_bounds:     &Aabb,
+    node_bounds: &Aabb,
 ) -> Option<(usize, usize)> {
     let parent_half_area = node_bounds.half_area().max(1e-8);
-    let leaf_cost        = prims.len() as f32;
+    let leaf_cost = prims.len() as f32;
 
-    let mut best_cost  = leaf_cost; // only accept strictly better splits
-    let mut best_axis  = 0usize;
+    let mut best_cost = leaf_cost; // only accept strictly better splits
+    let mut best_axis = 0usize;
     let mut best_split = 0usize;
-    let mut found      = false;
+    let mut found = false;
 
     for axis in 0..3usize {
         let axis_len = centroid_bounds.max[axis] - centroid_bounds.min[axis];
@@ -384,7 +405,7 @@ fn find_best_split(
 
         // ---- Right-suffix sweep + SAH evaluation ----------------------------
         let mut right_bounds = Aabb::empty();
-        let mut right_count  = 0u32;
+        let mut right_count = 0u32;
 
         for split in (0..SAH_BINS - 1).rev() {
             right_bounds = right_bounds.union(&bin_bounds[split + 1]);
@@ -401,12 +422,12 @@ fn find_best_split(
                 / parent_half_area;
 
             if cost < best_cost {
-                best_cost  = cost;
-                best_axis  = axis;
+                best_cost = cost;
+                best_axis = axis;
                 // `left_counts[split]` is the number of prims in left bins 0..=split.
                 // After sorting by this axis, the split is at that index.
                 best_split = l_count as usize;
-                found      = true;
+                found = true;
             }
         }
     }
@@ -429,7 +450,10 @@ mod tests {
 
     /// Helper: create a sphere at (cx, 0, cz) with given radius and material.
     fn sphere(cx: f32, cz: f32, r: f32, mat: u32) -> GpuSphere {
-        GpuSphere { center_r: [cx, 0.0, cz, r], mat_and_pad: [mat, 0, 0, 0] }
+        GpuSphere {
+            center_r: [cx, 0.0, cz, r],
+            mat_and_pad: [mat, 0, 0, 0],
+        }
     }
 
     #[test]
@@ -443,7 +467,11 @@ mod tests {
     fn single_sphere_produces_one_leaf() {
         let s = sphere(0.0, 0.0, 0.5, 0);
         let result = build_bvh(&[s]);
-        assert_eq!(result.nodes.len(), 1, "single sphere should produce exactly 1 node");
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "single sphere should produce exactly 1 node"
+        );
         assert_eq!(result.nodes[0].prim_count, 1);
         assert_eq!(result.nodes[0].right_or_offset, 0);
         assert_eq!(result.ordered_spheres.len(), 1);
@@ -456,7 +484,11 @@ mod tests {
             .map(|i| sphere(i as f32 * 2.0, 0.0, 0.5, 0))
             .collect();
         let result = build_bvh(&spheres);
-        assert_eq!(result.nodes.len(), 1, "exactly 4 prims ≤ BVH_LEAF_MAX should collapse to 1 leaf");
+        assert_eq!(
+            result.nodes.len(),
+            1,
+            "exactly 4 prims ≤ BVH_LEAF_MAX should collapse to 1 leaf"
+        );
         assert_eq!(result.nodes[0].prim_count, 4);
         assert_eq!(result.ordered_spheres.len(), spheres.len());
     }
@@ -474,9 +506,7 @@ mod tests {
 
     #[test]
     fn ordered_spheres_contain_all_originals() {
-        let spheres: Vec<GpuSphere> = (0..20)
-            .map(|i| sphere(i as f32, 0.0, 0.4, i % 4))
-            .collect();
+        let spheres: Vec<GpuSphere> = (0..20).map(|i| sphere(i as f32, 0.0, 0.4, i % 4)).collect();
         let result = build_bvh(&spheres);
         assert_eq!(result.ordered_spheres.len(), spheres.len());
         // Every original sphere must appear exactly once in ordered_spheres.
@@ -486,21 +516,23 @@ mod tests {
                 .iter()
                 .filter(|o| o.center_r == s.center_r && o.mat_and_pad == s.mat_and_pad)
                 .count();
-            assert_eq!(found, 1, "sphere {:?} should appear exactly once", s.center_r);
+            assert_eq!(
+                found, 1,
+                "sphere {:?} should appear exactly once",
+                s.center_r
+            );
         }
     }
 
     #[test]
     fn root_aabb_contains_all_spheres() {
-        let spheres: Vec<GpuSphere> = (0..16)
-            .map(|i| sphere(i as f32, 0.0, 0.5, 0))
-            .collect();
+        let spheres: Vec<GpuSphere> = (0..16).map(|i| sphere(i as f32, 0.0, 0.5, 0)).collect();
         let result = build_bvh(&spheres);
         let root = &result.nodes[0];
         // Every sphere centre must lie inside the root AABB (expanded by radius).
         for s in &spheres {
             let cx = s.center_r[0];
-            let r  = s.center_r[3];
+            let r = s.center_r[3];
             assert!(
                 cx - r >= root.aabb_min[0] - 1e-4 && cx + r <= root.aabb_max[0] + 1e-4,
                 "sphere at x={cx} r={r} not enclosed by root AABB [{}, {}]",
@@ -512,9 +544,7 @@ mod tests {
 
     #[test]
     fn leaf_nodes_have_positive_prim_count() {
-        let spheres: Vec<GpuSphere> = (0..32)
-            .map(|i| sphere(i as f32, 0.0, 0.4, 0))
-            .collect();
+        let spheres: Vec<GpuSphere> = (0..32).map(|i| sphere(i as f32, 0.0, 0.4, 0)).collect();
         let result = build_bvh(&spheres);
         for (i, node) in result.nodes.iter().enumerate() {
             if node.prim_count > 0 {
@@ -560,8 +590,7 @@ mod tests {
     #[test]
     fn coincident_spheres_do_not_panic() {
         // All centroids identical → SAH finds no useful split; must fall back to leaf.
-        let spheres: Vec<GpuSphere> =
-            (0..8).map(|i| sphere(0.0, 0.0, 0.5, i % 4)).collect();
+        let spheres: Vec<GpuSphere> = (0..8).map(|i| sphere(0.0, 0.0, 0.5, i % 4)).collect();
         let result = build_bvh(&spheres);
         assert!(!result.nodes.is_empty());
         assert_eq!(result.ordered_spheres.len(), spheres.len());
@@ -578,14 +607,16 @@ mod tests {
         let n = result.nodes.len();
 
         let mut visited = vec![false; n];
-        let mut stack   = vec![0usize]; // start at root
+        let mut stack = vec![0usize]; // start at root
         while let Some(idx) = stack.pop() {
-            if visited[idx] { continue; }
+            if visited[idx] {
+                continue;
+            }
             visited[idx] = true;
             let node = &result.nodes[idx];
             if node.prim_count == 0 {
                 // Internal: push left (idx+1) and right (right_or_offset).
-                let left  = idx + 1;
+                let left = idx + 1;
                 let right = node.right_or_offset as usize;
                 assert!(left < n, "left child {left} out of bounds");
                 assert!(right < n, "right child {right} out of bounds");
@@ -619,13 +650,20 @@ mod tests {
         ];
 
         for &(origin, dir) in rays {
-            let len = (dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2]).sqrt();
-            let dir_n = [dir[0]/len, dir[1]/len, dir[2]/len];
+            let len = (dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]).sqrt();
+            let dir_n = [dir[0] / len, dir[1] / len, dir[2] / len];
 
             // Brute-force: find closest intersection across ordered_spheres.
             let bf_hit = brute_force_hit(&result.ordered_spheres, origin, dir_n, 1e-4, 1e9);
             // BVH traversal: CPU mirror of the WGSL iterative stack algorithm.
-            let bvh_hit = cpu_bvh_traverse(&result.nodes, &result.ordered_spheres, origin, dir_n, 1e-4, 1e9);
+            let bvh_hit = cpu_bvh_traverse(
+                &result.nodes,
+                &result.ordered_spheres,
+                origin,
+                dir_n,
+                1e-4,
+                1e9,
+            );
 
             match (bf_hit, bvh_hit) {
                 (None, None) => {}
@@ -633,7 +671,8 @@ mod tests {
                     assert!(
                         (bf_t - bvh_t).abs() < 1e-4,
                         "ray from {:?} dir {:?}: brute-force t={bf_t:.4} vs BVH t={bvh_t:.4}",
-                        origin, dir
+                        origin,
+                        dir
                     );
                 }
                 (Some(bf_t), None) => panic!(
@@ -650,21 +689,23 @@ mod tests {
 
     /// CPU mirror of the WGSL iterative BVH traversal (pre-order left-child=i+1 layout).
     fn cpu_bvh_traverse(
-        nodes:   &[GpuBvhNode],
+        nodes: &[GpuBvhNode],
         spheres: &[GpuSphere],
-        origin:  [f32; 3],
-        dir:     [f32; 3],
-        t_min:   f32,
-        t_max:   f32,
+        origin: [f32; 3],
+        dir: [f32; 3],
+        t_min: f32,
+        t_max: f32,
     ) -> Option<f32> {
-        if nodes.is_empty() { return None; }
+        if nodes.is_empty() {
+            return None;
+        }
         let mut best_t = t_max;
-        let mut found  = false;
-        let mut stack  = [0u32; 32];
+        let mut found = false;
+        let mut stack = [0u32; 32];
         let mut sp: i32 = 0;
         stack[0] = 0;
         while sp >= 0 {
-            let idx  = stack[sp as usize] as usize;
+            let idx = stack[sp as usize] as usize;
             sp -= 1;
             let node = &nodes[idx];
             if !cpu_aabb_hit(origin, dir, node.aabb_min, node.aabb_max, t_min, best_t) {
@@ -672,59 +713,98 @@ mod tests {
             }
             if node.prim_count > 0 {
                 let start = node.right_or_offset as usize;
-                let end   = start + node.prim_count as usize;
+                let end = start + node.prim_count as usize;
                 for s in &spheres[start..end] {
                     if let Some(t) = cpu_sphere_hit(origin, dir, s, t_min, best_t) {
                         best_t = t;
-                        found  = true;
+                        found = true;
                     }
                 }
             } else if sp < 30 {
-                sp += 1; stack[sp as usize] = node.right_or_offset;
-                sp += 1; stack[sp as usize] = (idx + 1) as u32;
+                sp += 1;
+                stack[sp as usize] = node.right_or_offset;
+                sp += 1;
+                stack[sp as usize] = (idx + 1) as u32;
             }
         }
         if found { Some(best_t) } else { None }
     }
 
-    fn brute_force_hit(spheres: &[GpuSphere], origin: [f32; 3], dir: [f32; 3], t_min: f32, t_max: f32) -> Option<f32> {
+    fn brute_force_hit(
+        spheres: &[GpuSphere],
+        origin: [f32; 3],
+        dir: [f32; 3],
+        t_min: f32,
+        t_max: f32,
+    ) -> Option<f32> {
         let mut best = t_max;
         let mut found = false;
         for s in spheres {
             if let Some(t) = cpu_sphere_hit(origin, dir, s, t_min, best) {
-                best = t; found = true;
+                best = t;
+                found = true;
             }
         }
         if found { Some(best) } else { None }
     }
 
-    fn cpu_aabb_hit(origin: [f32; 3], dir: [f32; 3], bb_min: [f32; 4], bb_max: [f32; 4], t_min: f32, t_max: f32) -> bool {
+    fn cpu_aabb_hit(
+        origin: [f32; 3],
+        dir: [f32; 3],
+        bb_min: [f32; 4],
+        bb_max: [f32; 4],
+        t_min: f32,
+        t_max: f32,
+    ) -> bool {
         let mut t0 = t_min;
         let mut t1 = t_max;
         for i in 0..3 {
-            let inv_d = if dir[i].abs() < 1e-7 { if dir[i] >= 0.0 { 1e30_f32 } else { -1e30_f32 } } else { 1.0 / dir[i] };
+            let inv_d = if dir[i].abs() < 1e-7 {
+                if dir[i] >= 0.0 { 1e30_f32 } else { -1e30_f32 }
+            } else {
+                1.0 / dir[i]
+            };
             let ta = (bb_min[i] - origin[i]) * inv_d;
             let tb = (bb_max[i] - origin[i]) * inv_d;
             t0 = t0.max(ta.min(tb));
             t1 = t1.min(ta.max(tb));
-            if t1 <= t0 { return false; }
+            if t1 <= t0 {
+                return false;
+            }
         }
         true
     }
 
-    fn cpu_sphere_hit(origin: [f32; 3], dir: [f32; 3], s: &GpuSphere, t_min: f32, t_max: f32) -> Option<f32> {
-        let cx = s.center_r[0]; let cy = s.center_r[1]; let cz = s.center_r[2]; let r = s.center_r[3];
-        let ocx = origin[0]-cx; let ocy = origin[1]-cy; let ocz = origin[2]-cz;
-        let a = dir[0]*dir[0]+dir[1]*dir[1]+dir[2]*dir[2];
-        let h = ocx*dir[0]+ocy*dir[1]+ocz*dir[2];
-        let c = ocx*ocx+ocy*ocy+ocz*ocz - r*r;
-        let disc = h*h - a*c;
-        if disc < 0.0 { return None; }
+    fn cpu_sphere_hit(
+        origin: [f32; 3],
+        dir: [f32; 3],
+        s: &GpuSphere,
+        t_min: f32,
+        t_max: f32,
+    ) -> Option<f32> {
+        let cx = s.center_r[0];
+        let cy = s.center_r[1];
+        let cz = s.center_r[2];
+        let r = s.center_r[3];
+        let ocx = origin[0] - cx;
+        let ocy = origin[1] - cy;
+        let ocz = origin[2] - cz;
+        let a = dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2];
+        let h = ocx * dir[0] + ocy * dir[1] + ocz * dir[2];
+        let c = ocx * ocx + ocy * ocy + ocz * ocz - r * r;
+        let disc = h * h - a * c;
+        if disc < 0.0 {
+            return None;
+        }
         let sqrtd = disc.sqrt();
         let t = (-h - sqrtd) / a;
-        if t > t_min && t < t_max { return Some(t); }
+        if t > t_min && t < t_max {
+            return Some(t);
+        }
         let t = (-h + sqrtd) / a;
-        if t > t_min && t < t_max { return Some(t); }
+        if t > t_min && t < t_max {
+            return Some(t);
+        }
         None
     }
 
