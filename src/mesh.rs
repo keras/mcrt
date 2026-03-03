@@ -283,7 +283,11 @@ pub fn triangle_aabb(verts: &[GpuVertex], tri: &GpuTriangle) -> Aabb {
     let p0 = verts[tri.v[0] as usize].position;
     let p1 = verts[tri.v[1] as usize].position;
     let p2 = verts[tri.v[2] as usize].position;
-    Aabb::from_points_3(&[p0, p1, p2])
+    // Pad the AABB so that axis-aligned (flat) triangles — e.g. wall planes —
+    // always have a non-zero extent on every axis.  Without this, a leaf node
+    // that contains only co-planar triangles gets a zero-thickness AABB and
+    // the GPU slab test (t1 >= t0) may still be marginal for near-parallel rays.
+    Aabb::from_points_3(&[p0, p1, p2]).padded()
 }
 
 // ---------------------------------------------------------------------------
@@ -686,6 +690,44 @@ mod tests {
     #[test]
     fn gpu_triangle_is_16_bytes() {
         assert_eq!(std::mem::size_of::<GpuTriangle>(), 16);
+    }
+
+    #[test]
+    fn triangle_aabb_flat_plane_has_positive_extent() {
+        // A triangle that lies exactly in the z = -5 plane has zero z extent
+        // before padding.  The padded AABB must have positive extent on every
+        // axis so the GPU BVH slab test never produces t0 == t1 (which a strict
+        // `t1 > t0` would reject, making the whole plane invisible).
+        let verts = vec![
+            GpuVertex {
+                position: [-1.0, 0.0, -5.0, 1.0],
+                normal: [0.0, 0.0, 1.0, 0.0],
+                uv: [0.0; 4],
+            },
+            GpuVertex {
+                position: [1.0, 0.0, -5.0, 1.0],
+                normal: [0.0, 0.0, 1.0, 0.0],
+                uv: [0.0; 4],
+            },
+            GpuVertex {
+                position: [0.0, 1.0, -5.0, 1.0],
+                normal: [0.0, 0.0, 1.0, 0.0],
+                uv: [0.0; 4],
+            },
+        ];
+        let tri = GpuTriangle {
+            v: [0, 1, 2],
+            mat_idx: 0,
+        };
+        let aabb = triangle_aabb(&verts, &tri);
+        assert!(
+            aabb.max[2] - aabb.min[2] > 1e-5,
+            "flat-plane AABB z extent must be >0 after padding (got min={}, max={})",
+            aabb.min[2],
+            aabb.max[2]
+        );
+        assert!(aabb.max[0] - aabb.min[0] > 0.0, "x extent should be 2.0");
+        assert!(aabb.max[1] - aabb.min[1] > 0.0, "y extent should be 1.0");
     }
 
     // ---- uv-sphere sanity --------------------------------------------------

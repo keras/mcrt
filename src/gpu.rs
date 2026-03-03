@@ -272,7 +272,7 @@ impl GpuState {
     // Construction
     // -----------------------------------------------------------------------
 
-    pub fn new(window: Arc<Window>) -> Self {
+    pub fn new(window: Arc<Window>, scene_path: String) -> Self {
         let instance = wgpu::Instance::new(&InstanceDescriptor::default());
 
         let surface = instance
@@ -380,7 +380,7 @@ impl GpuState {
         // and upload both the reordered sphere list and the flat node array as
         // storage buffers.  The loaded scene also carries the material table,
         // the mesh geometry, and optional camera settings.
-        let loaded = load_scene_from_yaml("assets/scene.yaml");
+        let loaded = load_scene_from_yaml(&scene_path);
         let bvh_result = build_bvh(&loaded.spheres);
 
         let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -763,7 +763,7 @@ impl GpuState {
         };
 
         // ---- Phase 12: scene file watcher for hot-reload ------------------
-        let scene_path_str = "assets/scene.yaml";
+        let scene_path_str = scene_path.as_str();
         let (sc_tx, sc_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
         let _scene_watcher: Option<notify::RecommendedWatcher> =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {

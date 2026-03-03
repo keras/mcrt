@@ -172,8 +172,59 @@ enum ObjectDesc {
         #[serde(default)]
         translate: Option<[f32; 3]>,
     },
+    /// A finite rectangular plane tessellated into two triangles and added to
+    /// the mesh buffer.  The normal determines which side is "front" (outward).
+    ///
+    /// ```yaml
+    /// - type: plane
+    ///   center: [0.0, 0.0, -5.5]
+    ///   normal: [0.0, 0.0,  1.0]
+    ///   half_extents: [2.75, 2.75]
+    ///   material: white
+    /// ```
+    Plane {
+        /// World-space centre of the rectangle.
+        center: [f32; 3],
+        /// Outward-facing unit normal.  Two tangent axes are derived
+        /// automatically via Gram–Schmidt so no extra orientation is needed.
+        normal: [f32; 3],
+        /// Half-extents `[half_width, half_height]` of the rectangle.
+        /// The total patch is `2*half_width × 2*half_height`.
+        half_extents: [f32; 2],
+        /// Material reference: a name string or an inline definition.
+        material: MaterialRef,
+        /// When `true` rays hitting the back face (i.e. `dot(ray_dir, normal) > 0`)
+        /// produce no intersection.  Useful for wall planes that will never be
+        /// seen from behind, cutting the number of triangles the BVH has to test.
+        /// Defaults to `false` (double-sided).
+        #[serde(default)]
+        backface_culling: bool,
+    },
+    /// An axis-aligned box tessellated into 12 triangles (6 faces × 2 each).
+    ///
+    /// ```yaml
+    /// - type: box
+    ///   center: [-1.5, 0.7, -4.0]
+    ///   half_extents: [0.7, 0.7, 0.7]
+    ///   material: white
+    /// ```
+    #[serde(rename = "box")]
+    BoxPrim {
+        /// World-space centre of the box.
+        center: [f32; 3],
+        /// Half-extents along each axis `[hx, hy, hz]`; full dimensions are
+        /// `2*hx × 2*hy × 2*hz`.
+        half_extents: [f32; 3],
+        /// Optional Euler rotation angles in **degrees** applied in XYZ order
+        /// (first X, then Y, then Z; extrinsic ZYX equivalent).
+        /// Rotation is applied around the box centre before placement.
+        /// Defaults to `[0, 0, 0]` (identity — axis-aligned).
+        #[serde(default)]
+        rotate: Option<[f32; 3]>,
+        /// Material applied to all six faces.
+        material: MaterialRef,
+    },
     // Future variants:
-    // Cube  { center, size, material }
     // Torus { center, major_r, minor_r, material }
 }
 
@@ -254,6 +305,134 @@ fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Rotation helpers for BoxPrim
+// ---------------------------------------------------------------------------
+
+/// Convert degrees → radians.
+#[inline]
+fn to_rad(deg: f32) -> f32 { deg * std::f32::consts::PI / 180.0 }
+
+/// Build a **row-major** 3×3 rotation matrix from Euler angles (degrees).
+/// Convention: R = Rz(z) · Ry(y) · Rx(x)  — intrinsic XYZ / extrinsic ZYX.
+/// The resulting matrix `m` is applied as `m * v` via `rot3(m, v)`.
+fn euler_to_mat3(rx: f32, ry: f32, rz: f32) -> [[f32; 3]; 3] {
+    let (sx, cx) = to_rad(rx).sin_cos();
+    let (sy, cy) = to_rad(ry).sin_cos();
+    let (sz, cz) = to_rad(rz).sin_cos();
+    [
+        [ cy * cz,  sx * sy * cz - cx * sz,  cx * sy * cz + sx * sz ],
+        [ cy * sz,  sx * sy * sz + cx * cz,  cx * sy * sz - sx * cz ],
+        [     -sy,                 sx * cy,                  cx * cy ],
+    ]
+}
+
+/// Multiply a row-major 3×3 matrix by a column vector.
+#[inline]
+fn rot3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+// Float-3 helpers for plane / box tessellation
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn plane_cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+#[inline]
+fn plane_normalize3(v: [f32; 3]) -> [f32; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-9 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 1.0, 0.0] // fallback; should not occur for valid normals
+    }
+}
+
+/// Append one rectangular quad face (4 vertices + 2 CCW triangles) to the
+/// shared mesh buffers.  The face is centred at `center` with outward
+/// `normal`.  Two tangent axes are derived automatically via Gram–Schmidt.
+/// `hw` and `hh` are the half-extents along those tangent axes.
+fn push_quad_face(
+    center: [f32; 3],
+    normal: [f32; 3],
+    hw: f32,
+    hh: f32,
+    mat_idx: u32,
+    verts: &mut Vec<crate::mesh::GpuVertex>,
+    tris: &mut Vec<crate::mesh::GpuTriangle>,
+) {
+    let [nx, ny, nz] = normal;
+    // Gram–Schmidt: pick the axis-aligned helper with the smallest component
+    // to avoid a near-parallel cross product.
+    let abs = [nx.abs(), ny.abs(), nz.abs()];
+    let helper: [f32; 3] = if abs[0] <= abs[1] && abs[0] <= abs[2] {
+        [1.0, 0.0, 0.0]
+    } else if abs[1] <= abs[2] {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let t1 = plane_normalize3(plane_cross3(helper, [nx, ny, nz]));
+    let t2 = plane_cross3([nx, ny, nz], t1);
+
+    let [cx, cy, cz] = center;
+    let corner = |s1: f32, s2: f32| -> [f32; 4] {
+        [
+            cx + t1[0] * s1 * hw + t2[0] * s2 * hh,
+            cy + t1[1] * s1 * hw + t2[1] * s2 * hh,
+            cz + t1[2] * s1 * hw + t2[2] * s2 * hh,
+            1.0,
+        ]
+    };
+    let p0 = corner(-1.0, -1.0);
+    let p1 = corner(1.0, -1.0);
+    let p2 = corner(1.0, 1.0);
+    let p3 = corner(-1.0, 1.0);
+
+    let n4 = [nx, ny, nz, 0.0];
+    let base = verts.len() as u32;
+    verts.push(crate::mesh::GpuVertex {
+        position: p0,
+        normal: n4,
+        uv: [0.0, 0.0, 0.0, 0.0],
+    });
+    verts.push(crate::mesh::GpuVertex {
+        position: p1,
+        normal: n4,
+        uv: [1.0, 0.0, 0.0, 0.0],
+    });
+    verts.push(crate::mesh::GpuVertex {
+        position: p2,
+        normal: n4,
+        uv: [1.0, 1.0, 0.0, 0.0],
+    });
+    verts.push(crate::mesh::GpuVertex {
+        position: p3,
+        normal: n4,
+        uv: [0.0, 1.0, 0.0, 0.0],
+    });
+    tris.push(crate::mesh::GpuTriangle {
+        v: [base, base + 1, base + 2],
+        mat_idx,
+    });
+    tris.push(crate::mesh::GpuTriangle {
+        v: [base, base + 2, base + 3],
+        mat_idx,
+    });
+}
+
 /// Parse a scene from a YAML *string* and return data ready for GPU upload.
 ///
 /// `source` is only used in panic messages (e.g. the original file path, or
@@ -312,6 +491,96 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> LoadedScene {
                     center_r: [center[0], center[1], center[2], *radius],
                     mat_and_pad: [mat_idx, 0, 0, 0],
                 });
+            }
+
+            ObjectDesc::Plane {
+                center,
+                normal,
+                half_extents,
+                material,
+                backface_culling,
+            } => {
+                let base_idx = resolve_mat!(material);
+                // Pack the backface-cull flag into bit 31 of mat_idx.
+                // Actual material indices are always ≤ MAX_MATERIALS (64), so
+                // bit 31 is permanently free for use as a flag.  The shader
+                // masks the flag off before indexing the material table.
+                const BACKFACE_CULL_FLAG: u32 = 1u32 << 31;
+                let mat_idx = if *backface_culling {
+                    base_idx | BACKFACE_CULL_FLAG
+                } else {
+                    base_idx
+                };
+                let [hw, hh] = *half_extents;
+                push_quad_face(
+                    *center,
+                    *normal,
+                    hw,
+                    hh,
+                    mat_idx,
+                    &mut mesh_vertices,
+                    &mut mesh_triangles,
+                );
+            }
+
+            ObjectDesc::BoxPrim {
+                center,
+                half_extents,
+                rotate,
+                material,
+            } => {
+                let mat_idx = resolve_mat!(material);
+                let [cx, cy, cz] = *center;
+                let [hx, hy, hz] = *half_extents;
+
+                // Build optional rotation matrix from Euler angles (degrees).
+                // When rotate is None or [0,0,0] the identity is used and the
+                // box is axis-aligned.
+                let rot = rotate
+                    .map(|[rx, ry, rz]| euler_to_mat3(rx, ry, rz))
+                    .unwrap_or([[1.,0.,0.],[0.,1.,0.],[0.,0.,1.]]);
+
+                // Six faces defined as (outward local normal, 4 CCW corner offsets).
+                // Corner offsets are in the box's local space (centred at origin);
+                // they are rotated and then shifted by `center`.
+                let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+                    // +X
+                    ([ 1., 0., 0.], [[ hx,-hy,-hz],[ hx,-hy, hz],[ hx, hy, hz],[ hx, hy,-hz]]),
+                    // -X
+                    ([-1., 0., 0.], [[-hx,-hy, hz],[-hx,-hy,-hz],[-hx, hy,-hz],[-hx, hy, hz]]),
+                    // +Y
+                    ([ 0., 1., 0.], [[-hx, hy,-hz],[ hx, hy,-hz],[ hx, hy, hz],[-hx, hy, hz]]),
+                    // -Y
+                    ([ 0.,-1., 0.], [[ hx,-hy,-hz],[-hx,-hy,-hz],[-hx,-hy, hz],[ hx,-hy, hz]]),
+                    // +Z
+                    ([ 0., 0., 1.], [[ hx,-hy, hz],[-hx,-hy, hz],[-hx, hy, hz],[ hx, hy, hz]]),
+                    // -Z
+                    ([ 0., 0.,-1.], [[-hx,-hy,-hz],[ hx,-hy,-hz],[ hx, hy,-hz],[-hx, hy,-hz]]),
+                ];
+
+                let uvs = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+                for (local_normal, local_corners) in &faces {
+                    // Rotate normal and corner offsets into world space.
+                    let rn = rot3(&rot, *local_normal);
+                    let n4 = [rn[0], rn[1], rn[2], 0.0];
+                    let base = mesh_vertices.len() as u32;
+                    for (i, c) in local_corners.iter().enumerate() {
+                        let rc = rot3(&rot, *c);
+                        mesh_vertices.push(crate::mesh::GpuVertex {
+                            position: [cx + rc[0], cy + rc[1], cz + rc[2], 1.0],
+                            normal: n4,
+                            uv: [uvs[i][0], uvs[i][1], 0.0, 0.0],
+                        });
+                    }
+                    mesh_triangles.push(crate::mesh::GpuTriangle {
+                        v: [base, base + 1, base + 2],
+                        mat_idx,
+                    });
+                    mesh_triangles.push(crate::mesh::GpuTriangle {
+                        v: [base, base + 2, base + 3],
+                        mat_idx,
+                    });
+                }
             }
 
             ObjectDesc::Mesh {
@@ -834,6 +1103,327 @@ objects:
             "expected aperture 0.1, got {}",
             cam.aperture
         );
+    }
+
+    #[test]
+    fn yaml_plane_produces_two_triangles_and_correct_normal() {
+        // A floor plane: center at origin, normal up, half_extents 1×1.
+        // Expected: 4 vertices added to mesh buffer, 2 triangles.
+        // The cross product of the two triangle edges must equal the plane normal.
+        let yaml = r#"
+materials:
+  floor: { type: lambertian, albedo: [0.5, 0.5, 0.5] }
+objects:
+  - type: plane
+    center: [0.0, 0.0, 0.0]
+    normal: [0.0, 1.0, 0.0]
+    half_extents: [1.0, 1.0]
+    material: floor
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        // 4 real vertices + 0 stub (mesh is non-empty)
+        assert_eq!(
+            loaded.mesh_vertices.len(),
+            4,
+            "plane must produce 4 vertices"
+        );
+        assert_eq!(
+            loaded.mesh_triangles.len(),
+            2,
+            "plane must produce 2 triangles"
+        );
+
+        // Verify the geometric normal of the first triangle equals [0,1,0].
+        let tri = &loaded.mesh_triangles[0];
+        let v = |i: u32| loaded.mesh_vertices[i as usize].position;
+        let p0 = v(tri.v[0]);
+        let p1 = v(tri.v[1]);
+        let p2 = v(tri.v[2]);
+        let e1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
+        let e2 = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];
+        let gn = plane_normalize3(plane_cross3(e1, e2));
+        assert!(
+            (gn[1] - 1.0).abs() < 1e-5,
+            "triangle geometric normal should be ~[0,1,0], got {:?}",
+            gn
+        );
+
+        // Verify stored per-vertex normal matches what we declared.
+        for v in &loaded.mesh_vertices {
+            assert!(
+                (v.normal[1] - 1.0).abs() < 1e-5,
+                "stored vertex normal should be [0,1,0], got {:?}",
+                v.normal
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_plane_material_index_in_range() {
+        let yaml = r#"
+materials:
+  wall: { type: lambertian, albedo: [0.8, 0.1, 0.1] }
+objects:
+  - type: plane
+    center: [0.0, 2.0, -5.0]
+    normal: [0.0, 0.0,  1.0]
+    half_extents: [2.0, 2.0]
+    material: wall
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        let mat_count = loaded.materials.mat_count;
+        for tri in &loaded.mesh_triangles {
+            // Mask off the backface-cull flag before comparing against mat_count.
+            let bare_idx = tri.mat_idx & !(1u32 << 31);
+            assert!(
+                bare_idx < mat_count,
+                "plane triangle mat_idx {} out of range (mat_count={})",
+                bare_idx,
+                mat_count
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_plane_backface_culling_sets_flag_in_mat_idx() {
+        // When backface_culling: true, bit 31 of every triangle's mat_idx must be
+        // set.  When omitted (default false), bit 31 must be clear.
+        const BACKFACE_CULL_FLAG: u32 = 1u32 << 31;
+        let yaml = r#"
+materials:
+  wall: { type: lambertian, albedo: [0.7, 0.7, 0.7] }
+objects:
+  - type: plane
+    center: [0.0, 0.0, 0.0]
+    normal: [0.0, 1.0, 0.0]
+    half_extents: [1.0, 1.0]
+    material: wall
+    backface_culling: true
+  - type: plane
+    center: [0.0, 5.0, 0.0]
+    normal: [0.0, -1.0, 0.0]
+    half_extents: [1.0, 1.0]
+    material: wall
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        // First 2 triangles belong to the culled plane; next 2 to the double-sided one.
+        for tri in &loaded.mesh_triangles[..2] {
+            assert_ne!(tri.mat_idx & BACKFACE_CULL_FLAG, 0,
+                "culled plane triangle should have bit 31 set, got {:#010x}", tri.mat_idx);
+        }
+        for tri in &loaded.mesh_triangles[2..] {
+            assert_eq!(tri.mat_idx & BACKFACE_CULL_FLAG, 0,
+                "double-sided plane triangle should NOT have bit 31 set, got {:#010x}", tri.mat_idx);
+        }
+    }
+
+    #[test]
+    fn yaml_box_produces_six_faces() {
+        // A unit box should produce 6 faces × 4 vertices = 24 vertices and
+        // 6 × 2 = 12 triangles.
+        let yaml = r#"
+Materials:
+  wall: { type: lambertian, albedo: [0.8, 0.8, 0.8] }
+objects:
+  - type: box
+    center: [0.0, 0.5, 0.0]
+    half_extents: [0.5, 0.5, 0.5]
+    material: { type: lambertian }
+"#;
+        // Lowercase keys required; reconstruct with valid YAML.
+        let yaml = r#"
+materials:
+  wall: { type: lambertian, albedo: [0.8, 0.8, 0.8] }
+objects:
+  - type: box
+    center: [0.0, 0.5, 0.0]
+    half_extents: [0.5, 0.5, 0.5]
+    material: wall
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        assert_eq!(
+            loaded.mesh_vertices.len(),
+            24,
+            "box must produce 24 vertices (6 faces × 4)"
+        );
+        assert_eq!(
+            loaded.mesh_triangles.len(),
+            12,
+            "box must produce 12 triangles (6 faces × 2)"
+        );
+        // Every triangle must reference a valid material slot.
+        let mat_count = loaded.materials.mat_count;
+        for tri in &loaded.mesh_triangles {
+            assert!(
+                tri.mat_idx < mat_count,
+                "box triangle mat_idx {} out of range (mat_count={})",
+                tri.mat_idx,
+                mat_count
+            );
+        }
+    }
+
+    #[test]
+    fn yaml_box_normals_are_axis_aligned() {
+        // Each face of an axis-aligned box must have a per-vertex normal that
+        // is one of the six axis-aligned unit vectors.
+        let yaml = r#"
+materials:
+  m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
+objects:
+  - type: box
+    center: [0.0, 0.0, 0.0]
+    half_extents: [1.0, 2.0, 3.0]
+    material: m
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        let axis_normals: [[f32; 3]; 6] = [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        for (i, v) in loaded.mesh_vertices.iter().enumerate() {
+            let n = [v.normal[0], v.normal[1], v.normal[2]];
+            let is_axis = axis_normals.iter().any(|&a| {
+                (n[0] - a[0]).abs() < 1e-5
+                    && (n[1] - a[1]).abs() < 1e-5
+                    && (n[2] - a[2]).abs() < 1e-5
+            });
+            assert!(is_axis, "vertex {i} has non-axis-aligned normal {n:?}");
+        }
+    }
+
+    #[test]
+    fn yaml_box_non_uniform_scale_maps_extents_to_correct_axes() {
+        // Regression test for the Gram-Schmidt tangent-swap bug: when hx, hy,
+        // hz are all different, each face must span exactly 2·hN on its two
+        // non-normal axes.  Before the fix, the ±Y and ±Z faces silently
+        // swapped two of their half-extents, so stretching one axis deformed
+        // unrelated faces.
+        let yaml = r#"
+materials:
+  m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
+objects:
+  - type: box
+    center: [0.0, 0.0, 0.0]
+    half_extents: [1.0, 2.0, 3.0]
+    material: m
+"#;
+        // hx=1, hy=2, hz=3 → box is 2×4×6 in X×Y×Z.
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        let verts = &loaded.mesh_vertices;
+
+        // For each face, collect the 4 vertices whose stored normal matches
+        // and verify the span in each world axis.
+        let check_face =
+            |nx: f32, ny: f32, nz: f32, span_x: f32, span_y: f32, span_z: f32| {
+                let face_verts: Vec<_> = verts
+                    .iter()
+                    .filter(|v| {
+                        (v.normal[0] - nx).abs() < 1e-5
+                            && (v.normal[1] - ny).abs() < 1e-5
+                            && (v.normal[2] - nz).abs() < 1e-5
+                    })
+                    .collect();
+                assert_eq!(
+                    face_verts.len(),
+                    4,
+                    "face ({nx},{ny},{nz}) must have 4 vertices"
+                );
+                let xs: Vec<f32> = face_verts.iter().map(|v| v.position[0]).collect();
+                let ys: Vec<f32> = face_verts.iter().map(|v| v.position[1]).collect();
+                let zs: Vec<f32> = face_verts.iter().map(|v| v.position[2]).collect();
+                let span = |vals: &[f32]| {
+                    vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max)
+                        - vals.iter().cloned().fold(f32::INFINITY, f32::min)
+                };
+                let tol = 1e-4;
+                assert!(
+                    (span(&xs) - span_x).abs() < tol,
+                    "face ({nx},{ny},{nz}) X-span={} expected {span_x}",
+                    span(&xs)
+                );
+                assert!(
+                    (span(&ys) - span_y).abs() < tol,
+                    "face ({nx},{ny},{nz}) Y-span={} expected {span_y}",
+                    span(&ys)
+                );
+                assert!(
+                    (span(&zs) - span_z).abs() < tol,
+                    "face ({nx},{ny},{nz}) Z-span={} expected {span_z}",
+                    span(&zs)
+                );
+            };
+
+        // ±X faces: fixed x, span Y=4, Z=6
+        check_face( 1., 0., 0., 0., 4., 6.);
+        check_face(-1., 0., 0., 0., 4., 6.);
+        // ±Y faces: fixed y, span X=2, Z=6
+        check_face( 0., 1., 0., 2., 0., 6.);
+        check_face( 0.,-1., 0., 2., 0., 6.);
+        // ±Z faces: fixed z, span X=2, Y=4
+        check_face( 0., 0., 1., 2., 4., 0.);
+        check_face( 0., 0.,-1., 2., 4., 0.);
+    }
+
+    #[test]
+    fn yaml_box_rotate_y_90_swaps_x_and_z() {
+        // A 90° Y rotation maps local +X → world -Z and local +Z → world +X.
+        // All 24 vertices of a unit box rotated 90° around Y must lie within
+        // the correct axis ranges: X ∈ [-1, 1], Y ∈ [-1, 1], Z ∈ [-1, 1]
+        // (still a unit cube, just reoriented).
+        // More specifically the vertices that were on the local ±X faces
+        // (x = ±1 in local space) should now have |z| ≈ 1, |x| ≈ 0.
+        let yaml = r#"
+materials:
+  m: { type: lambertian, albedo: [1.0, 1.0, 1.0] }
+objects:
+  - type: box
+    center: [0.0, 0.0, 0.0]
+    half_extents: [1.0, 1.0, 1.0]
+    rotate: [0, 90, 0]
+    material: m
+"#;
+        let loaded = load_scene_from_str(yaml, "<inline>");
+        let tol = 1e-5_f32;
+
+        // After Ry(90°): local X -> world -Z, local Z -> world X.
+        // All rotated normals must still be unit vectors.
+        for (i, v) in loaded.mesh_vertices.iter().enumerate() {
+            let n = &v.normal;
+            let len = (n[0]*n[0] + n[1]*n[1] + n[2]*n[2]).sqrt();
+            assert!((len - 1.0).abs() < tol, "vertex {i} normal not unit: len={len}");
+        }
+
+        // Collect face normals; after Ry(90) they must all be axis-aligned.
+        let axis_normals: [[f32; 3]; 6] = [
+            [ 1., 0., 0.], [-1., 0., 0.],
+            [ 0., 1., 0.], [ 0.,-1., 0.],
+            [ 0., 0., 1.], [ 0., 0.,-1.],
+        ];
+        for (i, v) in loaded.mesh_vertices.iter().enumerate() {
+            let n = [v.normal[0], v.normal[1], v.normal[2]];
+            let ok = axis_normals.iter().any(|&a| {
+                (n[0]-a[0]).abs() < tol && (n[1]-a[1]).abs() < tol && (n[2]-a[2]).abs() < tol
+            });
+            assert!(ok, "vertex {i} normal {n:?} is not axis-aligned after Ry(90)");
+        }
+
+        // Original +X face (local normal [1,0,0]) should map to world [0,0,-1].
+        // Find those 4 vertices: they should have z ≈ -1, x ≈ 0.
+        let minus_z_face: Vec<_> = loaded.mesh_vertices.iter()
+            .filter(|v| (v.normal[2] + 1.0).abs() < tol)
+            .collect();
+        assert_eq!(minus_z_face.len(), 4, "rotated +X face should appear as -Z face");
+        for v in &minus_z_face {
+            assert!((v.position[0]).abs() < tol + 1.0 + tol, // x ∈ [-1, 1]
+                "rotated -Z face vertex has unexpected x={}", v.position[0]);
+            assert!((v.position[2] + 1.0).abs() < tol,
+                "rotated -Z face vertex z should be -1, got {}", v.position[2]);
+        }
     }
 
     #[test]

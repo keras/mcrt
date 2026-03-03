@@ -24,10 +24,29 @@ mod texture;
 
 use winit::event_loop::EventLoop;
 
+/// Default scene file loaded when `--load-scene-yaml` is not supplied.
+const DEFAULT_SCENE: &str = "assets/scene.yaml";
+
 fn main() {
     env_logger::init();
 
+    // Parse optional `--load-scene-yaml <path>` argument.
+    let scene_path = {
+        let mut args = std::env::args().skip(1);
+        let mut path = None;
+        while let Some(arg) = args.next() {
+            if arg == "--load-scene-yaml" {
+                path = args.next().or_else(|| {
+                    eprintln!("error: --load-scene-yaml requires a file path argument");
+                    std::process::exit(1);
+                });
+                break;
+            }
+        }
+        path.unwrap_or_else(|| DEFAULT_SCENE.to_string())
+    };
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = app::App::default();
+    let mut app = app::App::new(scene_path);
     event_loop.run_app(&mut app).expect("event loop error");
 }

@@ -180,6 +180,29 @@ impl Aabb {
         ]
     }
 
+    /// Inflate the AABB so that no axis has zero extent.
+    ///
+    /// This is important for flat (co-planar) triangles: without padding the
+    /// BVH node AABB has `min == max` on one axis, and the GPU ray-AABB slab
+    /// test returns false even for rays that hit the plane exactly.  A tiny
+    /// symmetric padding makes the test robust without visibly moving geometry.
+    #[inline]
+    pub(crate) fn padded(self) -> Self {
+        const EPS: f32 = 1e-4;
+        Self {
+            min: [
+                self.min[0].min(self.max[0] - EPS),
+                self.min[1].min(self.max[1] - EPS),
+                self.min[2].min(self.max[2] - EPS),
+            ],
+            max: [
+                self.max[0].max(self.min[0] + EPS),
+                self.max[1].max(self.min[1] + EPS),
+                self.max[2].max(self.min[2] + EPS),
+            ],
+        }
+    }
+
     /// Convert to the GPU-friendly `[f32; 4]` pair used in `GpuBvhNode`.
     #[inline]
     pub(crate) fn to_gpu_pair(&self) -> ([f32; 4], [f32; 4]) {
@@ -461,6 +484,29 @@ mod tests {
         let result = build_bvh(&[]);
         assert!(result.nodes.is_empty());
         assert!(result.ordered_spheres.is_empty());
+    }
+
+    #[test]
+    fn aabb_padded_inflates_zero_extent_axes() {
+        // An axis-aligned plane triangle produces a zero-thickness AABB on the
+        // axis perpendicular to the plane.  Without padding the GPU ray-AABB
+        // slab test computes t0 == t1 and the strict `t1 > t0` check fails,
+        // making the whole plane invisible.  `padded()` adds a small epsilon so
+        // the leaf AABB is always non-degenerate.
+        let flat = Aabb {
+            min: [-1.0, 0.0, -5.0],
+            max: [1.0, 0.0, -5.0], // zero extent in Y and Z
+        };
+        let p = flat.padded();
+        assert!(p.max[0] - p.min[0] > 1e-5, "x extent should be unchanged");
+        assert!(p.max[1] - p.min[1] > 1e-5, "y extent should be inflated");
+        assert!(p.max[2] - p.min[2] > 1e-5, "z extent should be inflated");
+        // Centroid must be preserved.
+        let orig_c = flat.centroid();
+        let padded_c = p.centroid();
+        assert!((orig_c[0] - padded_c[0]).abs() < 1e-6);
+        assert!((orig_c[1] - padded_c[1]).abs() < 1e-6);
+        assert!((orig_c[2] - padded_c[2]).abs() < 1e-6);
     }
 
     #[test]

@@ -203,6 +203,7 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 - [ ] Implement a simple tone-mapping pass (ACES / Reinhard) in a post-process shader
 - [ ] Gamma correction (linear → sRGB)
 - [ ] Optional: implement a simple spatial denoiser (e.g., edge-aware blur using normals + depth as guide)
+  - [ ] Add toggle to enable/disable denoising for comparison
 - [ ] Output auxiliary buffers (albedo, normal, depth) for denoiser guidance
 
 **Output:** Clean, displayable images even at low sample counts.

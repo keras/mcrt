@@ -343,7 +343,16 @@ fn ray_sphere_hit(r: Ray, sphere: Sphere, t_min: f32, t_max: f32) -> HitRecord {
 /// Smooth shading is achieved by interpolating the three vertex normals with the
 /// Möller-Trumbore barycentric coordinates (u, v); the third weight w = 1 - u - v.
 /// The interpolated normal is normalised to defend against near-degenerate cases.
+// Bit 31 of Triangle.mat_idx: when set, the triangle is single-sided.
+// Rays whose direction has a positive dot product with the interpolated
+// surface normal (i.e. hitting the back face) are rejected.
+// The actual material index is stored in bits 0-30.
+const BACKFACE_CULL_FLAG: u32 = 0x80000000u;
+
 fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord {
+    let cull_backface = (tri.mat_idx & BACKFACE_CULL_FLAG) != 0u;
+    let real_mat_idx  = tri.mat_idx & ~BACKFACE_CULL_FLAG;
+
     let p0 = vertices[tri.v.x].position.xyz;
     let p1 = vertices[tri.v.y].position.xyz;
     let p2 = vertices[tri.v.z].position.xyz;
@@ -394,9 +403,17 @@ fn ray_triangle_hit(r: Ray, tri: Triangle, t_min: f32, t_max: f32) -> HitRecord 
     hit.t         = t;
     hit.point     = r.origin + t * r.dir;
     hit.front_face = dot(r.dir, interp_n) < 0.0;
+
+    // Backface culling: discard the hit when the ray is coming from behind
+    // and single-sided geometry was requested.
+    if cull_backface && !hit.front_face {
+        hit.t = -1.0;   // signal miss to callers
+        return hit;
+    }
+
     // Normal always faces the incident ray, consistent with ray_sphere_hit.
     hit.normal    = select(-interp_n, interp_n, hit.front_face);
-    hit.mat_index = tri.mat_idx;
+    hit.mat_index = real_mat_idx;
     // UV via barycentric interpolation of the three vertex UV coordinates.
     let uv0 = vertices[tri.v.x].uv.xy;
     let uv1 = vertices[tri.v.y].uv.xy;
@@ -424,7 +441,10 @@ fn ray_aabb_hit(r: Ray, bb_min: vec3<f32>, bb_max: vec3<f32>, t_min: f32, t_max:
     // Narrow the interval [t0, t1] with each axis slab.
     let t0 = max(t_min, max(min(ta.x, tb.x), max(min(ta.y, tb.y), min(ta.z, tb.z))));
     let t1 = min(t_max, min(max(ta.x, tb.x), min(max(ta.y, tb.y), max(ta.z, tb.z))));
-    return t1 > t0;
+    // Use >= (not >) so that a zero-thickness plane AABB (min == max on one
+    // axis) is accepted when the ray hits exactly that axis-aligned plane.
+    // A strict > would make every axis-aligned plane primitive invisible.
+    return t1 >= t0;
 }
 
 // ---- BVH traversal --------------------------------------------------------

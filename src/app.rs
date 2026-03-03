@@ -22,9 +22,17 @@ use crate::gpu::{GpuState, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
 // ---------------------------------------------------------------------------
 
 /// Top-level application state.  Created before the event loop starts.
-#[derive(Default)]
 pub struct App {
+    /// Path of the YAML scene file to load; forwarded to [`GpuState::new`].
+    scene_path: String,
     state: Option<GpuState>,
+}
+
+impl App {
+    /// Create the application with the given scene file path.
+    pub fn new(scene_path: String) -> Self {
+        Self { scene_path, state: None }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -56,7 +64,7 @@ impl ApplicationHandler for App {
                 .expect("failed to create window"),
         );
 
-        self.state = Some(GpuState::new(window));
+        self.state = Some(GpuState::new(window, self.scene_path.clone()));
         info!("GPU state initialised");
     }
 
