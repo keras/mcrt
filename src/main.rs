@@ -144,13 +144,13 @@ fn compute_camera(width: u32, height: u32, look_from: Vec3, look_at: Vec3) -> Ca
 
     // Orthonormal camera basis (right-handed, Z points toward the viewer).
     let w = (look_from - look_at).normalize(); // backward
-    // Guard: if vup is parallel to w the cross product is zero → NaN.
+                                               // Guard: if vup is parallel to w the cross product is zero → NaN.
     debug_assert!(
         vup.cross(w).length_squared() > 1e-10,
         "camera vup is parallel to view direction (gimbal lock)"
     );
     let u = vup.cross(w).normalize(); // right
-    let v = w.cross(u);               // up (already unit: w⊥u, both unit)
+    let v = w.cross(u); // up (already unit: w⊥u, both unit)
 
     let horizontal = viewport_width * u;
     let vertical = viewport_height * v;
@@ -453,7 +453,7 @@ impl GpuState {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: wgpu::BufferSize::new(
-                                size_of::<CameraUniform>() as u64,
+                                size_of::<CameraUniform>() as u64
                             ),
                         },
                         count: None,
@@ -466,7 +466,7 @@ impl GpuState {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
                             min_binding_size: wgpu::BufferSize::new(
-                                size_of::<GpuSceneData>() as u64,
+                                size_of::<GpuSceneData>() as u64
                             ),
                         },
                         count: None,
@@ -593,13 +593,18 @@ impl GpuState {
         // Orbit the camera around the scene based on elapsed wall-clock time.
         let elapsed = self.start_time.elapsed().as_secs_f32();
         let angle = elapsed * 0.5; // radians / second
-        let look_from = Vec3::new(angle.sin() * ORBIT_RADIUS, ORBIT_HEIGHT, angle.cos() * ORBIT_RADIUS);
+        let look_from = Vec3::new(
+            angle.sin() * ORBIT_RADIUS,
+            ORBIT_HEIGHT,
+            angle.cos() * ORBIT_RADIUS,
+        );
         let mut cam = compute_camera(self.config.width, self.config.height, look_from, Vec3::ZERO);
         // Store the frame counter as a u32 directly in the struct — avoids the
         // f32 precision loss that would occur beyond 2²⁴ frames (~77 h @ 60 fps).
         cam.frame_count = self.frame_count;
         self.frame_count = self.frame_count.wrapping_add(1);
-        self.queue.write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
 
         let frame = self.surface.get_current_texture()?;
         let view = frame

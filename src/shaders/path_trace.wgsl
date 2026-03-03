@@ -181,9 +181,9 @@ fn random_unit_sphere(rng: ptr<function, u32>) -> vec3<f32> {
 /// Guards against the degenerate case where the random vector nearly cancels
 /// the normal, which would produce a near-zero direction.
 fn cosine_scatter(rng: ptr<function, u32>, normal: vec3<f32>) -> vec3<f32> {
-    let target = normal + random_unit_sphere(rng);
-    if dot(target, target) < 1e-10 { return normal; }
-    return normalize(target);
+    let scatter = normal + random_unit_sphere(rng);
+    if dot(scatter, scatter) < 1e-10 { return normal; }
+    return normalize(scatter);
 }
 
 // ---- material albedos (Phase 5: hardcoded; replaced by buffer in Phase 7) -
