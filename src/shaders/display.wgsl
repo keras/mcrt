@@ -7,6 +7,13 @@
 // coordinate (no sampler needed), applies Reinhard tone-mapping and approximate
 // sRGB gamma correction, then outputs the result to the swapchain.
 
+// ---- constants -------------------------------------------------------------
+
+/// Inverse gamma exponent for the approximate sRGB transfer function (γ ≈ 2.2).
+/// A proper piecewise IEC 61966-2-1 transfer would be slightly more accurate,
+/// but the difference is imperceptible for path-traced output at this stage.
+const GAMMA_INV: f32 = 1.0 / 2.2;
+
 // ---- bindings ---------------------------------------------------------------
 
 /// Rgba32Float accumulation texture written by the compute shader each frame.
@@ -40,10 +47,8 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     // Applied per-channel so bright colours desaturate gracefully.
     let mapped = raw / (raw + vec3<f32>(1.0));
 
-    // Approximate sRGB gamma correction (γ ≈ 2.2).
-    // A proper piecewise sRGB transfer would be slightly more accurate but
-    // the difference is imperceptible for path-traced output.
-    let gamma = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    // Approximate sRGB gamma correction using the named constant.
+    let gamma = pow(max(mapped, vec3<f32>(0.0)), vec3<f32>(GAMMA_INV));
 
     return vec4<f32>(gamma, 1.0);
 }

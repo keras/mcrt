@@ -1,6 +1,6 @@
 ---
 name: Reviewer
-description: Reviews code changes for the path tracer project, checking correctness, GPU alignment, architecture, and code quality against project standards.
+description: Reviews code changes, checking correctness, GPU alignment, architecture, and code quality against project standards.
 argument-hint: Files or changes to review (e.g., "review the latest changes" or "review src/renderer.rs")
 ---
 

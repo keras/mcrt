@@ -6,6 +6,36 @@
 // Depth-of-field is implemented via the thin-lens model: rays originate from
 // a random point on the aperture disk and converge on the focus plane.
 
+// ---- module-level constants -----------------------------------------------
+
+/// Full circle in radians (2π).  Used in spherical- and disk-sampling functions.
+const TAU: f32 = 6.283185307179586;
+
+/// Maximum sphere count; must match MAX_SPHERES in scene.rs.
+const MAX_SPHERES: u32 = 8u;
+
+/// Maximum material count; must match MAX_MATERIALS in material.rs.
+const MAX_MATERIALS: u32 = 8u;
+
+/// Last valid material index (MAX_MATERIALS − 1) for safe clamping.
+const MAX_MAT_IDX: u32 = 7u;
+
+/// Minimum ray distance — avoids self-intersection (shadow acne).
+/// Assumes world-scale geometry with sphere radii ~0.5–100 units.
+const T_MIN: f32 = 1e-4;
+
+/// Maximum ray distance (effectively infinite for this scene scale).
+const T_MAX: f32 = 1e9;
+
+/// Frame accumulation cap.  Prevents u32 overflow in the weight denominator
+/// (f32 can represent integers exactly up to 2²⁴ ≈ 16 M; we stop earlier).
+const MAX_FRAME_COUNT: u32 = 65535u;
+
+// PCG32 PRNG mixing constants (https://www.pcg-random.org/).
+const PCG_MULT: u32 = 747796405u;
+const PCG_INC:  u32 = 2891336453u;
+const PCG_MIX:  u32 = 277803737u;
+
 // ---- shared primitives ----------------------------------------------------
 
 /// A ray in world space.  `dir` must be unit length.
@@ -55,13 +85,13 @@ struct Sphere {
     mat_and_pad: vec4<u32>,  // .x = material index, .yzw = unused
 }
 
-// Fixed-capacity scene; must match `MAX_SPHERES` in main.rs.
+// Fixed-capacity scene; must match MAX_SPHERES in scene.rs (and this file).
 struct SceneData {
     sphere_count: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
-    spheres: array<Sphere, 8>,
+    spheres: array<Sphere, MAX_SPHERES>,
 }
 
 // ---- material buffer -----------------------------------------------------
@@ -80,13 +110,13 @@ struct Material {
     ior_pad:     vec4<f32>,
 }
 
-/// Fixed-capacity material table; must match `MAX_MATERIALS` in main.rs.
+/// Fixed-capacity material table; must match MAX_MATERIALS in material.rs (and this file).
 struct MaterialData {
     mat_count: u32,
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
-    mats: array<Material, 8>,
+    mats: array<Material, MAX_MATERIALS>,
 }
 
 // ---- bindings -------------------------------------------------------------
@@ -115,10 +145,10 @@ struct MaterialData {
 
 /// Single PCG32 step; maps any seed to a well-distributed u32.
 fn pcg_hash(v: u32) -> u32 {
-    var s = v * 747796405u + 2891336453u;
+    var s = v * PCG_MULT + PCG_INC;
     // XSH-RR output mixing.
     let rot = s >> 28u;
-    s = ((s >> (rot + 4u)) ^ s) * 277803737u;
+    s = ((s >> (rot + 4u)) ^ s) * PCG_MIX;
     return (s >> 22u) ^ s;
 }
 
@@ -186,7 +216,7 @@ fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
     var closest = t_max;
 
     // Cap to array size to guard against a corrupt sphere_count from the CPU.
-    let count = min(scene.sphere_count, 8u);
+    let count = min(scene.sphere_count, MAX_SPHERES);
     for (var i = 0u; i < count; i++) {
         let hit = ray_sphere_hit(r, scene.spheres[i], t_min, closest);
         // ray_sphere_hit returns t > t_min (1e-4) on a hit; the `> 0.0` check
@@ -210,7 +240,7 @@ fn scene_hit(r: Ray, t_min: f32, t_max: f32) -> HitRecord {
 fn random_unit_sphere(rng: ptr<function, u32>) -> vec3<f32> {
     let cos_phi = 1.0 - 2.0 * rand_f32(rng);             // uniform in [-1, 1]
     let sin_phi = sqrt(max(0.0, 1.0 - cos_phi * cos_phi));
-    let theta   = 6.283185307179586 * rand_f32(rng);      // 2π
+    let theta   = TAU * rand_f32(rng);                    // 2π
     return vec3<f32>(sin_phi * cos(theta), sin_phi * sin(theta), cos_phi);
 }
 
@@ -232,7 +262,7 @@ fn cosine_scatter(rng: ptr<function, u32>, normal: vec3<f32>) -> vec3<f32> {
 ///   theta = uniform[0, 2π)      — uniform azimuth
 fn random_in_unit_disk(rng: ptr<function, u32>) -> vec2<f32> {
     let r     = sqrt(rand_f32(rng));
-    let theta = 6.283185307179586 * rand_f32(rng);
+    let theta = TAU * rand_f32(rng);
     return r * vec2<f32>(cos(theta), sin(theta));
 }
 
@@ -371,7 +401,7 @@ fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
     var throughput = vec3<f32>(1.0, 1.0, 1.0);
 
     for (var bounce = 0u; bounce < MAX_BOUNCES; bounce++) {
-        let hit = scene_hit(ray, 1e-4, 1e9);
+        let hit = scene_hit(ray, T_MIN, T_MAX);
 
         if hit.t < 0.0 {
             // Ray escaped — multiply throughput by sky radiance and return.
@@ -379,9 +409,9 @@ fn path_color(initial_ray: Ray, rng: ptr<function, u32>) -> vec3<f32> {
         }
 
         // Clamp to valid range; guards against corrupt sphere mat_index data.
-        // Using 7u (MAX_MATERIALS - 1) instead of mat_count-1 avoids underflow
-        // when mat_count is 0.
-        let mat_idx = min(hit.mat_index, 7u);
+        // Using MAX_MAT_IDX instead of mat_count-1 avoids underflow when
+        // mat_count is 0, and ties the value to the array-size constant.
+        let mat_idx = min(hit.mat_index, MAX_MAT_IDX);
         let mat     = materials.mats[mat_idx];
 
         let sr = scatter(mat, ray, hit, rng);
@@ -442,9 +472,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // When frame_count = 0 (first frame or after a resize reset) weight = 1.0,
     // so the previous texture value is discarded regardless of its contents.
     //
-    // Cap at 65535 frames: prevents the denominator from wrapping to 0 at
-    // u32::MAX which would produce +Inf weight and corrupt all pixels with NaN.
-    let weight = 1.0 / f32(min(frame_count, 65535u) + 1u);
+    // Cap at MAX_FRAME_COUNT frames: prevents the denominator from wrapping to
+    // 0 at u32::MAX (which would produce +Inf weight, corrupting pixels with NaN).
+    let weight = 1.0 / f32(min(frame_count, MAX_FRAME_COUNT) + 1u);
     let prev   = textureLoad(accum_read, coord, 0).xyz;
     let accum  = mix(prev, sample, weight);
 
