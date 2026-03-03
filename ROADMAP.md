@@ -200,11 +200,15 @@ A progressive, GPU-accelerated path tracer built with Rust and wgpu compute shad
 
 **Goal:** Post-process the raw path-traced output for display quality.
 
-- [ ] Implement a simple tone-mapping pass (ACES / Reinhard) in a post-process shader
-- [ ] Gamma correction (linear → sRGB)
-- [ ] Optional: implement a simple spatial denoiser (e.g., edge-aware blur using normals + depth as guide)
-  - [ ] Add toggle to enable/disable denoising for comparison
-- [ ] Output auxiliary buffers (albedo, normal, depth) for denoiser guidance
+- [x] Implement a simple tone-mapping pass (ACES / Reinhard) in a post-process shader
+      — ACES filmic (Narkowicz 2016) with configurable `EXPOSURE` constant replaces per-channel Reinhard
+- [x] Gamma correction (linear → sRGB)
+      — Proper piecewise IEC 61966-2-1 sRGB transfer (1/2.4 exponent, correct linear threshold) replaces pow(1/2.2)
+- [x] Optional: implement a simple spatial denoiser (e.g., edge-aware blur using normals + depth as guide)
+      — Joint bilateral filter (7×7, spatial + normal + relative-depth weights) in `denoise.wgsl`
+  - [x] Add toggle to enable/disable denoising for comparison — press 'N' at runtime
+- [x] Output auxiliary buffers (albedo, normal, depth) for denoiser guidance
+      — G-buffer (world-space normal + Euclidean depth) written by path_trace binding 13 each frame
 
 **Output:** Clean, displayable images even at low sample counts.
 

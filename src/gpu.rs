@@ -163,18 +163,19 @@ impl Default for InputState {
 // Texture helper
 // ---------------------------------------------------------------------------
 
-/// Creates an `Rgba32Float` texture used for HDR progressive accumulation.
+/// Creates an `Rgba32Float` storage texture that can be both read
+/// (`TEXTURE_BINDING`) and written (`STORAGE_BINDING`) by compute shaders.
 ///
-/// Both `TEXTURE_BINDING` (read by compute & display shaders) and
-/// `STORAGE_BINDING` (written by the compute shader) are required.
-/// Two of these textures ping-pong every frame.
-fn create_accum_texture(
+/// Used for accumulation ping-pong buffers, the G-buffer, and the
+/// denoiser output texture.
+fn create_storage_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    label: &str,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&TextureDescriptor {
-        label: Some("accum texture"),
+        label: Some(label),
         size: Extent3d {
             width,
             height,
@@ -189,6 +190,16 @@ fn create_accum_texture(
     });
     let view = texture.create_view(&TextureViewDescriptor::default());
     (texture, view)
+}
+
+/// Convenience wrapper: creates an accumulation texture with the standard label.
+#[inline]
+fn create_accum_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    create_storage_texture(device, width, height, "accum texture")
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +250,32 @@ pub struct GpuState {
     /// Emissive sphere list for NEE direct-light sampling (storage buffer, binding 12).
     /// Contains a stub sphere at [1e9,1e9,1e9] r=0 when there are no emissives.
     emissive_buffer: wgpu::Buffer,
+    // ---- Phase 14: G-buffer and denoiser pass ----------------------------
+    /// Primary-hit G-buffer: (.xyz = world-space normal, .w = linear depth).
+    /// Written every frame by path_trace binding 13; read by the denoiser.
+    /// Kept to prevent texture deallocation; accessed only through gbuffer_view.
+    _gbuffer_tex: wgpu::Texture,
+    gbuffer_view: wgpu::TextureView,
+    /// Denoiser output texture.  Written by the denoiser pass; displayed in
+    /// place of the raw accumulation texture when `denoise_enabled` is true.
+    /// Kept to prevent texture deallocation; accessed only through denoise_output_view.
+    _denoise_output_tex: wgpu::Texture,
+    denoise_output_view: wgpu::TextureView,
+    /// Bind group layout shared by both denoiser bind groups.
+    denoise_bind_group_layout: wgpu::BindGroupLayout,
+    /// Two denoiser bind groups.
+    /// denoise_bind_groups[i] reads accum[i] — the slice *just written* by
+    /// compute_bind_groups[i] — plus the shared G-buffer, and writes the
+    /// denoised result to denoise_output_view.
+    denoise_bind_groups: [wgpu::BindGroup; 2],
+    /// The joint-bilateral denoiser compute pipeline.
+    denoise_pipeline: wgpu::ComputePipeline,
+    /// Display bind group that reads from the denoised output texture.
+    /// Replaces `display_bind_groups[f_idx]` when `denoise_enabled` is true.
+    display_bg_denoised: wgpu::BindGroup,
+    /// When `true` the denoiser compute pass runs before the display pass.
+    /// Toggle at runtime with the 'N' key.
+    denoise_enabled: bool,
     // ---- Phase 11: texture resources ----------------------------------------
     /// Albedo texture 2D array (RGBA8 Unorm, MAX_TEXTURES layers; binding 10).
     /// Stored alongside the view so the Texture Arc is not dropped early.
@@ -528,6 +565,14 @@ impl GpuState {
 
         info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
 
+        // ---- Phase 14: G-buffer + denoiser output textures ---------------
+        // Both need TEXTURE_BINDING (read by denoise/display) and
+        // STORAGE_BINDING (written by path_trace / denoise compute passes).
+        let (_gbuffer_tex, gbuffer_view) =
+            create_storage_texture(&device, config.width, config.height, "gbuffer");
+        let (_denoise_output_tex, denoise_output_view) =
+            create_storage_texture(&device, config.width, config.height, "denoise output");
+
         // Linear/clamp sampler for the albedo texture array.
         let tex_sampler = device.create_sampler(&SamplerDescriptor {
             label: Some("linear sampler"),
@@ -763,6 +808,17 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // 13: G-buffer write target (Phase 14) — normal.xyz + depth.w
+                    BindGroupLayoutEntry {
+                        binding:    13,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::StorageTexture {
+                            access:         StorageTextureAccess::WriteOnly,
+                            format:         TextureFormat::Rgba32Float,
+                            view_dimension: TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
                 ],
             });
 
@@ -781,6 +837,64 @@ impl GpuState {
             layout: Some(&compute_pipeline_layout),
             module: &compute_shader,
             entry_point: Some("cs_main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // ---- Phase 14: denoiser pipeline ----------------------------------
+        let denoise_bind_group_layout =
+            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("denoise bgl"),
+                entries: &[
+                    // 0: accum texture (HDR radiance, non-filterable Rgba32Float)
+                    BindGroupLayoutEntry {
+                        binding:    0,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Texture {
+                            sample_type:    TextureSampleType::Float { filterable: false },
+                            view_dimension: TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    // 1: G-buffer (normal + depth, non-filterable Rgba32Float)
+                    BindGroupLayoutEntry {
+                        binding:    1,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::Texture {
+                            sample_type:    TextureSampleType::Float { filterable: false },
+                            view_dimension: TextureViewDimension::D2,
+                            multisampled:   false,
+                        },
+                        count: None,
+                    },
+                    // 2: denoised output (write-only storage texture)
+                    BindGroupLayoutEntry {
+                        binding:    2,
+                        visibility: ShaderStages::COMPUTE,
+                        ty:         BindingType::StorageTexture {
+                            access:         StorageTextureAccess::WriteOnly,
+                            format:         TextureFormat::Rgba32Float,
+                            view_dimension: TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let denoise_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("denoise shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/denoise.wgsl").into()),
+        });
+        let denoise_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("denoise pipeline layout"),
+            bind_group_layouts: &[&denoise_bind_group_layout],
+            ..Default::default()
+        });
+        let denoise_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("denoise pipeline"),
+            layout: Some(&denoise_pipeline_layout),
+            module: &denoise_shader,
+            entry_point: Some("cs_denoise"),
             compilation_options: Default::default(),
             cache: None,
         });
@@ -855,7 +969,17 @@ impl GpuState {
             &albedo_tex_view,
             &env_map_view,
             &emissive_buffer,
+            &gbuffer_view,
         );
+        let denoise_bind_groups = make_denoise_bind_groups(
+            &device,
+            &denoise_bind_group_layout,
+            &accum_views,
+            &gbuffer_view,
+            &denoise_output_view,
+        );
+        let display_bg_denoised =
+            make_display_bg_denoised(&device, &bind_group_layout, &denoise_output_view);
 
         Self {
             surface,
@@ -879,6 +1003,15 @@ impl GpuState {
             triangle_buffer,
             mesh_bvh_buffer,
             emissive_buffer,
+            _gbuffer_tex,
+            gbuffer_view,
+            _denoise_output_tex,
+            denoise_output_view,
+            denoise_bind_group_layout,
+            denoise_bind_groups,
+            denoise_pipeline,
+            display_bg_denoised,
+            denoise_enabled: false,
             _albedo_tex: albedo_tex,
             albedo_tex_view,
             _env_map_tex: env_map_tex,
@@ -911,6 +1044,16 @@ impl GpuState {
         self.accum_textures = [tex0, tex1];
         self.accum_views = [view0, view1];
 
+        // Recreate G-buffer and denoiser output to match the new resolution.
+        let (gb_tex, gb_view) =
+            create_storage_texture(&self.device, new_width, new_height, "gbuffer");
+        let (dn_tex, dn_view) =
+            create_storage_texture(&self.device, new_width, new_height, "denoise output");
+        self._gbuffer_tex     = gb_tex;
+        self.gbuffer_view     = gb_view;
+        self._denoise_output_tex  = dn_tex;
+        self.denoise_output_view  = dn_view;
+
         self.rebuild_bind_groups();
         self.frame_count = 0;
     }
@@ -939,6 +1082,19 @@ impl GpuState {
             &self.albedo_tex_view,
             &self.env_map_view,
             &self.emissive_buffer,
+            &self.gbuffer_view,
+        );
+        self.denoise_bind_groups = make_denoise_bind_groups(
+            &self.device,
+            &self.denoise_bind_group_layout,
+            &self.accum_views,
+            &self.gbuffer_view,
+            &self.denoise_output_view,
+        );
+        self.display_bg_denoised = make_display_bg_denoised(
+            &self.device,
+            &self.bind_group_layout,
+            &self.denoise_output_view,
         );
     }
 
@@ -1100,6 +1256,8 @@ impl GpuState {
         self.env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
         self._env_map_tex = env_map_tex;
 
+        // G-buffer and denoised-output textures are resolution-dependent, not
+        // scene-dependent.  They are not recreated here; resize() handles them.
         self.rebuild_bind_groups();
         self.frame_count = 0;
         info!(
@@ -1192,7 +1350,30 @@ impl GpuState {
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
-        // ---- render pass: tone-map accum to swapchain --------------------
+        // ---- compute pass: joint-bilateral denoiser (optional, 'N' key) --
+        // wgpu automatically inserts a pipeline barrier between the two compute
+        // passes, ensuring the path-tracer's writes to accum[f_idx] and
+        // gbuffer_write are visible to the denoiser's texture reads.
+        if self.denoise_enabled {
+            let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("denoise pass"),
+                timestamp_writes: None,
+            });
+            cpass.set_pipeline(&self.denoise_pipeline);
+            cpass.set_bind_group(0, &self.denoise_bind_groups[f_idx], &[]);
+            let wg_x = self.config.width.div_ceil(WORKGROUP_SIZE);
+            let wg_y = self.config.height.div_ceil(WORKGROUP_SIZE);
+            cpass.dispatch_workgroups(wg_x, wg_y, 1);
+        }
+
+        // ---- render pass: tone-map (accum or denoised) to swapchain ------
+        // When denoising is on the display pass reads from the denoised output
+        // texture; otherwise it reads directly from the accumulation buffer.
+        let display_bg: &wgpu::BindGroup = if self.denoise_enabled {
+            &self.display_bg_denoised
+        } else {
+            &self.display_bind_groups[f_idx]
+        };
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
                 label: Some("display pass"),
@@ -1211,7 +1392,7 @@ impl GpuState {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.render_pipeline);
-            pass.set_bind_group(0, &self.display_bind_groups[f_idx], &[]);
+            pass.set_bind_group(0, display_bg, &[]);
             pass.draw(0..3, 0..1); // full-screen triangle
         }
 
@@ -1272,6 +1453,16 @@ impl GpuState {
             PhysicalKey::Code(KeyCode::KeyA) => self.input.wasd_held[1] = pressed,
             PhysicalKey::Code(KeyCode::KeyS) => self.input.wasd_held[2] = pressed,
             PhysicalKey::Code(KeyCode::KeyD) => self.input.wasd_held[3] = pressed,
+            PhysicalKey::Code(KeyCode::KeyN) => {
+                // Toggle the joint-bilateral denoiser on the key-down event only.
+                if pressed {
+                    self.denoise_enabled = !self.denoise_enabled;
+                    info!(
+                        "Denoiser: {}  (press N to toggle)",
+                        if self.denoise_enabled { "ON" } else { "OFF" }
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -1353,6 +1544,7 @@ fn make_compute_bind_groups(
     albedo_tex_view: &wgpu::TextureView,
     env_map_view: &wgpu::TextureView,
     emissive_buffer: &wgpu::Buffer,
+    gbuffer_view: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -1411,6 +1603,10 @@ fn make_compute_bind_groups(
                     binding: 12,
                     resource: emissive_buffer.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding: 13,
+                    resource: BindingResource::TextureView(gbuffer_view),
+                },
             ],
         })
     };
@@ -1419,4 +1615,60 @@ fn make_compute_bind_groups(
         make(&accum_views[0], &accum_views[1], "compute bg 0"),
         make(&accum_views[1], &accum_views[0], "compute bg 1"),
     ]
+}
+
+/// Creates two denoiser bind groups (one per accum ping-pong frame).
+///
+/// Each group reads a different accumulation slice (the just-written one)
+/// plus the shared G-buffer, and writes to the shared denoised output texture.
+fn make_denoise_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    accum_views: &[wgpu::TextureView; 2],
+    gbuffer_view: &wgpu::TextureView,
+    denoise_output_view: &wgpu::TextureView,
+) -> [wgpu::BindGroup; 2] {
+    let make = |accum_view: &wgpu::TextureView, label: &str| {
+        device.create_bind_group(&BindGroupDescriptor {
+            label: Some(label),
+            layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(accum_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(gbuffer_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(denoise_output_view),
+                },
+            ],
+        })
+    };
+    [
+        make(&accum_views[0], "denoise bg 0"),
+        make(&accum_views[1], "denoise bg 1"),
+    ]
+}
+
+/// Creates the display bind group that reads from the denoised output texture.
+///
+/// The display bind group layout (`layout`) is the same one used for
+/// `display_bind_groups`; it only requires a single `texture_2d<f32>` binding.
+fn make_display_bg_denoised(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    denoise_output_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&BindGroupDescriptor {
+        label: Some("display bg denoised"),
+        layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::TextureView(denoise_output_view),
+        }],
+    })
 }

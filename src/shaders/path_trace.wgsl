@@ -1,17 +1,13 @@
-// path_trace.wgsl — Phase 13: Emissive Materials & Direct Light Sampling
+// path_trace.wgsl — Phase 14: G-buffer + denoiser support
 //
-// Phase 13 additions over Phase 11/12:
-//   - MAT_EMISSIVE (type 3): emission colour × strength on every surface hit.
-//   - Binding 12: emissive_spheres storage buffer for NEE cone sampling.
-//   - MaterialData gains `n_emissive` (replaces `_pad0`) so the shader can
-//     skip NEE entirely when the scene has no emissive spheres.
-//   - Next-event estimation (NEE) for Lambertian surfaces: at each diffuse
-//     bounce one emissive sphere is sampled via uniform cone sampling.
-//   - Multiple-importance sampling (MIS, power heuristic β=2) combines the
-//     NEE contribution and the BSDF-tracked emissive hit to avoid double-
-//     counting while keeping both code paths unbiased.
+// Phase 14 additions over Phase 13:
+//   - Binding 13: gbuffer_write (texture_storage_2d<rgba32float, write>).
+//     Written every frame by cs_main using a centre-of-pixel, pinhole ray.
+//     Stores (world-space normal xyz, Euclidean linear depth w) at the first
+//     scene hit; depth = −1, normal = vec3(0) for sky misses.
+//     Read by the denoiser to guide the joint-bilateral filter.
 //
-// Phase 11 additions (still present):
+// Phase 13 additions (still present):
 //   - HitRecord gains a `uv: vec2<f32>` field populated by both
 //     ray_sphere_hit (spherical UV) and ray_triangle_hit (barycentric UV).
 //   - HitRecord gains a `uv: vec2<f32>` field populated by both
@@ -235,6 +231,13 @@ struct MaterialData {
 /// Always has at least one entry (a stub sphere at [1e9,1e9,1e9] r=0 when empty)
 /// so array indexing is unconditionally safe.
 @group(0) @binding(12) var<storage, read> emissive_spheres: array<Sphere>;
+
+/// G-buffer write target (Phase 14).
+///   .xyz = world-space surface normal at the primary hit (unit length).
+///   .w   = linear ray depth at the primary hit, or −1 for sky/miss.
+/// Written once per pixel per frame using a centre-of-pixel ray (no jitter,
+/// no DOF) so the denoiser always receives a stable, noise-free guide.
+@group(0) @binding(13) var gbuffer_write: texture_storage_2d<rgba32float, write>;
 
 /// Material type 3 — emissive surface.
 const MAT_EMISSIVE: u32 = 3u;
@@ -950,6 +953,30 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // Discard out-of-bounds threads (non-multiple-of-16 resolutions).
     if coord.x >= dims.x || coord.y >= dims.y { return; }
+
+    // ---- G-buffer write (Phase 14) ----------------------------------------
+    // Shoot a stable centre-of-pixel primary ray (no sub-pixel jitter, no DOF)
+    // and record the first-hit normal + depth for the denoiser guide.
+    // This is done unconditionally every frame and is cheap (one scene_hit call).
+    {
+        let uc   = (f32(coord.x) + 0.5) / f32(dims.x);
+        let vc   = 1.0 - (f32(coord.y) + 0.5) / f32(dims.y);
+        let fp_c = camera.lower_left.xyz
+                 + uc * camera.horizontal.xyz
+                 + vc * camera.vertical.xyz;
+        let prim = Ray(camera.origin.xyz, normalize(fp_c - camera.origin.xyz));
+        let ghit = scene_hit(prim, T_MIN, T_MAX);
+        if ghit.t < 0.0 {
+            // Sky / miss: store a zero normal and depth sentinel −1.
+            // (The denoiser ignores .xyz for sky pixels, so the zero vector
+            // is semantically cleaner than storing prim.dir.)
+            textureStore(gbuffer_write, coord, vec4<f32>(0.0, 0.0, 0.0, -1.0));
+        } else {
+            // ghit.t is the Euclidean world-space distance along the ray
+            // (unit direction ⇒ ray parameter == distance in world units).
+            textureStore(gbuffer_write, coord, vec4<f32>(ghit.normal, ghit.t));
+        }
+    }
 
     let frame_count = camera.frame_count;
 
