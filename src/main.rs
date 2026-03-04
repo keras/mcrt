@@ -50,12 +50,9 @@ fn main() {
             eprintln!("error: --headless mode requires --output <path>");
             std::process::exit(1);
         });
-        let width: Option<u32> = get_next_after(&args, "--width")
-            .and_then(|s| s.parse().ok());
-        let height: Option<u32> = get_next_after(&args, "--height")
-            .and_then(|s| s.parse().ok());
-        let spp: Option<u32> = get_next_after(&args, "--spp")
-            .and_then(|s| s.parse().ok());
+        let width: Option<u32> = get_next_after(&args, "--width").and_then(|s| s.parse().ok());
+        let height: Option<u32> = get_next_after(&args, "--height").and_then(|s| s.parse().ok());
+        let spp: Option<u32> = get_next_after(&args, "--spp").and_then(|s| s.parse().ok());
 
         if let Err(e) = headless::run(scene, output, width, height, spp) {
             eprintln!("headless render failed: {e}");
@@ -67,8 +64,8 @@ fn main() {
     // -----------------------------------------------------------------------
     // Windowed (interactive) mode.
     // -----------------------------------------------------------------------
-    let scene_path = get_next_after(&args, "--load-scene-yaml")
-        .unwrap_or_else(|| DEFAULT_SCENE.to_string());
+    let scene_path =
+        get_next_after(&args, "--load-scene-yaml").unwrap_or_else(|| DEFAULT_SCENE.to_string());
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = app::App::new(scene_path);

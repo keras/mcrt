@@ -16,18 +16,17 @@
 use std::mem::size_of;
 use std::path::Path;
 
-use bytemuck::{bytes_of, Zeroable};
+use bytemuck::{Zeroable, bytes_of};
 use wgpu::util::DeviceExt;
 use wgpu::*;
 
-use crate::bvh::{build_bvh, GpuBvhNode};
-use crate::camera::{compute_camera, CameraUniform, INIT_LOOK_AT, INIT_LOOK_FROM};
+use crate::bvh::{GpuBvhNode, build_bvh};
+use crate::camera::{CameraUniform, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
-use crate::mesh::{build_mesh_bvh, GpuTriangle, GpuVertex};
-use crate::scene::{load_scene_from_yaml, GpuSphere};
+use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
+use crate::scene::{GpuSphere, load_scene_from_yaml};
 use crate::texture::{
-    load_all_textures, load_env_map_data, ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES,
-    TEXTURE_SIZE,
+    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,7 +96,7 @@ fn load_sidecar(scene_path: &str) -> SidecarParams {
 #[inline]
 fn tonemap_to_u8(v: f32) -> u8 {
     let v = v.max(0.0);
-    let mapped = v / (v + 1.0);                        // Reinhard
+    let mapped = v / (v + 1.0); // Reinhard
     let gamma = mapped.powf(1.0 / 2.2).clamp(0.0, 1.0); // gamma-2.2
     (gamma * 255.0 + 0.5) as u8
 }
@@ -125,7 +124,10 @@ pub fn run(
     let sidecar = load_sidecar(&scene_path);
     let render = sidecar.render.unwrap_or_default();
     let width = width_arg.or(render.width).unwrap_or(DEFAULT_WIDTH).max(1);
-    let height = height_arg.or(render.height).unwrap_or(DEFAULT_HEIGHT).max(1);
+    let height = height_arg
+        .or(render.height)
+        .unwrap_or(DEFAULT_HEIGHT)
+        .max(1);
     let spp = spp_arg.or(render.spp).unwrap_or(DEFAULT_SPP).max(1);
 
     log::info!(
@@ -403,9 +405,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<CameraUniform>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<CameraUniform>() as u64),
                 },
                 count: None,
             },
@@ -416,9 +416,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuSphere>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuSphere>() as u64),
                 },
                 count: None,
             },
@@ -440,9 +438,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuMaterialData>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuMaterialData>() as u64),
                 },
                 count: None,
             },
@@ -453,9 +449,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuBvhNode>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuBvhNode>() as u64),
                 },
                 count: None,
             },
@@ -466,9 +460,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuVertex>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuVertex>() as u64),
                 },
                 count: None,
             },
@@ -479,9 +471,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuTriangle>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuTriangle>() as u64),
                 },
                 count: None,
             },
@@ -492,9 +482,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuBvhNode>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuBvhNode>() as u64),
                 },
                 count: None,
             },
@@ -534,9 +522,7 @@ pub fn run(
                 ty: BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        size_of::<GpuSphere>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuSphere>() as u64),
                 },
                 count: None,
             },
@@ -649,20 +635,19 @@ pub fn run(
     ];
 
     // --- initial camera uniform --------------------------------------------
-    let (look_from, look_at, vfov, aperture, focus_dist) =
-        if let Some(ref c) = loaded.camera {
-            let lf = glam::Vec3::from(c.look_from);
-            let la = glam::Vec3::from(c.look_at);
-            (lf, la, c.vfov, c.aperture, c.focus_dist)
-        } else {
-            (
-                INIT_LOOK_FROM,
-                INIT_LOOK_AT,
-                crate::camera::DEFAULT_VFOV,
-                0.0_f32,
-                (INIT_LOOK_FROM - INIT_LOOK_AT).length(),
-            )
-        };
+    let (look_from, look_at, vfov, aperture, focus_dist) = if let Some(ref c) = loaded.camera {
+        let lf = glam::Vec3::from(c.look_from);
+        let la = glam::Vec3::from(c.look_at);
+        (lf, la, c.vfov, c.aperture, c.focus_dist)
+    } else {
+        (
+            INIT_LOOK_FROM,
+            INIT_LOOK_AT,
+            crate::camera::DEFAULT_VFOV,
+            0.0_f32,
+            (INIT_LOOK_FROM - INIT_LOOK_AT).length(),
+        )
+    };
 
     // --- SPP accumulation loop ---------------------------------------------
     // Pre-allocate a staging buffer with one CameraUniform per sample.
@@ -682,8 +667,9 @@ pub fn run(
     let cam_stride = size_of::<CameraUniform>() as u64;
     let cameras: Vec<CameraUniform> = (0..spp)
         .map(|frame| {
-            let mut cam =
-                compute_camera(width, height, look_from, look_at, vfov, aperture, focus_dist);
+            let mut cam = compute_camera(
+                width, height, look_from, look_at, vfov, aperture, focus_dist,
+            );
             cam.frame_count = frame;
             cam
         })

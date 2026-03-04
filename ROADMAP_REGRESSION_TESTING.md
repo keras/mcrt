@@ -310,24 +310,24 @@ mcrt-regress baseline --from HEAD^  [--scenes tests/assets/scenes/]
 
 ### Tasks
 
-- [ ] Decide on the delivery mechanism: a subcommand of the main binary (`mcrt
+- [x] Decide on the delivery mechanism: a subcommand of the main binary (`mcrt
   regress baseline`) or a standalone shell/Python script
   (`scripts/regress_baseline.sh`).  A shell script is simpler and avoids
   adding git-interaction logic to the Rust binary.
-- [ ] Implement worktree creation, with error handling for already-existing
+- [x] Implement worktree creation, with error handling for already-existing
   worktrees (resume or remove-and-recreate).
-- [ ] Implement sequential scene enumeration: find all `*.test.toml` sidecars
+- [x] Implement sequential scene enumeration: find all `*.test.toml` sidecars
   and render the corresponding YAML with the commitish binary.
-- [ ] Handle scene YAML schema changes gracefully: if the baseline binary
+- [x] Handle scene YAML schema changes gracefully: if the baseline binary
   rejects a scene file (non-zero exit, parse error logged to stderr), log a
   warning `[SKIP] <scene>: schema incompatible with baseline <short-sha>` and
   continue to the next scene.  Do **not** fail the baseline-capture run.
   The missing PNG will cause the later comparison step to log a skip for that
   scene rather than a failure.
-- [ ] Implement `manifest.json` generation.
-- [ ] Implement worktree cleanup (always, even on failure — use `trap` in
+- [x] Implement `manifest.json` generation.
+- [x] Implement worktree cleanup (always, even on failure — use `trap` in
   shell).
-- [ ] Test against a real prior commit to confirm images are produced and the
+- [x] Test against a real prior commit to confirm images are produced and the
   worktree is cleaned up.
 
 **Output:** After running the baseline command,

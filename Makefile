@@ -4,12 +4,14 @@
 # Only source files (scene YAMLs, sidecar TOMLs, generator scripts) are
 # committed.  Run `make help` for a brief description of each target.
 
-.PHONY: help gen-test-assets clean-regression
+.PHONY: help gen-test-assets regress-baseline clean-regression
 
 # Default target: print help.
 help:
 	@echo "Targets:"
 	@echo "  gen-test-assets   Generate all synthetic test assets (HDR skymaps, etc.)"
+	@echo "  regress-baseline  Capture regression baseline from a git commitish."
+	@echo "                    Usage: make regress-baseline FROM=HEAD^"
 	@echo "  clean-regression  Remove all generated artefacts in tmp/regression/"
 
 # ---------------------------------------------------------------------------
@@ -28,6 +30,17 @@ gen-test-assets:
 		--sky-horizon-nit 0.2 --sky-zenith-nit 0.5 \
 		--output tmp/regression/skyboxes/test_sky.hdr
 	@echo "✓ Test assets generated in tmp/regression/"
+
+# ---------------------------------------------------------------------------
+# regress-baseline — check out <FROM>, build it, render all regression scenes,
+# and store results in tmp/regression/baselines/<short-sha>/.
+#
+# Usage:  make regress-baseline FROM=HEAD^
+#         make regress-baseline FROM=a1b2c3d
+# ---------------------------------------------------------------------------
+regress-baseline:
+	@test -n "$(FROM)" || (echo "error: FROM is required — e.g. make regress-baseline FROM=HEAD^"; exit 1)
+	bash scripts/regress_baseline.sh --from $(FROM)
 
 # ---------------------------------------------------------------------------
 # clean-regression — wipe all generated regression artefacts.
