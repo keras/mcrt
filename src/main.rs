@@ -21,6 +21,7 @@ mod gpu;
 mod headless;
 mod material;
 mod mesh;
+mod regression;
 mod scene;
 mod texture;
 

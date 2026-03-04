@@ -364,12 +364,12 @@ clutter `git status`.
 
 ### Tasks
 
-- [ ] Add `image` crate usage (already planned for Phase RT-2) for PNG I/O.
-- [ ] Implement `fn compare_images(a: &DynamicImage, b: &DynamicImage) -> DiffResult` returning MSE, PSNR, and max delta.
-- [ ] Implement false-colour diff image generation.
-- [ ] Write unit tests for the comparison function with synthetic pixel data
+- [x] Add `image` crate usage (already planned for Phase RT-2) for PNG I/O.
+- [x] Implement `fn compare_images(a: &DynamicImage, b: &DynamicImage) -> DiffResult` returning MSE, PSNR, and max delta.
+- [x] Implement false-colour diff image generation.
+- [x] Write unit tests for the comparison function with synthetic pixel data
   (identical images → MSE = 0; fully inverted image → expected MSE value).
-- [ ] Verify the metrics against known reference values using at least one real
+- [x] Verify the metrics against known reference values using at least one real
   scene pair.
 
 **Output:** A `src/regression.rs` module (or `tests/regression/compare.rs`)
