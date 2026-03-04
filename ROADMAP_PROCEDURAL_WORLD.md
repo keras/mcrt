@@ -14,12 +14,10 @@ texture tiling alone.
 >   no new GPU primitives or shader rewrites are needed for the core path tracer.
 > - A greedy meshing pass keeps triangle counts manageable; flat same-material
 >   faces are merged into quads before triangulation.
-> - The scene YAML gains a `world:` key so a voxel world can be composed with
->   ordinary objects (spheres, meshes, lights).
+> - The procedural world generator works independently from the yaml scene definitions
+>   No changes to the yaml scene are required.
 > - All world-generation code lives in pure Rust with no wgpu dependencies,
 >   making it independently testable.
-> - Hot-reload: modifying generator parameters in the YAML rebuilds only the
->   affected chunks and re-uploads geometry to the GPU.
 
 ---
 
@@ -457,98 +455,7 @@ shader changes.
 
 ---
 
-## Phase VW-6: Scene YAML `world:` Key
-
-**Goal:** Expose the world generator through the scene YAML so users can
-control seed, view distance, and rendering parameters without touching Rust
-code.
-
-### YAML schema
-
-```yaml
-# Procedural voxel world
-world:
-  seed: 123456789       # u64 — deterministic generation
-  view_distance: 9      # half-width in chunks (9 → 9×9 = 81 chunks)
-  sea_level: 64         # y-coordinate of water surface
-  terrain:
-    base_height: 64     # average surface y
-    amplitude:   24.0   # ±height of fBm detail (metres)
-    octaves:     5
-    lacunarity:  2.0
-    gain:        0.5
-  biomes:
-    enabled: true       # false → single biome (plains)
-  caves:
-    enabled: true
-    threshold: 0.72     # Perlin threshold above which voxels are carved
-
-# World materials block (optional — built-in defaults are used if absent)
-world_materials:
-  stone: { type: lambertian, albedo: [0.45, 0.45, 0.45] }
-  ...
-
-# Regular scene additions (lights, props, camera) compose with the world
-camera:
-  look_from: [0.0, 12.0, 10.0]
-  look_at:   [0.0,  9.0,  0.0]
-  vfov: 70.0
-  aperture: 0.0
-
-objects:
-  - type: sphere
-    center: [0.0, 15.0, 0.0]
-    radius: 0.5
-    material: { type: emissive, albedo: [1.0, 0.9, 0.8], emission_strength: 20.0 }
-```
-
-### Serde schema types
-
-```rust
-// src/world/config.rs
-#[derive(serde::Deserialize, Default)]
-pub struct WorldDesc {
-    pub seed:          u64,
-    #[serde(default = "default_view_distance")]
-    pub view_distance: i32,
-    #[serde(default = "default_sea_level")]
-    pub sea_level:     i32,
-    #[serde(default)]
-    pub terrain:       TerrainDesc,
-    #[serde(default)]
-    pub biomes:        BiomeDesc,
-    #[serde(default)]
-    pub caves:         CaveDesc,
-}
-```
-
-When the `world:` key is absent the existing behaviour (static mesh + sphere
-scene) is unchanged.
-
-### Hot-reload support
-
-Changing world generator parameters in the YAML triggers `reload_scene()` in
-`gpu.rs`.  The reload regenerates all visible chunks from scratch (incrementally
-dirty only when chunk count is large — a future optimisation).
-
-### Tasks
-
-- [ ] Implement `src/world/config.rs` with `WorldDesc`, `TerrainDesc`,
-  `BiomeDesc`, `CaveDesc` serde structs and `Default` impls matching the
-  defaults above.
-- [ ] Extend `SceneFile` in `scene.rs` to include `world: Option<WorldDesc>`.
-- [ ] Wire `WorldDesc` → `WorldGenerator::new_from_desc` factory.
-- [ ] Write `assets/world.yaml` — a minimal example world scene that can be
-  opened with the interactive renderer.
-- [ ] Confirm hot-reload: edit `seed:` in the running interactive renderer and
-  verify the world re-generates.
-
-**Output:** `cargo run -- assets/world.yaml` opens the interactive renderer
-showing a procedurally generated voxel landscape.
-
----
-
-## Phase VW-7: Dynamic Chunk Streaming
+## Phase VW-6: Dynamic Chunk Streaming
 
 **Goal:** As the camera moves in the interactive renderer, load newly visible
 chunks and unload out-of-range chunks without stalling the render loop.
@@ -610,7 +517,7 @@ chunk pop-in limited to the background loading rate.
 
 ---
 
-## Phase VW-8: World Regression Test Scenes
+## Phase VW-7: World Regression Test Scenes
 
 **Goal:** Add regression test scenes that cover the voxel world rendering path
 so the Phase RT framework can detect unintended visual regressions in terrain
