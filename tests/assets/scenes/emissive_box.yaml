@@ -1,0 +1,100 @@
+# tests/assets/scenes/emissive_box.yaml
+#
+# Regression test scene: area-light emission + soft shadows.
+#
+# A small white room lit exclusively by a warm emissive ceiling panel.
+# There is no other light source and no env_map, so all illumination comes
+# from the single area light — directly testing the emissive sampling and
+# soft-shadow code paths.  A single white diffuse box sits on the floor to
+# cast a soft shadow.
+#
+# NOTE: Emission-only scenes converge slowly, so the sidecar requests
+# spp = 256 (4× the default) and uses a looser MSE threshold.
+
+camera:
+  look_from: [0.0, 3.5,  6.0]
+  look_at:   [0.0, 2.5,  0.0]
+  vfov:      55.0
+  aperture:  0.0
+
+materials:
+  white:
+    type: lambertian
+    albedo: [0.73, 0.73, 0.73]
+
+  ceiling_light:
+    type: emissive
+    albedo:            [1.0, 0.95, 0.85]
+    emission_strength: 80.0
+
+objects:
+  # Floor (y = 0, normal up).
+  - type: plane
+    normal:        [0.0, 1.0, 0.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0.0]
+
+  # Ceiling (y = 7, normal down).
+  - type: plane
+    normal:        [0.0, -1.0, 0.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 7.0, 0.0]
+
+  # Back wall (z = -4, normal toward camera).
+  - type: plane
+    normal:        [0.0, 0.0, 1.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 3.5, -4.0]
+
+  # Left wall (x = -4, normal right).
+  - type: plane
+    normal:        [1.0, 0.0, 0.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [-4.0, 3.5, 0.0]
+
+  # Right wall (x = +4, normal left).
+  - type: plane
+    normal:        [-1.0, 0.0, 0.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [4.0, 3.5, 0.0]
+
+  # Front wall (z = +6, seals the room — backface_culling lets camera rays
+  # through while blocking internally bounced rays from reaching the sky).
+  - type: plane
+    normal:        [0.0, 0.0, -1.0]
+    half_extents:  [4, 4]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 3.5, 6.0]
+
+  # Emissive ceiling panel — the only light source.
+  - type: plane
+    normal:        [0.0, -1.0, 0.0]
+    half_extents:  [1.2, 1.2]
+    material:      ceiling_light
+    transform:
+      translate: [0.0, 6.9, -1.0]
+
+  # Small white box on the floor — casts a soft shadow.
+  - type: box
+    half_extents: [0.8, 0.8, 0.8]
+    material:     white
+    transform:
+      translate: [0.0, 0.8, -1.5]
+      rotate:    [0.0, 20.0, 0.0]

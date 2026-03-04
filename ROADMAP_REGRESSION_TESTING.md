@@ -56,23 +56,23 @@ threshold_psnr   = 38.0    # minimum Peak Signal-to-Noise Ratio (dB)
 
 ### Tasks
 
-- [ ] Add `tmp/` to `.gitignore` (a single line `tmp/` covers all generated
+- [x] Add `tmp/` to `.gitignore` (a single line `tmp/` covers all generated
   artefacts for the entire regression framework).
-- [ ] Create `tests/assets/scenes/` directory.
-- [ ] Author `diffuse_sphere.yaml` — single Lambertian sphere on a white floor,
+- [x] Create `tests/assets/scenes/` directory.
+- [x] Author `diffuse_sphere.yaml` — single Lambertian sphere on a white floor,
   one point light above, sky colour background.
-- [ ] Author `mirror_sphere.yaml` — single perfectly specular sphere, same
+- [x] Author `mirror_sphere.yaml` — single perfectly specular sphere, same
   lighting as above.
-- [ ] Author `glass_sphere.yaml` — dielectric sphere (IOR 1.5) suspended in
+- [x] Author `glass_sphere.yaml` — dielectric sphere (IOR 1.5) suspended in
   air, same lighting.
-- [ ] Author `emissive_box.yaml` — room with a ceiling emissive panel, no
+- [x] Author `emissive_box.yaml` — room with a ceiling emissive panel, no
   other light source.  Because emission-only scenes converge slowly, set
   `spp = 256` in its sidecar (4× the default) and use a looser threshold
   (`threshold_mse = 0.005`) to accommodate the remaining variance.
-- [ ] Author `cornell_box_mini.yaml` — trimmed-down copy of
+- [x] Author `cornell_box_mini.yaml` — trimmed-down copy of
   `assets/cornell-box.yaml` (remove complex geometry that adds render time).
-- [ ] Write a `<scene>.test.toml` sidecar for every scene above.
-- [ ] Add a brief `tests/assets/scenes/README.md` documenting the purpose of
+- [x] Write a `<scene>.test.toml` sidecar for every scene above.
+- [x] Add a brief `tests/assets/scenes/README.md` documenting the purpose of
   each scene and the sidecar format.
 
 **Output:** A `tests/assets/scenes/` directory containing five scene+sidecar

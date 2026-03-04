@@ -1,0 +1,61 @@
+# tests/assets/scenes/glass_sphere.yaml
+#
+# Regression test scene: dielectric refraction + Fresnel.
+#
+# A glass sphere (IOR 1.5) is suspended in the air above a white floor.
+# A white diffuse sphere sits behind it so that refraction is clearly visible
+# through the glass.  Lighting is identical to diffuse_sphere.yaml: one
+# emissive area-light sphere above and the procedural sky gradient.
+
+camera:
+  look_from: [0.0, 1.5, 5.0]
+  look_at:   [0.0, 1.0, 0.0]
+  vfov:      40.0
+  aperture:  0.0
+
+materials:
+  white:
+    type: lambertian
+    albedo: [0.9, 0.9, 0.9]
+
+  glass:
+    type: dielectric
+    ior: 1.5
+
+  backdrop:
+    type: lambertian
+    albedo: [0.6, 0.3, 0.1]   # warm reddish-brown for contrast
+
+  light:
+    type: emissive
+    albedo:            [1.0, 0.95, 0.85]
+    emission_strength: 500.0
+
+objects:
+  # Glass sphere — the primary subject, suspended at eye level.
+  - type: sphere
+    center:   [0.0, 1.0, 0.0]
+    radius:   1.0
+    material: glass
+
+  # Diffuse backdrop sphere rendered behind the glass sphere so refraction
+  # distortion is visually obvious in the regression image.
+  - type: sphere
+    center:   [0.0, 1.0, -3.0]
+    radius:   1.5
+    material: backdrop
+
+  # White floor plane.
+  - type: plane
+    normal:        [0.0, 1.0, 0.0]
+    half_extents:  [6, 6]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0.0]
+
+  # Small emissive sphere above and to the right (same position as diffuse scene).
+  - type: sphere
+    center:   [2.0, 4.0, 2.0]
+    radius:   0.3
+    material: light

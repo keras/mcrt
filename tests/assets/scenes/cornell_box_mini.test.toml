@@ -1,0 +1,11 @@
+# tests/assets/scenes/cornell_box_mini.test.toml
+# Regression-test parameters for cornell_box_mini.yaml.
+
+[render]
+width  = 128
+height = 128
+spp    = 64          # samples per pixel
+
+[regression]
+threshold_mse  = 0.002   # mean squared error (linear, 0-1 range)
+threshold_psnr = 38.0    # minimum Peak Signal-to-Noise Ratio (dB)

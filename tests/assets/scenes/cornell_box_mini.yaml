@@ -1,0 +1,112 @@
+# tests/assets/scenes/cornell_box_mini.yaml
+#
+# Regression test scene: Full Cornell Box at low SPP.
+#
+# A trimmed-down version of assets/cornell-box.yaml that removes the
+# heavy-geometry meshes and the extra metal/glass spheres so the scene renders
+# quickly at 64 spp.  Retains the characteristic red/green side walls and the
+# warm ceiling area-light to exercise colour bleeding and inter-reflection.
+
+camera:
+  look_from: [0.0, 4.75,  8.0]
+  look_at:   [0.0, 4.0,   0.0]
+  vfov:      60.0
+  aperture:  0.0
+
+materials:
+  white:
+    type: lambertian
+    albedo: [0.73, 0.73, 0.73]
+
+  red:
+    type: lambertian
+    albedo: [0.65, 0.05, 0.05]
+
+  green:
+    type: lambertian
+    albedo: [0.12, 0.45, 0.15]
+
+  ceiling_light:
+    type: emissive
+    albedo:            [1.0, 0.95, 0.85]
+    emission_strength: 80.0
+
+objects:
+  # Floor (y = 0, normal up).
+  - type: plane
+    normal:        [0.0, 1.0, 0.0]
+    half_extents:  [5, 5]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0.0]
+
+  # Ceiling (y = 10, normal down).
+  - type: plane
+    normal:        [0.0, -1.0, 0.0]
+    half_extents:  [5, 5]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 10.0, 0.0]
+
+  # Back wall (z = -5, normal toward camera).
+  - type: plane
+    normal:        [0.0, 0.0, 1.0]
+    half_extents:  [5, 5]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 5.0, -5.0]
+
+  # Left wall — red (x = -5, normal right).
+  - type: plane
+    normal:        [1.0, 0.0, 0.0]
+    half_extents:  [5, 5]
+    material:      red
+    backface_culling: true
+    transform:
+      translate: [-5.0, 5.0, 0.0]
+
+  # Right wall — green (x = +5, normal left).
+  - type: plane
+    normal:        [-1.0, 0.0, 0.0]
+    half_extents:  [5, 5]
+    material:      green
+    backface_culling: true
+    transform:
+      translate: [5.0, 5.0, 0.0]
+
+  # Front wall (z = +5, seals the box — backface_culling lets camera rays
+  # through while blocking internally bounced rays from escaping to the sky).
+  - type: plane
+    normal:        [0.0, 0.0, -1.0]
+    half_extents:  [5, 5]
+    material:      white
+    backface_culling: true
+    transform:
+      translate: [0.0, 5.0, 5.0]
+
+  # Emissive ceiling panel (area light).
+  - type: plane
+    normal:        [0.0, -1.0, 0.0]
+    half_extents:  [1.5, 1.5]
+    material:      ceiling_light
+    transform:
+      translate: [0.0, 9.9, -2.5]
+
+  # Two small white boxes as interior props — cheap stand-ins for the full
+  # Cornell Box furniture without mesh loading overhead.
+  - type: box
+    half_extents: [1.0, 1.8, 1.0]
+    material:     white
+    transform:
+      translate: [-2.0, 1.8, -3.0]
+      rotate:    [0.0,  25.0, 0.0]
+
+  - type: box
+    half_extents: [0.9, 0.9, 0.9]
+    material:     white
+    transform:
+      translate: [2.0, 0.9, -1.5]
+      rotate:    [0.0, -15.0, 0.0]

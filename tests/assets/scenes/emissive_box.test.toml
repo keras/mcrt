@@ -1,0 +1,14 @@
+# tests/assets/scenes/emissive_box.test.toml
+# Regression-test parameters for emissive_box.yaml.
+#
+# Higher SPP to reduce variance in the emission-only scene; looser threshold
+# to accommodate the remaining noise at 256 spp.
+
+[render]
+width  = 128
+height = 128
+spp    = 256         # 4x default — emission-only scenes converge slowly
+
+[regression]
+threshold_mse  = 0.005   # looser: higher residual variance at 256 spp
+threshold_psnr = 35.0    # minimum Peak Signal-to-Noise Ratio (dB)
