@@ -4,7 +4,10 @@
 # Only source files (scene YAMLs, sidecar TOMLs, generator scripts) are
 # committed.  Run `make help` for a brief description of each target.
 
-.PHONY: help gen-test-assets regress-baseline clean-regression
+.PHONY: help gen-test-assets regress-baseline regress clean-regression
+
+# Default FROM commitish when not supplied by the caller.
+FROM ?= HEAD^
 
 # Default target: print help.
 help:
@@ -12,6 +15,8 @@ help:
 	@echo "  gen-test-assets   Generate all synthetic test assets (HDR skymaps, etc.)"
 	@echo "  regress-baseline  Capture regression baseline from a git commitish."
 	@echo "                    Usage: make regress-baseline FROM=HEAD^"
+	@echo "  regress           Full pipeline: build, capture baseline, render, compare."
+	@echo "                    Usage: make regress [FROM=HEAD^]"
 	@echo "  clean-regression  Remove all generated artefacts in tmp/regression/"
 
 # ---------------------------------------------------------------------------
@@ -30,6 +35,31 @@ gen-test-assets:
 		--sky-horizon-nit 0.2 --sky-zenith-nit 0.5 \
 		--output tmp/regression/skyboxes/test_sky.hdr
 	@echo "✓ Test assets generated in tmp/regression/"
+
+# ---------------------------------------------------------------------------
+# regress — full regression pipeline in one command.
+#
+# 1. Builds the release binary from the current working copy.
+# 2. Captures a baseline from <FROM> (default: HEAD^) using
+#    scripts/regress_baseline.sh.
+# 3. Resolves the short SHA so the env var points to the right directory.
+# 4. Runs `cargo test regression_suite` with the env vars set.
+#
+# Usage:
+#   make regress              # compare HEAD vs HEAD^
+#   make regress FROM=a1b2c3  # compare HEAD vs a specific commit
+#   make regress FROM=HEAD~5  # compare HEAD vs 5 commits back
+# ---------------------------------------------------------------------------
+regress:
+	@echo "→ Building release binary …"
+	cargo build --release
+	@echo "→ Capturing baseline from $(FROM) …"
+	bash scripts/regress_baseline.sh --from $(FROM)
+	$(eval SHA := $(shell git rev-parse --short $(FROM)))
+	@echo "→ Running regression suite (baseline: $(SHA)) …"
+	MCRT_REGRESSION_BASELINE=tmp/regression/baselines/$(SHA) \
+	MCRT_REGRESSION_CURRENT=tmp/regression/current \
+	cargo test --release regression_suite -- --nocapture
 
 # ---------------------------------------------------------------------------
 # regress-baseline — check out <FROM>, build it, render all regression scenes,
