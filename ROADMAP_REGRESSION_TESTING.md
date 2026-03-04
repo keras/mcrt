@@ -458,17 +458,17 @@ jobs:
 
 ### Tasks
 
-- [ ] Implement the `render` subcommand / script: enumerate scenes, skip
+- [x] Implement the `render` subcommand / script: enumerate scenes, skip
   already-fresh PNGs (mtime check), render the rest, write to
   `tmp/regression/current/`.  Support `--force` to bypass the cache.
-- [ ] Implement the `compare` subcommand / script: load PNGs from `--current`
+- [x] Implement the `compare` subcommand / script: load PNGs from `--current`
   and `--baseline`, compute metrics, skip scenes where the baseline PNG is
   absent (log `[SKIP]`), report failures.
-- [ ] Generate a Markdown summary table and print it to stdout upon completion.
-- [ ] Write `tests/regression_tests.rs`: the `cargo test`-compatible wrapper
+- [x] Generate a Markdown summary table and print it to stdout upon completion.
+- [x] Write `tests/regression_tests.rs`: the `cargo test`-compatible wrapper
   that skips gracefully when `MCRT_REGRESSION_BASELINE` or
   `MCRT_REGRESSION_CURRENT` are not set.
-- [ ] Document the full workflow in `docs/REGRESSION_TESTING.md`:
+- [x] Document the full workflow in `docs/REGRESSION_TESTING.md`:
   initial baseline capture, running comparisons, interpreting results,
   updating baselines after intentional changes.
 - [ ] (Stretch) Add a GitHub Actions workflow file at

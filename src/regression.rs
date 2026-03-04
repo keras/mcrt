@@ -25,7 +25,7 @@
 //! | PSNR   | 10 · log₁₀(1 / MSE) dB, `+∞` when MSE = 0 | `psnr ≥ threshold_psnr` |
 //! | max delta | max |pa − pb| over all pixels and channels | informational |
 
-#![allow(dead_code)] // RT-4 public API; consumed in RT-5
+#![allow(dead_code)] // Public API used from integration tests via lib crate; also compiled into bin
 
 use image::{DynamicImage, GenericImageView, ImageBuffer, Rgb};
 use std::borrow::Cow;
@@ -121,12 +121,19 @@ pub fn compare_images(a: &DynamicImage, b: &DynamicImage) -> Result<DiffResult, 
     let (wa, ha) = a.dimensions();
     let (wb, hb) = b.dimensions();
     if wa != wb || ha != hb {
-        return Err(DimensionMismatch { a: (wa, ha), b: (wb, hb) });
+        return Err(DimensionMismatch {
+            a: (wa, ha),
+            b: (wb, hb),
+        });
     }
 
     // Zero-size images are trivially identical.
     if wa == 0 || ha == 0 {
-        return Ok(DiffResult { mse: 0.0, psnr: f64::INFINITY, max_delta: 0.0 });
+        return Ok(DiffResult {
+            mse: 0.0,
+            psnr: f64::INFINITY,
+            max_delta: 0.0,
+        });
     }
 
     let a_rgba = match a.as_rgba8() {
@@ -166,7 +173,11 @@ pub fn compare_images(a: &DynamicImage, b: &DynamicImage) -> Result<DiffResult, 
         10.0 * (1.0_f64 / mse).log10()
     };
 
-    Ok(DiffResult { mse, psnr, max_delta })
+    Ok(DiffResult {
+        mse,
+        psnr,
+        max_delta,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +259,6 @@ pub fn write_diff_image(
     Ok(())
 }
 
-
 /// Map a scalar `t ∈ [0, 1]` to an RGB heat-map colour.
 ///
 /// Palette control points (linearly interpolated):
@@ -277,6 +287,63 @@ fn heat_map(t: f32) -> [u8; 3] {
         (g * 255.0 + 0.5) as u8,
         (b * 255.0 + 0.5) as u8,
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Sidecar threshold loading
+// ---------------------------------------------------------------------------
+
+/// Per-scene regression thresholds loaded from the `[regression]` section of a
+/// `.test.toml` sidecar file.
+#[derive(Debug, Clone)]
+pub struct SceneThresholds {
+    /// Maximum allowed MSE (mean squared error, normalised 0–1 range).
+    /// The test **fails** when `mse > threshold_mse`.
+    pub threshold_mse: f64,
+    /// Minimum required PSNR in dB.
+    /// The test **fails** when `psnr < threshold_psnr` (and `psnr` is finite).
+    pub threshold_psnr: f64,
+}
+
+impl Default for SceneThresholds {
+    fn default() -> Self {
+        SceneThresholds {
+            threshold_mse: 0.002,
+            threshold_psnr: 38.0,
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RegressionSection {
+    threshold_mse: Option<f64>,
+    threshold_psnr: Option<f64>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ThresholdSidecar {
+    regression: Option<RegressionSection>,
+}
+
+/// Load regression thresholds from the `.test.toml` sidecar adjacent to
+/// `scene_yaml`.
+///
+/// For `diffuse_sphere.yaml`, looks for `diffuse_sphere.test.toml` in the same
+/// directory.  Falls back to [`SceneThresholds::default`] on any I/O or parse
+/// error so missing sidecars are silently ignored.
+pub fn load_thresholds(scene_yaml: &Path) -> SceneThresholds {
+    let sidecar = scene_yaml.with_extension("").with_extension("test.toml");
+    let text = match std::fs::read_to_string(&sidecar) {
+        Ok(t) => t,
+        Err(_) => return SceneThresholds::default(),
+    };
+    let parsed: ThresholdSidecar = toml::from_str(&text).unwrap_or_default();
+    let reg = parsed.regression.unwrap_or_default();
+    let defaults = SceneThresholds::default();
+    SceneThresholds {
+        threshold_mse: reg.threshold_mse.unwrap_or(defaults.threshold_mse),
+        threshold_psnr: reg.threshold_psnr.unwrap_or(defaults.threshold_psnr),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,7 +558,10 @@ mod tests {
             cross.mse, cross.psnr, cross.max_delta
         );
         assert!(cross.mse > 0.0, "different scenes should not be identical");
-        assert!(cross.psnr.is_finite(), "PSNR should be finite for differing images");
+        assert!(
+            cross.psnr.is_finite(),
+            "PSNR should be finite for differing images"
+        );
         assert!(cross.max_delta > 0.0);
 
         // Write a diff image and confirm it exists.
