@@ -25,6 +25,7 @@ gen-test-assets:
 	@mkdir -p tmp/regression/skyboxes
 	uv run tests/assets/gen_test_skymap.py \
 		--width 512 --height 256 \
+		--sky-horizon-nit 0.2 --sky-zenith-nit 0.5 \
 		--output tmp/regression/skyboxes/test_sky.hdr
 	@echo "✓ Test assets generated in tmp/regression/"
 

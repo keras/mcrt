@@ -24,13 +24,15 @@ materials:
   white:
     type: lambertian
     albedo: [0.9, 0.9, 0.9]
+  glass:
+    type: dielectric
+    ior: 1.5
 
 objects:
-  # White Lambertian sphere — the primary subject.
   - type: sphere
     center:   [0.0, 1.0, 0.0]
     radius:   1.0
-    material: white
+    material: glass
 
   # White floor plane (y = 0, normal up).
   - type: plane
