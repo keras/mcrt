@@ -22,8 +22,7 @@ use wgpu::{
     RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions,
     SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
     StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
-    TextureViewDescriptor, TextureViewDimension, VertexState,
+    TextureFormat, TextureSampleType, TextureViewDimension, VertexState,
 };
 use winit::{
     dpi::PhysicalPosition,
@@ -35,14 +34,9 @@ use winit::{
 // Phase 15: egui immediate-mode GUI.
 use egui_wgpu::ScreenDescriptor;
 
-use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
-use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
-use crate::scene::{GpuSphere, STUB_SPHERE, load_scene_from_yaml};
-use crate::texture::{
-    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
-};
+use crate::scene::load_scene_from_yaml;
 use notify::Watcher as _;
 
 // ---------------------------------------------------------------------------
@@ -242,52 +236,6 @@ struct RenderStats {
 }
 
 // ---------------------------------------------------------------------------
-// Texture helper
-// ---------------------------------------------------------------------------
-
-/// Creates an `Rgba32Float` storage texture that can be both read
-/// (`TEXTURE_BINDING`) and written (`STORAGE_BINDING`) by compute shaders.
-///
-/// Used for accumulation ping-pong buffers, the G-buffer, and the
-/// denoiser output texture.
-fn create_storage_texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-    label: &str,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&TextureDescriptor {
-        label: Some(label),
-        size: Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba32Float,
-        // COPY_SRC enables GPU → CPU readback for the screenshot feature (Phase 15).
-        usage: TextureUsages::TEXTURE_BINDING
-            | TextureUsages::STORAGE_BINDING
-            | TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&TextureViewDescriptor::default());
-    (texture, view)
-}
-
-/// Convenience wrapper: creates an accumulation texture with the standard label.
-#[inline]
-fn create_accum_texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    create_storage_texture(device, width, height, "accum texture")
-}
-
-// ---------------------------------------------------------------------------
 // GpuState — all GPU resources + camera + input sub-structs
 // ---------------------------------------------------------------------------
 
@@ -431,8 +379,8 @@ impl GpuState {
         surface.configure(&device, &config);
 
         // ---- accumulation textures ----------------------------------------
-        let (accum_tex0, accum_view0) = create_accum_texture(&device, config.width, config.height);
-        let (accum_tex1, accum_view1) = create_accum_texture(&device, config.width, config.height);
+        let (accum_tex0, accum_view0) = gpu_layout::create_accum_texture(&device, config.width, config.height);
+        let (accum_tex1, accum_view1) = gpu_layout::create_accum_texture(&device, config.width, config.height);
         let accum_textures = [accum_tex0, accum_tex1];
         let accum_views = [accum_view0, accum_view1];
 
@@ -503,68 +451,18 @@ impl GpuState {
         // ---- Load scene + build all scene-dependent GPU buffers ---------------
         let loaded = load_scene_from_yaml(&scene_path)
             .expect("failed to load initial scene");
-        let scene = build_scene_buffers(&device, &queue, &loaded);
+        let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded);
 
         // ---- Phase 11: albedo texture array (not rebuilt on hot-reload) ----
-        let (albedo_layers, _) = load_all_textures();
-
-        // RGBA8 Unorm 2D texture array — MAX_TEXTURES layers, TEXTURE_SIZE².
-        let albedo_tex = device.create_texture(&TextureDescriptor {
-            label: Some("albedo texture array"),
-            size: Extent3d {
-                width: TEXTURE_SIZE,
-                height: TEXTURE_SIZE,
-                depth_or_array_layers: MAX_TEXTURES,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8UnormSrgb, // sRGB→linear decode on fetch
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        // Upload each layer by offsetting the z-origin (array slice index).
-        for (layer_idx, layer_data) in albedo_layers.iter().enumerate() {
-            queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &albedo_tex,
-                    mip_level: 0,
-                    origin: Origin3d {
-                        x: 0,
-                        y: 0,
-                        z: layer_idx as u32,
-                    },
-                    aspect: TextureAspect::All,
-                },
-                layer_data,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(TEXTURE_SIZE * 4),
-                    rows_per_image: Some(TEXTURE_SIZE),
-                },
-                Extent3d {
-                    width: TEXTURE_SIZE,
-                    height: TEXTURE_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-
-        let albedo_tex_view = albedo_tex.create_view(&TextureViewDescriptor {
-            dimension: Some(TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-
-        info!("Albedo texture array: {MAX_TEXTURES} layers @ {TEXTURE_SIZE}×{TEXTURE_SIZE}");
+        let (albedo_tex, albedo_tex_view) = gpu_layout::create_albedo_texture(&device, &queue);
 
         // ---- Phase 14: G-buffer + denoiser output textures ---------------
         // Both need TEXTURE_BINDING (read by denoise/display) and
         // STORAGE_BINDING (written by path_trace / denoise compute passes).
         let (_gbuffer_tex, gbuffer_view) =
-            create_storage_texture(&device, config.width, config.height, "gbuffer");
+            gpu_layout::create_storage_texture(&device, config.width, config.height, "gbuffer");
         let (_denoise_output_tex, denoise_output_view) =
-            create_storage_texture(&device, config.width, config.height, "denoise output");
+            gpu_layout::create_storage_texture(&device, config.width, config.height, "denoise output");
 
         // Linear/clamp sampler for the albedo texture array.
         let tex_sampler = device.create_sampler(&SamplerDescriptor {
@@ -594,23 +492,8 @@ impl GpuState {
         let compute_bind_group_layout = gpu_layout::make_compute_bgl(&device);
 
         // ---- compute shader + pipeline ------------------------------------
-        let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
-            label: Some("path trace shader"),
-            source: ShaderSource::Wgsl(include_str!("shaders/path_trace.wgsl").into()),
-        });
-        let compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("compute pipeline layout"),
-            bind_group_layouts: &[&compute_bind_group_layout],
-            ..Default::default()
-        });
-        let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-            label: Some("path trace pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &compute_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let compute_pipeline =
+            gpu_layout::create_compute_pipeline(&device, &compute_bind_group_layout);
 
         // ---- Phase 14: denoiser pipeline ----------------------------------
         let denoise_bind_group_layout =
@@ -746,7 +629,7 @@ impl GpuState {
         // as a regular (non-self) function before we finish constructing Self.
         let display_bind_groups =
             make_display_bind_groups(&device, &bind_group_layout, &accum_views);
-        let compute_bind_groups = make_compute_bind_groups(
+        let compute_bind_groups = gpu_layout::make_compute_bind_groups(
             &device,
             &compute_bind_group_layout,
             &accum_views,
@@ -862,16 +745,16 @@ impl GpuState {
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
 
-        let (tex0, view0) = create_accum_texture(&self.device, new_width, new_height);
-        let (tex1, view1) = create_accum_texture(&self.device, new_width, new_height);
+        let (tex0, view0) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
+        let (tex1, view1) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
         self.accum_textures = [tex0, tex1];
         self.accum_views = [view0, view1];
 
         // Recreate G-buffer and denoiser output to match the new resolution.
         let (gb_tex, gb_view) =
-            create_storage_texture(&self.device, new_width, new_height, "gbuffer");
+            gpu_layout::create_storage_texture(&self.device, new_width, new_height, "gbuffer");
         let (dn_tex, dn_view) =
-            create_storage_texture(&self.device, new_width, new_height, "denoise output");
+            gpu_layout::create_storage_texture(&self.device, new_width, new_height, "denoise output");
         self._gbuffer_tex = gb_tex;
         self.gbuffer_view = gb_view;
         self._denoise_output_tex = dn_tex;
@@ -890,7 +773,7 @@ impl GpuState {
     fn rebuild_bind_groups(&mut self) {
         self.display_bind_groups =
             make_display_bind_groups(&self.device, &self.bind_group_layout, &self.accum_views);
-        self.compute_bind_groups = make_compute_bind_groups(
+        self.compute_bind_groups = gpu_layout::make_compute_bind_groups(
             &self.device,
             &self.compute_bind_group_layout,
             &self.accum_views,
@@ -954,7 +837,7 @@ impl GpuState {
             }
         };
 
-        let scene = build_scene_buffers(&self.device, &self.queue, &loaded);
+        let scene = gpu_layout::build_scene_buffers(&self.device, &self.queue, &loaded);
         self.sphere_buffer = scene.sphere_buffer;
         self.bvh_buffer = scene.bvh_buffer;
         self.vertex_buffer = scene.vertex_buffer;
@@ -1469,170 +1352,6 @@ impl GpuState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SceneBuffers — scene-dependent GPU resources built from a LoadedScene
-// ---------------------------------------------------------------------------
-
-/// GPU resources that are rebuilt whenever the scene changes (initial load
-/// or hot-reload).  Grouping them here makes `build_scene_buffers` the single
-/// place where the creation logic lives; both `new()` and `reload_scene()`
-/// call it instead of duplicating ~160 lines.
-struct SceneBuffers {
-    sphere_buffer: wgpu::Buffer,
-    bvh_buffer: wgpu::Buffer,
-    vertex_buffer: wgpu::Buffer,
-    triangle_buffer: wgpu::Buffer,
-    mesh_bvh_buffer: wgpu::Buffer,
-    emissive_buffer: wgpu::Buffer,
-    /// Keep the texture alive so the view's underlying allocation is not freed.
-    env_map_tex: wgpu::Texture,
-    env_map_view: wgpu::TextureView,
-}
-
-/// Build all scene-dependent GPU buffers and textures from a parsed scene.
-///
-/// Called once in `GpuState::new()` and again on every hot-reload in
-/// `GpuState::reload_scene()`.  The albedo texture array is *not* rebuilt here
-/// because it depends only on files on disk, not on the scene YAML.
-fn build_scene_buffers(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    loaded: &crate::scene::LoadedScene,
-) -> SceneBuffers {
-    use bytemuck::Zeroable;
-
-    // ---- Sphere BVH --------------------------------------------------------
-    let bvh_result = build_bvh(&loaded.spheres);
-    // wgpu requires every storage-buffer binding to be at least as large as
-    // the stride declared in the shader.  Pad with a stub sphere when empty.
-    let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
-        vec![STUB_SPHERE]
-    } else {
-        bvh_result.ordered_spheres.clone()
-    };
-    let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("sphere storage"),
-        contents: bytemuck::cast_slice(&sphere_data),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-    let bvh_node_data: Vec<GpuBvhNode> = if bvh_result.nodes.is_empty() {
-        vec![GpuBvhNode::zeroed()]
-    } else {
-        bvh_result.nodes.clone()
-    };
-    let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("bvh node storage"),
-        contents: bytemuck::cast_slice(&bvh_node_data),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-    info!(
-        "BVH built: {} spheres → {} nodes",
-        bvh_result.ordered_spheres.len(),
-        bvh_result.nodes.len()
-    );
-
-    // ---- Triangle mesh BVH -------------------------------------------------
-    let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
-    info!(
-        "Mesh BVH built: {} triangles, {} vertices → {} nodes",
-        mesh_result.ordered_triangles.len(),
-        mesh_result.vertices.len(),
-        mesh_result.nodes.len()
-    );
-    let mesh_verts: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
-        vec![GpuVertex::zeroed()]
-    } else {
-        mesh_result.vertices.clone()
-    };
-    let mesh_tris: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
-        vec![GpuTriangle::zeroed()]
-    } else {
-        mesh_result.ordered_triangles.clone()
-    };
-    let mesh_bvh_nodes: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
-        vec![GpuBvhNode::zeroed()]
-    } else {
-        mesh_result.nodes.clone()
-    };
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mesh vertex storage"),
-        contents: bytemuck::cast_slice(&mesh_verts),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-    let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mesh triangle storage"),
-        contents: bytemuck::cast_slice(&mesh_tris),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-    let mesh_bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mesh bvh node storage"),
-        contents: bytemuck::cast_slice(&mesh_bvh_nodes),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-
-    // ---- Emissive sphere buffer --------------------------------------------
-    // Always non-empty: the shader unconditionally indexes this array during NEE.
-    let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-        vec![STUB_SPHERE]
-    } else {
-        loaded.emissive_spheres.clone()
-    };
-    let emissive_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("emissive sphere storage"),
-        contents: bytemuck::cast_slice(&emissive_data),
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-    });
-
-    // ---- Environment map texture -------------------------------------------
-    let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
-    let env_map_tex = device.create_texture(&TextureDescriptor {
-        label: Some("env map"),
-        size: Extent3d {
-            width: ENV_MAP_WIDTH,
-            height: ENV_MAP_HEIGHT,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &env_map_tex,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        bytemuck::cast_slice(&env_map_data),
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4), // 4 channels × 4 bytes
-            rows_per_image: Some(ENV_MAP_HEIGHT),
-        },
-        Extent3d {
-            width: ENV_MAP_WIDTH,
-            height: ENV_MAP_HEIGHT,
-            depth_or_array_layers: 1,
-        },
-    );
-    let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
-    info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
-
-    SceneBuffers {
-        sphere_buffer,
-        bvh_buffer,
-        vertex_buffer,
-        triangle_buffer,
-        mesh_bvh_buffer,
-        emissive_buffer,
-        env_map_tex,
-        env_map_view,
-    }
-}
-
 /// Returns the compute dispatch dimensions for the given surface size.
 #[inline]
 fn workgroup_dims(width: u32, height: u32) -> (u32, u32) {
@@ -1665,96 +1384,6 @@ fn make_display_bind_groups(
     [
         make(&accum_views[0], "display bg 0"),
         make(&accum_views[1], "display bg 1"),
-    ]
-}
-
-#[allow(clippy::too_many_arguments)]
-fn make_compute_bind_groups(
-    device: &wgpu::Device,
-    layout: &wgpu::BindGroupLayout,
-    accum_views: &[wgpu::TextureView; 2],
-    camera_buffer: &wgpu::Buffer,
-    sphere_buffer: &wgpu::Buffer,
-    material_buffer: &wgpu::Buffer,
-    bvh_buffer: &wgpu::Buffer,
-    vertex_buffer: &wgpu::Buffer,
-    triangle_buffer: &wgpu::Buffer,
-    mesh_bvh_buffer: &wgpu::Buffer,
-    tex_sampler: &wgpu::Sampler,
-    albedo_tex_view: &wgpu::TextureView,
-    env_map_view: &wgpu::TextureView,
-    emissive_buffer: &wgpu::Buffer,
-    gbuffer_view: &wgpu::TextureView,
-) -> [wgpu::BindGroup; 2] {
-    use crate::gpu_layout::*;
-    let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
-        device.create_bind_group(&BindGroupDescriptor {
-            label: Some(label),
-            layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: BINDING_ACCUM_WRITE,
-                    resource: BindingResource::TextureView(write_view),
-                },
-                BindGroupEntry {
-                    binding: BINDING_CAMERA,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_SPHERES,
-                    resource: sphere_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_ACCUM_READ,
-                    resource: BindingResource::TextureView(read_view),
-                },
-                BindGroupEntry {
-                    binding: BINDING_MATERIALS,
-                    resource: material_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_SPHERE_BVH,
-                    resource: bvh_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_VERTICES,
-                    resource: vertex_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_TRIANGLES,
-                    resource: triangle_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_MESH_BVH,
-                    resource: mesh_bvh_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_TEX_SAMPLER,
-                    resource: BindingResource::Sampler(tex_sampler),
-                },
-                BindGroupEntry {
-                    binding: BINDING_ALBEDO_TEX,
-                    resource: BindingResource::TextureView(albedo_tex_view),
-                },
-                BindGroupEntry {
-                    binding: BINDING_ENV_MAP,
-                    resource: BindingResource::TextureView(env_map_view),
-                },
-                BindGroupEntry {
-                    binding: BINDING_EMISSIVES,
-                    resource: emissive_buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: BINDING_GBUFFER,
-                    resource: BindingResource::TextureView(gbuffer_view),
-                },
-            ],
-        })
-    };
-    [
-        // compute_bind_groups[i]: write to accum[i], read accum[1-i]
-        make(&accum_views[0], &accum_views[1], "compute bg 0"),
-        make(&accum_views[1], &accum_views[0], "compute bg 1"),
     ]
 }
 

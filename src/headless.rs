@@ -16,19 +16,14 @@
 use std::mem::size_of;
 use std::path::Path;
 
-use bytemuck::{Zeroable, bytes_of};
+use bytemuck::bytes_of;
 use wgpu::util::DeviceExt;
 use wgpu::*;
 
-use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
-use crate::gpu_layout::{self, *};
+use crate::gpu_layout;
 use crate::material::GpuMaterialData;
-use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
-use crate::scene::{GpuSphere, load_scene_from_yaml};
-use crate::texture::{
-    ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
-};
+use crate::scene::load_scene_from_yaml;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -154,86 +149,9 @@ pub fn run(
 
     // --- scene loading -----------------------------------------------------
     let loaded = load_scene_from_yaml(&scene_path)?;
-    let bvh_result = build_bvh(&loaded.spheres);
-    let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
-
-    log::info!(
-        "BVH: {} spheres → {} nodes; mesh: {} tris → {} nodes",
-        bvh_result.ordered_spheres.len(),
-        bvh_result.nodes.len(),
-        mesh_result.ordered_triangles.len(),
-        mesh_result.nodes.len(),
-    );
-
-    // Pad empty slices to avoid zero-byte storage bindings (wgpu validation).
-    let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
-        vec![GpuSphere {
-            center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-            mat_and_pad: [0; 4],
-        }]
-    } else {
-        bvh_result.ordered_spheres
-    };
-    let bvh_node_data: Vec<GpuBvhNode> = if bvh_result.nodes.is_empty() {
-        vec![GpuBvhNode::zeroed()]
-    } else {
-        bvh_result.nodes
-    };
-    let mesh_vertices_data: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
-        vec![GpuVertex::zeroed()]
-    } else {
-        mesh_result.vertices
-    };
-    let mesh_triangles_data: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
-        vec![GpuTriangle::zeroed()]
-    } else {
-        mesh_result.ordered_triangles
-    };
-    let mesh_bvh_data: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
-        vec![GpuBvhNode::zeroed()]
-    } else {
-        mesh_result.nodes
-    };
-    let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-        vec![GpuSphere {
-            center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-            mat_and_pad: [0; 4],
-        }]
-    } else {
-        loaded.emissive_spheres
-    };
+    let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded);
 
     // --- GPU buffers -------------------------------------------------------
-    let sphere_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("spheres"),
-        contents: bytemuck::cast_slice(&sphere_data),
-        usage: BufferUsages::STORAGE,
-    });
-    let bvh_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("sphere bvh"),
-        contents: bytemuck::cast_slice(&bvh_node_data),
-        usage: BufferUsages::STORAGE,
-    });
-    let vertex_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("vertices"),
-        contents: bytemuck::cast_slice(&mesh_vertices_data),
-        usage: BufferUsages::STORAGE,
-    });
-    let triangle_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("triangles"),
-        contents: bytemuck::cast_slice(&mesh_triangles_data),
-        usage: BufferUsages::STORAGE,
-    });
-    let mesh_bvh_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("mesh bvh"),
-        contents: bytemuck::cast_slice(&mesh_bvh_data),
-        usage: BufferUsages::STORAGE,
-    });
-    let emissive_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
-        label: Some("emissives"),
-        contents: bytemuck::cast_slice(&emissive_data),
-        usage: BufferUsages::STORAGE,
-    });
     let material_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("materials"),
         size: size_of::<GpuMaterialData>() as u64,
@@ -250,130 +168,18 @@ pub fn run(
     });
 
     // --- textures ----------------------------------------------------------
-    let (albedo_layers, _) = load_all_textures();
-    let albedo_tex = device.create_texture(&TextureDescriptor {
-        label: Some("albedo"),
-        size: Extent3d {
-            width: TEXTURE_SIZE,
-            height: TEXTURE_SIZE,
-            depth_or_array_layers: MAX_TEXTURES,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba8UnormSrgb,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    for (i, layer) in albedo_layers.iter().enumerate() {
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &albedo_tex,
-                mip_level: 0,
-                origin: Origin3d {
-                    x: 0,
-                    y: 0,
-                    z: i as u32,
-                },
-                aspect: TextureAspect::All,
-            },
-            layer,
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(TEXTURE_SIZE * 4),
-                rows_per_image: Some(TEXTURE_SIZE),
-            },
-            Extent3d {
-                width: TEXTURE_SIZE,
-                height: TEXTURE_SIZE,
-                depth_or_array_layers: 1,
-            },
-        );
-    }
-    let albedo_tex_view = albedo_tex.create_view(&TextureViewDescriptor {
-        dimension: Some(TextureViewDimension::D2Array),
-        ..Default::default()
-    });
-
-    let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
-    let env_map_tex = device.create_texture(&TextureDescriptor {
-        label: Some("env map"),
-        size: Extent3d {
-            width: ENV_MAP_WIDTH,
-            height: ENV_MAP_HEIGHT,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        TexelCopyTextureInfo {
-            texture: &env_map_tex,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        bytemuck::cast_slice(&env_map_data),
-        TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4), // 4 channels × 4 bytes
-            rows_per_image: Some(ENV_MAP_HEIGHT),
-        },
-        Extent3d {
-            width: ENV_MAP_WIDTH,
-            height: ENV_MAP_HEIGHT,
-            depth_or_array_layers: 1,
-        },
-    );
-    let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
+    let (_albedo_tex, albedo_tex_view) = gpu_layout::create_albedo_texture(&device, &queue);
 
     // Ping-pong accumulation textures: COPY_SRC enables GPU→CPU readback.
-    let make_accum_tex = |label: &str| {
-        let tex = device.create_texture(&TextureDescriptor {
-            label: Some(label),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba32Float,
-            usage: TextureUsages::TEXTURE_BINDING
-                | TextureUsages::STORAGE_BINDING
-                | TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = tex.create_view(&TextureViewDescriptor::default());
-        (tex, view)
-    };
-    let (accum_tex0, accum_view0) = make_accum_tex("accum 0");
-    let (accum_tex1, accum_view1) = make_accum_tex("accum 1");
+    let (accum_tex0, accum_view0) = gpu_layout::create_accum_texture(&device, width, height);
+    let (accum_tex1, accum_view1) = gpu_layout::create_accum_texture(&device, width, height);
     let accum_textures = [accum_tex0, accum_tex1];
     let accum_views = [accum_view0, accum_view1];
 
     // G-buffer texture: path_trace.wgsl always writes to binding 13.
     // In headless mode we never read it; we just need a valid storage target.
-    let gbuffer_tex = device.create_texture(&TextureDescriptor {
-        label: Some("gbuffer"),
-        size: Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::Rgba32Float,
-        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::STORAGE_BINDING,
-        view_formats: &[],
-    });
-    let gbuffer_view = gbuffer_tex.create_view(&TextureViewDescriptor::default());
+    let (_gbuffer_tex, gbuffer_view) =
+        gpu_layout::create_storage_texture(&device, width, height, "gbuffer");
 
     let tex_sampler = device.create_sampler(&SamplerDescriptor {
         label: Some("linear sampler"),
@@ -388,98 +194,27 @@ pub fn run(
     let compute_bgl = gpu_layout::make_compute_bgl(&device);
 
     // --- compute pipeline --------------------------------------------------
-    let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("path trace shader"),
-        source: ShaderSource::Wgsl(include_str!("shaders/path_trace.wgsl").into()),
-    });
-    let compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("compute pipeline layout"),
-        bind_group_layouts: &[&compute_bgl],
-        ..Default::default()
-    });
-    let compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("path trace pipeline"),
-        layout: Some(&compute_pipeline_layout),
-        module: &compute_shader,
-        entry_point: Some("cs_main"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
+    let compute_pipeline = gpu_layout::create_compute_pipeline(&device, &compute_bgl);
 
     // --- compute bind groups (ping-pong) -----------------------------------
     // compute_bind_groups[i]: write to accum[i], read from accum[1-i].
-    // This mirrors the layout in gpu.rs so the first dispatch (frame_count=0)
-    // reads from a zero-initialised texture, ignoring prev correctly.
-    let make_compute_bg =
-        |write_view: &TextureView, read_view: &TextureView, label: &str| -> BindGroup {
-            device.create_bind_group(&BindGroupDescriptor {
-                label: Some(label),
-                layout: &compute_bgl,
-                entries: &[
-                    BindGroupEntry {
-                        binding: BINDING_ACCUM_WRITE,
-                        resource: BindingResource::TextureView(write_view),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_CAMERA,
-                        resource: camera_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_SPHERES,
-                        resource: sphere_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_ACCUM_READ,
-                        resource: BindingResource::TextureView(read_view),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_MATERIALS,
-                        resource: material_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_SPHERE_BVH,
-                        resource: bvh_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_VERTICES,
-                        resource: vertex_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_TRIANGLES,
-                        resource: triangle_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_MESH_BVH,
-                        resource: mesh_bvh_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_TEX_SAMPLER,
-                        resource: BindingResource::Sampler(&tex_sampler),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_ALBEDO_TEX,
-                        resource: BindingResource::TextureView(&albedo_tex_view),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_ENV_MAP,
-                        resource: BindingResource::TextureView(&env_map_view),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_EMISSIVES,
-                        resource: emissive_buffer.as_entire_binding(),
-                    },
-                    BindGroupEntry {
-                        binding: BINDING_GBUFFER,
-                        resource: BindingResource::TextureView(&gbuffer_view),
-                    },
-                ],
-            })
-        };
-
-    let compute_bind_groups = [
-        make_compute_bg(&accum_views[0], &accum_views[1], "compute bg 0"),
-        make_compute_bg(&accum_views[1], &accum_views[0], "compute bg 1"),
-    ];
+    let compute_bind_groups = gpu_layout::make_compute_bind_groups(
+        &device,
+        &compute_bgl,
+        &accum_views,
+        &camera_buffer,
+        &scene.sphere_buffer,
+        &material_buffer,
+        &scene.bvh_buffer,
+        &scene.vertex_buffer,
+        &scene.triangle_buffer,
+        &scene.mesh_bvh_buffer,
+        &tex_sampler,
+        &albedo_tex_view,
+        &scene.env_map_view,
+        &scene.emissive_buffer,
+        &gbuffer_view,
+    );
 
     // --- initial camera uniform --------------------------------------------
     let (look_from, look_at, vfov, aperture, focus_dist) = if let Some(ref c) = loaded.camera {
