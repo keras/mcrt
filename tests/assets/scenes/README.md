@@ -12,11 +12,14 @@ used by the render regression testing framework (Phase RT).
 | `glass_sphere.yaml` | Dielectric refraction and Fresnel at IOR 1.5 |
 | `emissive_box.yaml` | Area-light emission, soft shadows, colour bleed |
 | `cornell_box_mini.yaml` | Full Cornell Box feature set at low SPP |
+| `skymap_sphere.yaml` | Env-map sampling and importance weighting (synthetic HDR sky) |
 
-All scenes are deliberately simple: low primitive counts, no external mesh or
-texture assets, and the default procedural sky gradient as background (no
-`env_map`).  This keeps render times short and makes the framework fully
-self-contained.
+All scenes are deliberately simple: low primitive counts and no external mesh
+assets.  Five scenes use the built-in procedural sky gradient (no `env_map`)
+for full self-containment.  `skymap_sphere` uses a **generated** HDR
+environment map — run `make gen-test-assets` (or
+`uv run tests/assets/gen_test_skymap.py`) once to produce it before rendering
+that scene.
 
 ---
 
@@ -61,14 +64,23 @@ threshold_psnr = 38.0   # minimum required PSNR in decibels
 direct-light contribution from the sky, and residual high-frequency noise from
 Monte Carlo sampling would otherwise trigger false negatives.
 
+**`skymap_sphere`** uses `spp = 128` and a slightly looser threshold
+(`threshold_mse = 0.003`, `threshold_psnr = 36.0`) because environment-map
+lighting from a single HDR source converges more slowly than direct area-light
+sampling.  This scene requires the synthetic HDR file at
+`tmp/regression/skyboxes/test_sky.hdr` — generate it with
+`make gen-test-assets` before rendering.
+
 ---
 
 ## Design principles
 
 - **No GPU window** — renderers run headless; scenes must load without any
   interactive window being present.
-- **No external assets** — scenes intentionally omit `env_map` and OBJ meshes
-  so the test suite works in fresh checkouts without downloading large files.
+- **No downloaded assets** — scenes do not reference external Wavefront OBJ
+  meshes or downloaded HDR photographs.  The one scene that uses an `env_map`
+  (`skymap_sphere`) references a **generated** file under `tmp/` (git-ignored)
+  that is produced deterministically by `tests/assets/gen_test_skymap.py`.
 - **Stable baselines** — baselines are generated from a known commit using
   `tmp/regression/baselines/` (excluded from git via `tmp/` in `.gitignore`).
   Only source files in this directory are version-controlled.

@@ -1,0 +1,15 @@
+# tests/assets/scenes/skymap_sphere.test.toml
+# Regression-test parameters for skymap_sphere.yaml.
+#
+# Higher SPP than the simple scenes because env-map-only lighting converges
+# more slowly than scenes with direct emissive area lights.  Looser PSNR
+# threshold to match.
+
+[render]
+width  = 128
+height = 128
+spp    = 128         # env-map scenes converge more slowly
+
+[regression]
+threshold_mse  = 0.003   # slightly looser than direct-light scenes
+threshold_psnr = 36.0    # minimum Peak Signal-to-Noise Ratio (dB)

@@ -114,9 +114,12 @@ so no separate virtual environment or `requirements.txt` is needed:
 ```python
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy>=1.26", "imageio>=2.34"]
+# dependencies = ["numpy>=1.26"]
 # ///
 ```
+
+The HDR file is written using a self-contained RGBE encoder built on numpy;
+no additional Python packages are needed.
 
 Running the script is then a single, reproducible command — `uv` creates an
 isolated environment automatically:
@@ -202,21 +205,21 @@ threshold_psnr = 36.0
 
 ### Tasks
 
-- [ ] Write `tests/assets/gen_test_skymap.py` following the algorithm above.
-  Add PEP 723 inline script metadata declaring `numpy` and `imageio` as
-  dependencies so the script is fully self-contained.
-  Parameterise sun direction, sun peak radiance, σ, sky colours, and output
-  path via `argparse`.
-- [ ] Run the script with `uv run tests/assets/gen_test_skymap.py`; the HDR is
+- [x] Write `tests/assets/gen_test_skymap.py` following the algorithm above.
+  Add PEP 723 inline script metadata declaring `numpy` as the only
+  dependency.  The HDR file is written by a self-contained RGBE encoder
+  (no imageio required).  Parameterise sun direction, sun peak radiance,
+  σ, sky colours, and output path via `argparse`.
+- [x] Run the script with `uv run tests/assets/gen_test_skymap.py`; the HDR is
   written to `tmp/regression/skyboxes/test_sky.hdr` which is git-ignored.
   The generator script is the source of truth — the `.hdr` is a build artefact
   that is never committed.
-- [ ] Add a `Makefile` (or `scripts/gen_test_assets.sh`) target
+- [x] Add a `Makefile` (or `scripts/gen_test_assets.sh`) target
   `gen-test-assets` that runs `uv run tests/assets/gen_test_skymap.py` and
   creates `tmp/regression/skyboxes/` if it does not exist.
-- [ ] Author `tests/assets/scenes/skymap_sphere.yaml` and its sidecar
+- [x] Author `tests/assets/scenes/skymap_sphere.yaml` and its sidecar
   `skymap_sphere.test.toml`.
-- [ ] Add the new scene to `tests/assets/scenes/README.md`.
+- [x] Add the new scene to `tests/assets/scenes/README.md`.
 - [ ] Verify visually: open the scene in the interactive renderer and confirm
   the sky gradient and sun highlight are visible on the sphere.
 
@@ -500,7 +503,7 @@ environment automatically on first run.
 
 | Script | Python packages declared in script |
 |--------|-------------------------------------|
-| `tests/assets/gen_test_skymap.py` | `numpy>=1.26`, `imageio>=2.34` |
+| `tests/assets/gen_test_skymap.py` | `numpy>=1.26` (RGBE encoding done with numpy; no imageio needed) |
 
 If a helper script is added later (e.g. a comparison visualiser), it follows
 the same pattern: declare its own `# dependencies = [...]` block and run with
