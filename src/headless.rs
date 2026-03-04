@@ -5,8 +5,9 @@
 //   2. Loads the scene YAML and a `.test.toml` sidecar for default parameters.
 //   3. Accumulates exactly `spp` samples using the same path-trace compute
 //      shader that the interactive renderer uses.
-//   4. Reads back the float32 accumulation texture, applies a gamma-2.2
-//      tonemap, and writes an 8-bit sRGB PNG via the `image` crate.
+//   4. Reads back the float32 accumulation texture, applies Reinhard tonemapping
+//      followed by gamma-2.2 (matching the realtime display shader), and writes
+//      an 8-bit sRGB PNG via the `image` crate.
 //
 // The render is deterministic: setting `camera.frame_count` to `0, 1, …,
 // spp-1` on successive dispatches seeds the per-pixel PRNG identically each
@@ -84,13 +85,21 @@ fn load_sidecar(scene_path: &str) -> SidecarParams {
 // Tonemap
 // ---------------------------------------------------------------------------
 
-/// Simple gamma-2.2 transfer function: `v^(1/2.2)`, clamped to [0, 1].
+/// Reinhard tonemap + gamma-2.2, matching the realtime display shader
+/// (`display.wgsl`).
 ///
-/// HDR values above 1.0 are clipped to white, matching the roadmap spec.
+/// The display shader does:
+///   mapped = raw / (raw + 1.0)   // per-channel Reinhard: compresses [0,∞) → [0,1)
+///   gamma  = pow(mapped, 1/2.2)  // approximate sRGB transfer
+///
+/// Applying the same pipeline here ensures headless PNG output is visually
+/// identical to what the interactive renderer shows on screen.
 #[inline]
-fn gamma22_to_u8(v: f32) -> u8 {
-    let clamped = v.max(0.0).powf(1.0 / 2.2).clamp(0.0, 1.0);
-    (clamped * 255.0 + 0.5) as u8
+fn tonemap_to_u8(v: f32) -> u8 {
+    let v = v.max(0.0);
+    let mapped = v / (v + 1.0);                        // Reinhard
+    let gamma = mapped.powf(1.0 / 2.2).clamp(0.0, 1.0); // gamma-2.2
+    (gamma * 255.0 + 0.5) as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -783,9 +792,9 @@ pub fn run(
             let r = if r.is_finite() { r } else { 0.0 };
             let g = if g.is_finite() { g } else { 0.0 };
             let b = if b.is_finite() { b } else { 0.0 };
-            pixels.push(gamma22_to_u8(r));
-            pixels.push(gamma22_to_u8(g));
-            pixels.push(gamma22_to_u8(b));
+            pixels.push(tonemap_to_u8(r));
+            pixels.push(tonemap_to_u8(g));
+            pixels.push(tonemap_to_u8(b));
             pixels.push(255);
         }
     }
