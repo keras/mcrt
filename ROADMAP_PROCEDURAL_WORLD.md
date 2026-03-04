@@ -49,16 +49,16 @@ metadata:
 
 ```rust
 // src/world/block.rs
-pub const AIR:   u16 = 0;
-pub const STONE: u16 = 1;
-pub const DIRT:  u16 = 2;
-pub const GRASS: u16 = 3;
-pub const SAND:  u16 = 4;
-pub const WATER: u16 = 5;   // transparent, future phase
-pub const WOOD:  u16 = 6;
-pub const LEAVES: u16 = 7;
-pub const SNOW:  u16 = 8;
-pub const GRAVEL: u16 = 9;
+pub const AIR:       u16 = 0;
+pub const LIMESTONE: u16 = 1;  // Primary rocky material
+pub const RED_SOIL:  u16 = 2;  // "Terra Rossa" Mediterranean soil
+pub const GRASS_TYP: u16 = 3;  // Dry grass/scrubland top
+pub const SAND:      u16 = 4;
+pub const WATER:     u16 = 5;
+pub const WOOD:      u16 = 6;  // Olive/Pine wood
+pub const LEAVES:    u16 = 7;
+pub const SHRUB:     u16 = 8;  // Small shrubs/bushes
+pub const GRAVEL:    u16 = 9;
 // ... up to 256 initial block types
 
 pub struct BlockMeta {
@@ -117,107 +117,88 @@ chunks in a `HashMap<(i32,i32), Chunk>`.
 
 ---
 
-## Phase VW-2: Procedural Terrain Generator
+## Phase VW-2: Physical Terrain Generator (Mediterranean)
 
-**Goal:** Implement a deterministic noise-based heightmap + biome terrain
-generator that fills `Chunk` objects from a world seed.
+**Goal:** Implement a deterministic terrain generator inspired by Mediterranean
+landscapes. Focus on physical phenomena like erosion and light-based biological
+growth rather than simple rule-based biome switching.
 
-### Noise library
-
-Use the `noise` crate (already common in Rust game projects) for
-`Simplex`/`Perlin` noise.  Add it to `Cargo.toml`:
-
-```toml
-noise = "0.9"
-```
-
-### Terrain layers
+### Noise & Simulation Layers
 
 | Pass | Algorithm | Controls |
 |------|-----------|---------|
-| **Continent** | Low-frequency Simplex (octave 1) | Large-scale continent/ocean shape |
-| **Heightmap** | 5-octave fractional Brownian motion (fBm) | Hill & valley profile |
-| **Biome** | 2D Voronoi + temperature/humidity noise | Block palette selection |
-| **Cave** | 3D Perlin worm + threshold | Underground cavities |
-| **Surface decoration** | Point Poisson sampling + templates | Trees, boulders |
+| **Base Tectonics** | Low-frequency Simplex (octave 1) | Large-scale elevation and coastline |
+| **Erosion Pass** | Multi-scale gradient noise + simulated flow | Carves gullies, canyons, and weathered rock faces |
+| **Limestone Caves** | 3D Perlin "swiss cheese" + ridge-noise tunnels | Large, interconnected limestone caverns |
+| **Light Simulation** | Ray-casted sky visibility (shadow mapping) | Determines where grass and trees can thrive |
+| **Biological Growth** | Poisson sampling weighted by light/slope | Placement of olive trees, pines, and shrubs |
 
-#### Heightmap formula
+#### Erosion-based Heightmap
 
-```
-base_height   = 64 + continent_noise(cx,cz) * 48
-detail_height = fBm(x, z, octaves=5, lacunarity=2.0, gain=0.5) * 24
-surface_y     = clamp(base_height + detail_height, 4, 248)
-```
+Instead of simple fBm addition, the terrain should exhibit "drainage" patterns.
+A simplified hydraulic erosion approximation can be achieved by:
+1.  Sampling a base heightmap.
+2.  Computing the gradient (slope) at each point.
+3.  Accumulating "flow" to lower-lying areas.
+4.  Applying a non-linear "carving" function to the height based on flow and slope.
 
-All noise evaluations use `(x * VOXEL_SCALE, z * VOXEL_SCALE)` world
-coordinates so terrain features scale correctly.
+This produces sharp ridges and sediment-filled valleys characteristic of rocky
+coastal Mediterranean regions.
 
 #### Column filling
 
-```
-for y in 0..surface_y:
-    block = stone
-for y in surface_y-3..surface_y:
-    block = dirt (or biome-appropriate fill)
-blocks[surface_y] = grass / sand / snow (biome top)
-for y in surface_y+1..sea_level:
-    block = water
-```
-
-### Biome system
-
-Four initial biomes, selected by a `(temperature, humidity)` pair sampled from
-two low-frequency noise maps:
-
-| Biome | Top block | Fill | Tree type |
-|-------|-----------|------|-----------|
-| Plains | Grass | Dirt | Oak (trunk + leaf sphere) |
-| Desert | Sand | Sand | Cactus pillar |
-| Taiga | Snow | Dirt | Spruce (tall trunk + cone cap) |
-| Badlands | Red sand | Red stone | None |
-
-### Cave generation
-
-3D Perlin noise evaluated at each voxel: if `cave_noise(x, y, z) > 0.72` and
-`y < surface_y - 8` and `y > 2`, the voxel is carved to AIR.  A secondary
-worm-tube pass uses the gradient of the noise field to produce more tunnel-like
-passages.
-
-### World generator struct
-
 ```rust
-// src/world/generator.rs
-pub struct WorldGenerator {
-    seed: u64,
-    // per-noise-layer Simplex generators derived from seeded RNG
-}
+for y in 0..surface_y:
+    if is_cave(x, y, z):
+        block = air
+    else:
+        block = limestone (for deep/rocky areas) or red_soil (for valleys/slopes)
 
-impl WorldGenerator {
-    pub fn new(seed: u64) -> Self;
-    pub fn generate_chunk(&self, cx: i32, cz: i32) -> Box<Chunk>;
-}
+// Surface dressing based on light and slope
+if light_level(x, surface_y, z) > 0.8:
+    if slope < 0.3:
+        blocks[surface_y] = grass_typ
+    else:
+        blocks[surface_y] = limestone  // Exposed rocky face
 ```
 
-`generate_chunk` is pure (no mutable state) so multiple chunks can be generated
-in parallel with `rayon`.
+### Mediterranean Vegetation
+
+Vegetation spawning is no longer a simple "Plains" vs "Desert" choice. It is
+driven by the local environment:
+
+*   **Trees (Olive, Pine):** Spawn in areas with high light visibility and low
+    slope. The trunk height and canopy density scale with the available light
+    energy.
+*   **Shrubs:** Dry, hardy bushes that grow on steeper rocky slopes or in
+    drier, higher areas where trees cannot take root.
+*   **Grass:** Primarily fills the sediment-rich valleys (Red Soil) where light
+    is plentiful but water-flow (from the erosion pass) would naturally collect.
+
+### Cave generation (Limestone)
+
+Specifically modeled after limestone karst topography. Caves should be large,
+often reaching the surface as "sinkholes" or coastal grottoes. 3D noise is
+modulated by a vertical gradient to ensure most caves are concentrated below sea
+level but above bedrock.
 
 ### Tasks
 
 - [ ] Add `noise = "0.9"` to `Cargo.toml`.
 - [ ] Implement `src/world/generator.rs`: `WorldGenerator::new(seed)` and
   `generate_chunk(cx, cz)`.
-- [ ] Implement the 5-layer generation pipeline: continent, heightmap, biome
-  selection, cave carve, surface decoration stubs.
-- [ ] Implement the four initial biomes with correct top/fill block palettes.
-- [ ] Implement tree template spawning (oak: 4–6-voxel trunk + leaf sphere of
-  radius 3–4; spruce: 6–10-voxel trunk + stacked horizontal leaf layers).
-- [ ] Write determinism tests: `generate_chunk(0,0)` called twice returns
-  byte-identical `Chunk` contents.
-- [ ] Write coverage tests: at least 50 % of generated surface blocks are
-  non-air across a 5×5 chunk region.
+- [ ] Implement the **Erosion Pass**: replace simple fBm with a slope-cognizant
+  layer that produces canyons and ridges.
+- [ ] Implement **Light Map Calculation**: A per-column pass that computes sky
+  visibility for vegetation growth.
+- [ ] Implement **Limestone Cave Pass**: 3D noise tuned for karst landforms.
+- [ ] Implement **Mediterranean Vegetation Templates**: Olive trees (gnarled
+  trunks) and hardy shrubs.
+- [ ] Write growth-condition tests: Confirm trees do not spawn in deep caves
+  (zero light) or on 90-degree cliff faces.
 
-**Output:** `WorldGenerator::new(42).generate_chunk(0, 0)` returns a fully
-filled chunk.  `cargo test world` passes.
+**Output:** `WorldGenerator` produces a rugged, weathered Mediterranean landscape.
+`cargo test world` passes.
 
 ---
 
@@ -328,22 +309,16 @@ dielectric variants are used for ore veins and ice/water blocks respectively.
 
 | Block | Material type | Albedo (linear) | Notes |
 |-------|--------------|-----------------|-------|
-| Stone | Lambertian | [0.45, 0.45, 0.45] | |
-| Dirt | Lambertian | [0.42, 0.27, 0.14] | |
-| Grass | Lambertian | [0.22, 0.48, 0.10] | |
+| Limestone | Lambertian | [0.82, 0.78, 0.70] | Warm, light-colored rock |
+| Red Soil | Lambertian | [0.55, 0.25, 0.15] | Terra Rossa |
+| Grass | Lambertian | [0.35, 0.42, 0.18] | Desaturated, dry Mediterranean grass |
 | Sand | Lambertian | [0.76, 0.69, 0.50] | |
-| Gravel | Lambertian | [0.40, 0.38, 0.36] | |
-| Wood | Lambertian | [0.35, 0.21, 0.10] | |
-| Leaves | Lambertian | [0.10, 0.35, 0.05] | |
-| Snow | Lambertian | [0.90, 0.92, 0.95] | |
-| Coal ore | Lambertian | [0.18, 0.18, 0.18] | |
-| Iron ore | Metal | [0.62, 0.53, 0.45] fuzz=0.6 | |
-| Gold ore | Metal | [0.83, 0.68, 0.22] fuzz=0.3 | |
-| Diamond ore | Metal | [0.20, 0.80, 0.90] fuzz=0.1 | |
-| Ice | Dielectric | ior=1.31 | water ice |
-| Lava | Emissive | [1.0, 0.35, 0.02] strength=6.0 | area light source |
-| Glowstone | Emissive | [1.0, 0.90, 0.60] strength=4.0 | |
-| Red sand | Lambertian | [0.70, 0.35, 0.12] | |
+| Shrub | Lambertian | [0.25, 0.35, 0.12] | Darker, waxy leaf color |
+| Wood | Lambertian | [0.32, 0.28, 0.20] | Gnarled Olive bark |
+| Leaves | Lambertian | [0.20, 0.35, 0.15] | Olive/Pine foliage |
+| Gravel | Lambertian | [0.45, 0.42, 0.40] | Weathered limestone debris |
+| Water | Dielectric | ior=1.33 | Deep blue coastal water |
+| Cave Glow | Emissive | [0.60, 0.85, 1.0] strength=2.0 | Phosphorescent cave flora |
 
 The current `MAX_MATERIALS = 64` limit in `material.rs` / `path_trace.wgsl`
 accommodates a palette of ~64 block types.  If more are needed, bump
@@ -527,9 +502,9 @@ generation or meshing.
 
 | File | What it tests |
 |------|---------------|
-| `tests/assets/scenes/world_plains.yaml` | Basic Lambertian terrain, no caves, no decoration |
-| `tests/assets/scenes/world_caves.yaml` | Underground camera angle testing cave interiors and emissive lava |
-| `tests/assets/scenes/world_biomes.yaml` | Camera positioned to capture a biome boundary edge |
+| `tests/assets/scenes/world_coast.yaml` | Eroded limestone cliffs meeting the sea |
+| `tests/assets/scenes/world_karst.yaml` | Interior of a limestone cave with flora |
+| `tests/assets/scenes/world_olive_grove.yaml` | Valley with red soil and light-dependent vegetation |
 
 All three scenes use `view_distance: 3` (7×7 = 49 chunks) and low SPP for
 fast headless renders.  The seed and camera are fixed so output is fully
@@ -538,7 +513,7 @@ deterministic.
 ### Sidecar example
 
 ```toml
-# tests/assets/scenes/world_plains.test.toml
+# tests/assets/scenes/world_coast.test.toml
 [render]
 width  = 256
 height = 144
@@ -551,12 +526,12 @@ threshold_psnr = 34.0
 
 ### Tasks
 
-- [ ] Author `tests/assets/scenes/world_plains.yaml` with fixed seed, small
-  `view_distance`, and deterministic top-down camera.
-- [ ] Author `tests/assets/scenes/world_caves.yaml` with a camera placed below
-  the surface highlighting lava emissive lighting.
-- [ ] Author `tests/assets/scenes/world_biomes.yaml` with camera at a
-  plains-desert boundary.
+- [ ] Author `tests/assets/scenes/world_coast.yaml` with fixed seed, small
+  `view_distance`, and deterministic coastal camera.
+- [ ] Author `tests/assets/scenes/world_karst.yaml` with a camera placed inside
+   a cave highlighting phosphorescent flora lighting.
+- [ ] Author `tests/assets/scenes/world_olive_grove.yaml` with camera positioned
+  to view vegetation growth patterns on a slope.
 - [ ] Write sidecar `.test.toml` for each scene.
 - [ ] Add all three scenes to `tests/assets/scenes/README.md`.
 - [ ] Run `scripts/regress_baseline.sh --from HEAD` to capture initial baselines.
