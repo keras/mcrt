@@ -303,6 +303,37 @@ pub struct LoadedScene {
     pub material_names: Vec<String>,
 }
 
+impl LoadedScene {
+    /// Compute the combined AABB of all spheres and mesh vertices in the scene.
+    ///
+    /// Used by Phase IC-1 to automate irradiance probe grid placement.
+    pub fn get_aabb(&self) -> crate::bvh::Aabb {
+        let mut aabb = crate::bvh::Aabb::empty();
+
+        // Include spheres.
+        for s in &self.spheres {
+            let center = [s.center_r[0], s.center_r[1], s.center_r[2]];
+            let radius = s.center_r[3];
+            aabb = aabb.union(&crate::bvh::Aabb::from_sphere(center, radius));
+        }
+
+        // Include mesh vertices.
+        // We skip the first vertex if it's the 0,0,0,0 stub.
+        for v in &self.mesh_vertices {
+            if v.position[3] != 0.0 {
+                // position is [x, y, z, 1.0] for real vertices
+                aabb = aabb.union(&crate::bvh::Aabb::point([
+                    v.position[0],
+                    v.position[1],
+                    v.position[2],
+                ]));
+            }
+        }
+
+        aabb
+    }
+}
+
 // Convert a YAML MaterialDesc into a GPU-ready GpuMaterial.
 fn material_desc_to_gpu(desc: &MaterialDesc) -> crate::material::GpuMaterial {
     use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};

@@ -149,7 +149,7 @@ pub fn run(
 
     // --- scene loading -----------------------------------------------------
     let loaded = load_scene_from_yaml(&scene_path)?;
-    let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded);
+    let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded, 2.0);
 
     // --- GPU buffers -------------------------------------------------------
     let material_buffer = device.create_buffer(&BufferDescriptor {
@@ -214,6 +214,8 @@ pub fn run(
         &scene.env_map_view,
         &scene.emissive_buffer,
         &gbuffer_view,
+        &scene.probe_grid_buffer,
+        &scene.probe_irradiance_buffer,
     );
 
     // --- initial camera uniform --------------------------------------------

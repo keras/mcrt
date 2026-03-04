@@ -84,23 +84,23 @@ irradiance probes and visualise their placement on screen.
 
 ### Tasks
 
-- [ ] Define `IrradianceProbe` GPU struct:
+- [x] Define `IrradianceProbe` GPU struct:
   - `position: [f32; 4]` (world-space centre; w = cascade index)
   - `radiance_offset: u32` (index into the flat irradiance buffer)
   - `depth_offset: u32`
   - `flags: u32` (dirty / valid / invalid / needs-relocation / cascade)
   - 4-byte pad
-- [ ] Define `ProbeGrid` CPU struct:
+- [x] Define `ProbeGrid` CPU struct:
   - `origin: Vec3`, `spacing: f32`, `dimensions: [u32; 3]`
   - Probe array: `Vec<IrradianceProbe>`
   - Helper: `probe_index(x, y, z) -> u32`
-- [ ] Allocate two flat GPU storage buffers:
+- [x] Allocate two flat GPU storage buffers:
   - `irradiance_buffer`: `N × 9 × 3 × f32` (L2 SH, 9 coeffs × RGB per probe)
   - `depth_buffer`: `N × 16 × 16 × 2 × f32` (octahedral depth: R = mean distance, G = mean distance² — variance derived at lookup time as `mean² − mean²`)
-- [ ] Write WGSL struct `Probe` and accessor helpers used in later passes
-- [ ] Upload an initial grid centred on the scene AABB (computed from
+- [x] Write WGSL struct `Probe` and accessor helpers used in later passes
+- [x] Upload an initial grid centred on the scene AABB (computed from
   `GpuSphere` + `GpuVertex` bounds)
-- [ ] Mark all probes dirty on scene load / camera warp
+- [x] Mark all probes dirty on scene load / camera warp
 
 > **Bind group constraint:** The compute pass already uses 14 of 16 bindings.
 > Adding `irradiance_buffer` and `probe_grid_uniform` fills the group exactly.
@@ -109,10 +109,10 @@ irradiance probes and visualise their placement on screen.
 
 #### Debug Visualisation
 
-- [ ] Render probe positions as small spheres in the path-trace or a separate
+- [x] Render probe positions as small spheres in the path-trace or a separate
   debug compute pass — colour-encode by cascade / validity / relocation state
-- [ ] Add egui checkbox **"Show probe grid"** to toggle the overlay
-- [ ] Add egui slider **"Probe spacing"** to adjust grid density at runtime
+- [x] Add egui checkbox **"Show probe grid"** to toggle the overlay
+- [x] Add egui slider **"Probe spacing"** to adjust grid density at runtime
   (triggers full cache invalidation)
 
 **Output:** Probe grid visible as coloured dots overlaid on the rendered scene.
@@ -158,22 +158,22 @@ For each probe scheduled for update this frame:
 
 ### Tasks
 
-- [ ] Write `probe_update.wgsl` compute shader:
+- [x] Write `probe_update.wgsl` compute shader:
   - Workgroup: one probe per workgroup, `NUM_RAYS_PER_PROBE` invocations
   - Shared memory: per-thread SH accumulator; reduce at end of workgroup
   - Bindings: scene BVH, vertices, indices, materials, environment map,
     probe grid uniform, irradiance buffer (read/write), depth buffer (read/write)
-- [ ] Implement per-frame random rotation matrix (uniform random axis + angle,
+- [x] Implement per-frame random rotation matrix (uniform random axis + angle,
   seeded from `frame_count`; apply to all ray directions in the workgroup)
-- [ ] Implement `sh_project(dir: vec3f, radiance: vec3f) -> array<vec3f, 9>` in WGSL
-- [ ] Implement `sh_irradiance(coeffs: array<vec3f, 9>, normal: vec3f) -> vec3f`
+- [x] Implement `sh_project(dir: vec3f, radiance: vec3f) -> array<vec3f, 9>` in WGSL
+- [x] Implement `sh_irradiance(coeffs: array<vec3f, 9>, normal: vec3f) -> vec3f`
   — used at shading time (ZH-convolved evaluation: band 0 × π, band 1 × 2π/3,
   band 2 × π/4)
-- [ ] Wire up a new `ProbeUpdatePass` in `gpu.rs`:
+- [x] Wire up a new `ProbeUpdatePass` in `gpu.rs`:
   - Dispatch with `ceil(N_dirty_probes / WORKGROUP_SIZE)` workgroups
   - CPU-side dirty list: only update probes flagged as dirty or due for refresh
-- [ ] Time-slice: cap the per-frame update budget to `MAX_PROBES_PER_FRAME` (e.g., 64)
-- [ ] Expose `MAX_PROBES_PER_FRAME` in the egui panel
+- [x] Time-slice: cap the per-frame update budget to `MAX_PROBES_PER_FRAME` (e.g., 64)
+- [x] Expose `MAX_PROBES_PER_FRAME` in the egui panel
 
 **Output:** Probe SH coefficients converge to correct indirect lighting values
 over several frames.  Indirect lighting visible on diffuse surfaces when probes
@@ -545,8 +545,8 @@ Buffer inventory (new):
 
 | Phase  | Milestone                        | Key Deliverable                               |
 |--------|----------------------------------|-----------------------------------------------|
-| IC-1   | Probe Grid Foundation            | Visualised probe grid in scene                |
-| IC-2   | Probe Radiance Capture           | SH probe coefficients converging              |
+| IC-1   | Probe Grid Foundation            | ✅ Visualised probe grid in scene             |
+| IC-2   | Probe Radiance Capture           | ✅ SH probe coefficients converging             |
 | IC-3   | Probe Interpolation              | Cache-driven indirect diffuse lighting        |
 | IC-4   | Visibility & Relocation          | Light-leak-free interpolation, probe relocation |
 | IC-5   | Multi-Resolution Cascades        | Far-field + near-field GI, no seams           |

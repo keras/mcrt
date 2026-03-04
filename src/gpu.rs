@@ -222,6 +222,15 @@ struct UiState {
     material_names: Vec<String>,
     /// CPU mirror of the denoiser parameter uniform; written to GPU each frame.
     denoise_params: DenoiseParams,
+    // ---- Irradiance Cache (Phase IC-1 / IC-2) ---------------------------
+    pub show_probe_grid: bool,
+    pub probe_spacing: f32,
+    /// IC-2: enable the probe radiance capture compute pass.
+    pub probe_update_enabled: bool,
+    /// IC-2: max probes updated per frame (time-slicing).
+    pub probes_per_frame: u32,
+    /// IC-2: hysteresis factor (1 - alpha); typical 0.97.
+    pub probe_hysteresis: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +330,24 @@ pub struct GpuState {
 
     /// Monotonically increasing frame index; resets to 0 on camera move / resize.
     frame_count: u32,
+
+    // ---- Irradiance Cache (Phase IC-1+) ------------------------------------
+    pub probe_grid_buffer: wgpu::Buffer,
+    pub probe_irradiance_buffer: wgpu::Buffer,
+    #[allow(dead_code)]
+    pub probe_meta_buffer: wgpu::Buffer,
+    pub probe_grid: gpu_layout::ProbeGrid,
+
+    // ---- Irradiance Cache (Phase IC-2) ------------------------------------
+    probe_update_bgl: wgpu::BindGroupLayout,
+    probe_update_bind_group: wgpu::BindGroup,
+    probe_update_pipeline: wgpu::ComputePipeline,
+    /// Uniform buffer for `GpuProbeUpdateParams` (updated each frame).
+    probe_params_buffer: wgpu::Buffer,
+    /// Rolling time-slice offset: next probe index to update.
+    probe_update_offset: u32,
+
+    // Sub-structs for non-GPU state.
 
     // Sub-structs for non-GPU state.
     /// Camera orbit state and raw input bundled together.
@@ -451,7 +478,7 @@ impl GpuState {
         // ---- Load scene + build all scene-dependent GPU buffers ---------------
         let loaded = load_scene_from_yaml(&scene_path)
             .expect("failed to load initial scene");
-        let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded);
+        let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded, 2.0);
 
         // ---- Phase 11: albedo texture array (not rebuilt on hot-reload) ----
         let (albedo_tex, albedo_tex_view) = gpu_layout::create_albedo_texture(&device, &queue);
@@ -645,6 +672,8 @@ impl GpuState {
             &scene.env_map_view,
             &scene.emissive_buffer,
             &gbuffer_view,
+            &scene.probe_grid_buffer,
+            &scene.probe_irradiance_buffer,
         );
         let denoise_bind_groups = make_denoise_bind_groups(
             &device,
@@ -656,6 +685,51 @@ impl GpuState {
         );
         let display_bg_denoised =
             make_display_bg_denoised(&device, &bind_group_layout, &denoise_output_view);
+
+        // ---- Phase IC-2: probe update pipeline ----------------------------
+        let probe_update_bgl = gpu_layout::make_probe_update_bgl(&device);
+        let probe_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("probe update params"),
+            contents: bytemuck::bytes_of(&gpu_layout::GpuProbeUpdateParams {
+                frame_count: 0,
+                probes_per_frame: 64,
+                probe_offset: 0,
+                hysteresis: 0.97,
+            }),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+        let probe_update_bind_group = gpu_layout::make_probe_update_bind_group(
+            &device,
+            &probe_update_bgl,
+            &probe_params_buffer,
+            &scene.probe_grid_buffer,
+            &scene.probe_irradiance_buffer,
+            &scene.sphere_buffer,
+            &scene.bvh_buffer,
+            &scene.vertex_buffer,
+            &scene.triangle_buffer,
+            &scene.mesh_bvh_buffer,
+            &material_buffer,
+            &scene.emissive_buffer,
+            &scene.env_map_view,
+        );
+        let probe_update_shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("probe update shader"),
+            source: ShaderSource::Wgsl(include_str!("shaders/probe_update.wgsl").into()),
+        });
+        let probe_update_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("probe update pipeline layout"),
+            bind_group_layouts: &[&probe_update_bgl],
+            ..Default::default()
+        });
+        let probe_update_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("probe update pipeline"),
+            layout: Some(&probe_update_layout),
+            module: &probe_update_shader,
+            entry_point: Some("cs_probe_update"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // ---- Phase 15: egui initialisation --------------------------------
         let egui_ctx = egui::Context::default();
@@ -710,6 +784,15 @@ impl GpuState {
             env_map_view: scene.env_map_view,
             tex_sampler,
             frame_count: 0,
+            probe_grid_buffer: scene.probe_grid_buffer,
+            probe_irradiance_buffer: scene.probe_irradiance_buffer,
+            probe_meta_buffer: scene.probe_meta_buffer,
+            probe_grid: scene.probe_grid,
+            probe_update_bgl,
+            probe_update_bind_group,
+            probe_update_pipeline,
+            probe_params_buffer,
+            probe_update_offset: 0,
             cam_ctrl: CameraController {
                 camera,
                 input: InputState::default(),
@@ -728,6 +811,11 @@ impl GpuState {
                 material_data_cpu,
                 material_names,
                 denoise_params: DenoiseParams::default(),
+                show_probe_grid: false,
+                probe_spacing: 2.0,
+                probe_update_enabled: true,
+                probes_per_frame: 64,
+                probe_hysteresis: 0.97,
             },
         }
     }
@@ -789,6 +877,8 @@ impl GpuState {
             &self.env_map_view,
             &self.emissive_buffer,
             &self.gbuffer_view,
+            &self.probe_grid_buffer,
+            &self.probe_irradiance_buffer,
         );
         self.denoise_bind_groups = make_denoise_bind_groups(
             &self.device,
@@ -798,10 +888,23 @@ impl GpuState {
             &self.denoise_output_view,
             &self.denoise_params_buffer,
         );
-        self.display_bg_denoised = make_display_bg_denoised(
+        self.display_bg_denoised =
+            make_display_bg_denoised(&self.device, &self.bind_group_layout, &self.denoise_output_view);
+        // IC-2: rebuild probe update bind group to reference the latest scene buffers.
+        self.probe_update_bind_group = gpu_layout::make_probe_update_bind_group(
             &self.device,
-            &self.bind_group_layout,
-            &self.denoise_output_view,
+            &self.probe_update_bgl,
+            &self.probe_params_buffer,
+            &self.probe_grid_buffer,
+            &self.probe_irradiance_buffer,
+            &self.sphere_buffer,
+            &self.bvh_buffer,
+            &self.vertex_buffer,
+            &self.triangle_buffer,
+            &self.mesh_bvh_buffer,
+            &self.material_buffer,
+            &self.emissive_buffer,
+            &self.env_map_view,
         );
     }
 
@@ -823,6 +926,17 @@ impl GpuState {
         changed
     }
 
+    /// Rebuild the probe grid after a spacing change.
+    fn rebuild_probe_grid(&mut self) {
+        let spacing = self.ui.probe_spacing;
+        info!("Rebuilding probe grid (spacing={spacing:.2})");
+
+        // For IC-1, we trigger a full scene reload to rebuild the grid
+        // based on the new spacing. This is the simplest way to ensure
+        // all buffers are re-allocated if needed.
+        self.reload_scene();
+    }
+
     /// Reload the scene file from disk: re-parse YAML, rebuild BVH and mesh,
     /// recreate scene GPU buffers, rebuild compute bind groups, reset
     /// accumulation.  The camera position is intentionally preserved so the
@@ -837,7 +951,7 @@ impl GpuState {
             }
         };
 
-        let scene = gpu_layout::build_scene_buffers(&self.device, &self.queue, &loaded);
+        let scene = gpu_layout::build_scene_buffers(&self.device, &self.queue, &loaded, self.ui.probe_spacing);
         self.sphere_buffer = scene.sphere_buffer;
         self.bvh_buffer = scene.bvh_buffer;
         self.vertex_buffer = scene.vertex_buffer;
@@ -846,6 +960,11 @@ impl GpuState {
         self.emissive_buffer = scene.emissive_buffer;
         self._env_map_tex = scene.env_map_tex;
         self.env_map_view = scene.env_map_view;
+
+        self.probe_grid_buffer = scene.probe_grid_buffer;
+        self.probe_irradiance_buffer = scene.probe_irradiance_buffer;
+        self.probe_meta_buffer = scene.probe_meta_buffer;
+        self.probe_grid = scene.probe_grid;
 
         // Material buffer has a fixed GPU layout — just overwrite in place.
         self.queue
@@ -946,6 +1065,34 @@ impl GpuState {
                 label: Some("frame encoder"),
             });
 
+        // ---- IC-2: probe update compute pass (runs before path trace) ------
+        if self.ui.probe_update_enabled {
+            let total_probes = self.probe_grid.total_probes() as u32;
+            if total_probes > 0 {
+                // Time-slice: update `probes_per_frame` probes per frame.
+                let ppf = self.ui.probes_per_frame.min(total_probes);
+                let offset = self.probe_update_offset % total_probes;
+                self.probe_update_offset = (offset + ppf) % total_probes;
+
+                let params = gpu_layout::GpuProbeUpdateParams {
+                    frame_count: self.frame_count,
+                    probes_per_frame: ppf,
+                    probe_offset: offset,
+                    hysteresis: self.ui.probe_hysteresis,
+                };
+                self.queue.write_buffer(&self.probe_params_buffer, 0, bytemuck::bytes_of(&params));
+
+                let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("probe update pass"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(&self.probe_update_pipeline);
+                cpass.set_bind_group(0, &self.probe_update_bind_group, &[]);
+                // One workgroup per probe updated this frame (workgroup_size = 64 threads).
+                cpass.dispatch_workgroups(ppf, 1, 1);
+            }
+        }
+
         // ---- compute pass: path tracer ------------------------------------
         {
             let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
@@ -1030,6 +1177,7 @@ impl GpuState {
             let mut cam_changed = false;
             let mut mat_changed = false;
             let mut save_request = false;
+            let mut grid_changed = false;
 
             let stats = RenderStats {
                 frame_count: self.frame_count,
@@ -1037,11 +1185,12 @@ impl GpuState {
                 height: self.config.height,
             };
             let full_output = egui_ctx.run(raw_input, |ctx| {
-                let (cc, mc, sr) =
+                let (cc, mc, sr, gc) =
                     self.ui.build_panels(ctx, &mut self.cam_ctrl.camera, &stats);
                 cam_changed = cc;
                 mat_changed = mc;
                 save_request = sr;
+                grid_changed = gc;
             });
 
             self.ui.egui_state
@@ -1057,13 +1206,36 @@ impl GpuState {
                     bytes_of(&self.ui.material_data_cpu),
                 );
                 self.frame_count = 0;
-                // The camera uniform was already written this frame with a non-zero
-                // frame_count.  Re-upload it with frame_count = 0 so the compute pass
-                // treats this as the first accumulation sample and discards stale pixels
-                // from the previous material, preventing a one-frame blend artifact.
                 cam.frame_count = 0;
                 self.queue
                     .write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
+            }
+            if grid_changed {
+                if (self.ui.probe_spacing - self.probe_grid.spacing).abs() > 1e-4 {
+                    self.rebuild_probe_grid();
+                }
+
+                // Update the uniform to reflect new visibility or spacing.
+                let uniform = gpu_layout::GpuProbeGridUniform {
+                    origin: [
+                        self.probe_grid.origin[0],
+                        self.probe_grid.origin[1],
+                        self.probe_grid.origin[2],
+                        self.probe_grid.spacing,
+                    ],
+                    dims: [
+                        self.probe_grid.dimensions[0],
+                        self.probe_grid.dimensions[1],
+                        self.probe_grid.dimensions[2],
+                        self.probe_grid.total_probes() as u32,
+                    ],
+                    show_grid: if self.ui.show_probe_grid { 1 } else { 0 },
+                    ..Default::default()
+                };
+                self.queue
+                    .write_buffer(&self.probe_grid_buffer, 0, bytes_of(&uniform));
+
+                self.frame_count = 0;
             }
             if save_request {
                 self.save_screenshot();
@@ -1468,7 +1640,7 @@ impl UiState {
         ctx: &egui::Context,
         camera: &mut CameraState,
         stats: &RenderStats,
-    ) -> (bool, bool, bool) {
+    ) -> (bool, bool, bool, bool) {
         let denoise_enabled = &mut self.denoise_enabled;
         let dp = &mut self.denoise_params;
         let material_data = &mut self.material_data_cpu;
@@ -1482,6 +1654,7 @@ impl UiState {
         let mut cam_changed = false;
         let mut mat_changed = false;
         let mut save_request = false;
+        let mut grid_changed = false;
 
         egui::SidePanel::right("mcrt_panel")
         .resizable(true)
@@ -1652,12 +1825,33 @@ impl UiState {
                             }
                         });
                 }
+                ui.add_space(8.0);
+                // ── Irradiance Cache ──────────────────────────────────────
+                ui.heading("Irradiance Cache");
+                ui.separator();
+                if ui.checkbox(&mut self.show_probe_grid, "Show probe grid").changed() {
+                    grid_changed = true;
+                }
+                let spacing_resp = ui.add(egui::Slider::new(&mut self.probe_spacing, 0.5..=5.0).text("Probe spacing"));
+                if spacing_resp.drag_stopped() || (spacing_resp.changed() && !spacing_resp.dragged()) {
+                    grid_changed = true;
+                }
+                ui.add_space(4.0);
+                ui.separator();
+                ui.label("Probe Update (IC-2)");
+                ui.checkbox(&mut self.probe_update_enabled, "Enable probe radiance capture");
+                let mut ppf_i32 = self.probes_per_frame as i32;
+                if ui.add(egui::Slider::new(&mut ppf_i32, 1..=256).text("Probes / frame")).changed() {
+                    self.probes_per_frame = ppf_i32.max(1) as u32;
+                }
+                ui.add(egui::Slider::new(&mut self.probe_hysteresis, 0.5..=0.999).text("Hysteresis"));
+
                 ui.add_space(4.0);
                 ui.small("Press H to hide/show this panel");
             });
         });
 
-        (cam_changed, mat_changed, save_request)
+        (cam_changed, mat_changed, save_request, grid_changed)
     }
 }
 

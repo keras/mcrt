@@ -15,10 +15,81 @@ use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::CameraUniform;
 use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
-use crate::scene::{GpuSphere, LoadedScene, STUB_SPHERE};
+use crate::scene::{GpuSphere, STUB_SPHERE};
 use crate::texture::{
     ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
 };
+
+// ---------------------------------------------------------------------------
+// Irradiance Cache Types (Phase IC-1+)
+// ---------------------------------------------------------------------------
+
+/// GPU-side descriptor for a single irradiance probe.
+/// Matches the `Probe` struct in `probe_common.wgsl`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuIrradianceProbe {
+    /// xyz = world-space centre; w = cascade index.
+    pub position_cascade: [f32; 4],
+    /// Index into the flat radiance (SH) buffer.
+    pub radiance_offset: u32,
+    /// Index into the flat depth (octahedral) buffer.
+    pub depth_offset: u32,
+    /// Bitmask: dirty / valid / invalid / needs-relocation.
+    pub flags: u32,
+    /// Explicit padding for 16-byte alignment.
+    pub _pad: u32,
+}
+
+/// CPU-side management for a uniform 3D grid of probes.
+#[derive(Clone, Debug)]
+pub struct ProbeGrid {
+    pub origin: [f32; 3],
+    pub spacing: f32,
+    pub dimensions: [u32; 3],
+    #[allow(dead_code)]
+    pub probes: Vec<GpuIrradianceProbe>,
+}
+
+impl ProbeGrid {
+    /// Calculate the flat index for a probe at (x, y, z).
+    #[allow(dead_code)]
+    pub fn probe_index(&self, x: u32, y: u32, z: u32) -> u32 {
+        z * self.dimensions[0] * self.dimensions[1] + y * self.dimensions[0] + x
+    }
+
+    /// Total number of probes in the grid.
+    pub fn total_probes(&self) -> usize {
+        (self.dimensions[0] * self.dimensions[1] * self.dimensions[2]) as usize
+    }
+}
+
+/// Uniform data for the probe grid, uploaded to `BINDING_PROBE_GRID`.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuProbeGridUniform {
+    pub origin: [f32; 4], // .xyz = origin, .w = spacing
+    pub dims: [u32; 4],   // .xyz = dimensions, .w = total probes
+    // Visualisation flags (Phase IC-1 debug)
+    pub show_grid: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
+}
+
+/// Per-dispatch parameters for the probe update compute pass (Phase IC-2).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuProbeUpdateParams {
+    /// Global frame counter (used to seed the per-frame random rotation).
+    pub frame_count: u32,
+    /// Maximum probes to update in this dispatch.
+    pub probes_per_frame: u32,
+    /// Index of the first probe in this time-slice window.
+    pub probe_offset: u32,
+    /// Hysteresis factor: `1.0 - alpha`; typical ≈ 0.97.
+    pub hysteresis: f32,
+}
 
 // ---------------------------------------------------------------------------
 // Named binding-slot constants — use these everywhere instead of bare integers
@@ -229,6 +300,210 @@ pub fn make_compute_bgl(device: &Device) -> BindGroupLayout {
                 },
                 count: None,
             },
+            // 14: irradiance probe grid metadata uniform (IC-2+)
+            BindGroupLayoutEntry {
+                binding: BINDING_PROBE_GRID,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuProbeGridUniform>() as u64),
+                },
+                count: None,
+            },
+            // 15: irradiance probe SH coefficients storage buffer (IC-2+)
+            BindGroupLayoutEntry {
+                binding: BINDING_PROBE_IRRADIANCE,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<[f32; 27]>() as u64),
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Create the bind group layout for the probe-update compute pass (Phase IC-2).
+///
+/// Binding map:
+///   0  ProbeUpdateParams  uniform
+///   1  ProbeGrid          uniform
+///   2  irradiance_buf     storage read_write
+///   3  spheres            storage read
+///   4  sphere_bvh         storage read
+///   5  vertices           storage read
+///   6  triangles          storage read
+///   7  mesh_bvh           storage read
+///   8  materials          uniform
+///   9  emissive_spheres   storage read
+///  10  env_map            texture_2d (non-filterable)
+pub fn make_probe_update_bgl(device: &Device) -> BindGroupLayout {
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("probe update bgl"),
+        entries: &[
+            // 0: ProbeUpdateParams uniform
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuProbeUpdateParams>() as u64),
+                },
+                count: None,
+            },
+            // 1: ProbeGrid uniform
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuProbeGridUniform>() as u64),
+                },
+                count: None,
+            },
+            // 2: irradiance_buf read_write storage
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<[f32; 27]>() as u64),
+                },
+                count: None,
+            },
+            // 3: spheres storage read
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuSphere>() as u64),
+                },
+                count: None,
+            },
+            // 4: sphere_bvh storage read
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuBvhNode>() as u64),
+                },
+                count: None,
+            },
+            // 5: vertices storage read
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuVertex>() as u64),
+                },
+                count: None,
+            },
+            // 6: triangles storage read
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuTriangle>() as u64),
+                },
+                count: None,
+            },
+            // 7: mesh_bvh storage read
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuBvhNode>() as u64),
+                },
+                count: None,
+            },
+            // 8: materials uniform
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuMaterialData>() as u64),
+                },
+                count: None,
+            },
+            // 9: emissive_spheres storage read
+            BindGroupLayoutEntry {
+                binding: 9,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(size_of::<GpuSphere>() as u64),
+                },
+                count: None,
+            },
+            // 10: env_map texture (non-filterable)
+            BindGroupLayoutEntry {
+                binding: 10,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+        ],
+    })
+}
+
+/// Create the bind group for the probe-update pass.
+#[allow(clippy::too_many_arguments)]
+pub fn make_probe_update_bind_group(
+    device: &Device,
+    layout: &BindGroupLayout,
+    probe_params_buffer: &wgpu::Buffer,
+    probe_grid_buffer: &wgpu::Buffer,
+    probe_irradiance_buffer: &wgpu::Buffer,
+    sphere_buffer: &wgpu::Buffer,
+    bvh_buffer: &wgpu::Buffer,
+    vertex_buffer: &wgpu::Buffer,
+    triangle_buffer: &wgpu::Buffer,
+    mesh_bvh_buffer: &wgpu::Buffer,
+    material_buffer: &wgpu::Buffer,
+    emissive_buffer: &wgpu::Buffer,
+    env_map_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("probe update bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0,  resource: probe_params_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1,  resource: probe_grid_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 2,  resource: probe_irradiance_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 3,  resource: sphere_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 4,  resource: bvh_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5,  resource: vertex_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6,  resource: triangle_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7,  resource: mesh_bvh_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8,  resource: material_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 9,  resource: emissive_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: wgpu::BindingResource::TextureView(env_map_view),
+            },
         ],
     })
 }
@@ -249,6 +524,12 @@ pub struct SceneBuffers {
     /// Keep the texture alive so the view's underlying allocation is not freed.
     pub env_map_tex: wgpu::Texture,
     pub env_map_view: wgpu::TextureView,
+
+    // ---- Irradiance Cache (Phase IC-1+) ------------------------------------
+    pub probe_grid_buffer: wgpu::Buffer,
+    pub probe_irradiance_buffer: wgpu::Buffer,
+    pub probe_meta_buffer: wgpu::Buffer,
+    pub probe_grid: ProbeGrid,
 }
 
 /// Build all scene-dependent GPU buffers and textures from a parsed scene.
@@ -256,7 +537,12 @@ pub struct SceneBuffers {
 /// Called once in `GpuState::new()` and again on every hot-reload in
 /// `GpuState::reload_scene()`.  The albedo texture array is *not* rebuilt here
 /// because it depends only on files on disk, not on the scene YAML.
-pub fn build_scene_buffers(device: &Device, queue: &Queue, loaded: &LoadedScene) -> SceneBuffers {
+pub fn build_scene_buffers(
+    device: &Device,
+    queue: &Queue,
+    loaded: &crate::scene::LoadedScene,
+    probe_spacing: f32,
+) -> SceneBuffers {
     // ---- Sphere BVH --------------------------------------------------------
     let bvh_result = build_bvh(&loaded.spheres);
     // wgpu requires every storage-buffer binding to be at least as large as
@@ -377,6 +663,94 @@ pub fn build_scene_buffers(device: &Device, queue: &Queue, loaded: &LoadedScene)
     let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
     info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
 
+    // ---- Irradiance Cache (Phase IC-1) -------------------------------------
+    let mut aabb = loaded.get_aabb();
+
+    // Prevent massive ground spheres from creating millions of probes.
+    // Hard clamp the generation bounds for the demo scenes.
+    aabb.min[0] = aabb.min[0].max(-20.0);
+    aabb.min[1] = aabb.min[1].max(-1.0);
+    aabb.min[2] = aabb.min[2].max(-20.0);
+    aabb.max[0] = aabb.max[0].min(20.0);
+    aabb.max[1] = aabb.max[1].min(20.0);
+    aabb.max[2] = aabb.max[2].min(20.0);
+
+    let center = aabb.centroid();
+    // Round extent up to ensure the grid covers the whole scene.
+    let extent = [
+        aabb.max[0] - aabb.min[0],
+        aabb.max[1] - aabb.min[1],
+        aabb.max[2] - aabb.min[2],
+    ];
+
+    let spacing = probe_spacing.max(0.1); // prevent division by zero or infinite probes
+    let dims = [
+        ((extent[0] / spacing).ceil() as u32).max(2) + 1,
+        ((extent[1] / spacing).ceil() as u32).max(2) + 1,
+        ((extent[2] / spacing).ceil() as u32).max(2) + 1,
+    ];
+
+    let grid_origin = [
+        center[0] - (dims[0] as f32 - 1.0) * spacing * 0.5,
+        center[1] - (dims[1] as f32 - 1.0) * spacing * 0.5,
+        center[2] - (dims[2] as f32 - 1.0) * spacing * 0.5,
+    ];
+
+    let mut probes = Vec::with_capacity((dims[0] * dims[1] * dims[2]) as usize);
+    for z in 0..dims[2] {
+        for y in 0..dims[1] {
+            for x in 0..dims[0] {
+                let px = grid_origin[0] + x as f32 * spacing;
+                let py = grid_origin[1] + y as f32 * spacing;
+                let pz = grid_origin[2] + z as f32 * spacing;
+
+                probes.push(GpuIrradianceProbe {
+                    position_cascade: [px, py, pz, 0.0], // cascade 0 for now
+                    radiance_offset: (probes.len() * 9 * 3) as u32,
+                    depth_offset: (probes.len() * 16 * 16 * 2) as u32,
+                    flags: 1, // DIRTY
+                    _pad: 0,
+                });
+            }
+        }
+    }
+
+    let probe_grid = ProbeGrid {
+        origin: grid_origin,
+        spacing,
+        dimensions: dims,
+        probes: probes.clone(),
+    };
+
+    let probe_grid_uniform = GpuProbeGridUniform {
+        origin: [grid_origin[0], grid_origin[1], grid_origin[2], spacing],
+        dims: [dims[0], dims[1], dims[2], probes.len() as u32],
+        show_grid: 0, // off by default
+        ..Default::default()
+    };
+
+    let probe_grid_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+        label: Some("probe grid uniform"),
+        contents: bytemuck::bytes_of(&probe_grid_uniform),
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+    });
+
+    let probe_meta_buffer = device.create_buffer_init(&util::BufferInitDescriptor {
+        label: Some("probe meta storage"),
+        contents: bytemuck::cast_slice(&probes),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
+    // Allocate flat radiance (SH) and depth buffers.
+    // L2 SH: 9 coefficients * 3 channels (RGB) * 4 bytes (f32)
+    let radiance_size = (probes.len() * 9 * 3 * 4) as u64;
+    let probe_irradiance_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("probe irradiance storage"),
+        size: radiance_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     SceneBuffers {
         sphere_buffer,
         bvh_buffer,
@@ -386,6 +760,10 @@ pub fn build_scene_buffers(device: &Device, queue: &Queue, loaded: &LoadedScene)
         emissive_buffer,
         env_map_tex,
         env_map_view,
+        probe_grid_buffer,
+        probe_irradiance_buffer,
+        probe_meta_buffer,
+        probe_grid,
     }
 }
 
@@ -522,6 +900,8 @@ pub fn make_compute_bind_groups(
     env_map_view: &wgpu::TextureView,
     emissive_buffer: &wgpu::Buffer,
     gbuffer_view: &wgpu::TextureView,
+    probe_grid_buffer: &wgpu::Buffer,
+    probe_irradiance_buffer: &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
@@ -583,6 +963,14 @@ pub fn make_compute_bind_groups(
                 BindGroupEntry {
                     binding: BINDING_GBUFFER,
                     resource: BindingResource::TextureView(gbuffer_view),
+                },
+                BindGroupEntry {
+                    binding: BINDING_PROBE_GRID,
+                    resource: probe_grid_buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: BINDING_PROBE_IRRADIANCE,
+                    resource: probe_irradiance_buffer.as_entire_binding(),
                 },
             ],
         })

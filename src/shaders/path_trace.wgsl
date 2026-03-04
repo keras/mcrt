@@ -121,6 +121,18 @@ struct BvhNode {
     _pad1:           u32,
 }
 
+struct ProbeGrid {
+    // .xyz = origin, .w = spacing
+    origin_spacing: vec4<f32>,
+    // .xyz = dimensions, .w = total probes
+    dims_count: vec4<u32>,
+    // Debug visualization flags
+    show_grid: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
 struct Vertex {
     position: vec4<f32>,  // .xyz = world-space position
     normal:   vec4<f32>,  // .xyz = vertex normal
@@ -186,6 +198,7 @@ struct ScatterResult {
 @group(0) @binding(12) var<storage, read> emissive_spheres: array<Sphere>;
 /// G-buffer: primary hit normal (.xyz) + linear depth (.w).
 @group(0) @binding(13) var         gbuffer_write:    texture_storage_2d<rgba32float, write>;
+@group(0) @binding(14) var<uniform> grid:             ProbeGrid;
 
 // ---------------------------------------------------------------------------
 // PCG32 PRNG
@@ -581,7 +594,8 @@ fn scatter(mat: Material, ray_in: Ray, hit: HitRecord,
 /// Emissive surfaces (type 3) terminate the path and return their stored
 /// emission (`albedo_fuzz.xyz * ior_pad.x` = colour × strength multiplier).
 fn path_color(initial_ray: Ray, coord: vec2<u32>,
-              rng: ptr<function, u32>) -> vec3<f32> {
+              rng: ptr<function, u32>,
+              primary_hit_t: ptr<function, f32>) -> vec3<f32> {
     var ray        = initial_ray;
     var throughput = vec3<f32>(1.0);
     var first_hit  = true;
@@ -591,12 +605,14 @@ fn path_color(initial_ray: Ray, coord: vec2<u32>,
 
         if hit.t < 0.0 {
             if first_hit {
+                *primary_hit_t = T_MAX;
                 textureStore(gbuffer_write, coord, vec4<f32>(0.0, 0.0, 0.0, T_MAX));
             }
             return throughput * sample_env_map(ray.dir);
         }
 
         if first_hit {
+            *primary_hit_t = hit.t;
             textureStore(gbuffer_write, coord, vec4<f32>(hit.normal, hit.t));
             first_hit = false;
         }
@@ -651,7 +667,41 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let ray_origin  = camera.origin.xyz + lens_offset;
     let ray = Ray(ray_origin, normalize(focal_point - ray_origin));
 
-    let sample = path_color(ray, coord, &rng);
+    var primary_hit_t = T_MAX;
+    var sample = path_color(ray, coord, &rng, &primary_hit_t);
+
+    // ---- Phase IC-1: Debug visualization for probe grid ------------------
+    if (grid.show_grid != 0u) {
+        let probe_radius = 0.05;
+        let origin = grid.origin_spacing.xyz;
+        let spacing = grid.origin_spacing.w;
+        let dms = vec3<f32>(grid.dims_count.xyz);
+
+        // Fast raymarching of the grid's distance field
+        var t = 0.0;
+        for (var step = 0; step < 64; step = step + 1) {
+            let p = ray.origin + t * ray.dir;
+
+            // local pos in grid space
+            let local_p = (p - origin) / spacing;
+
+            // nearest grid node
+            let node_local = clamp(round(local_p), vec3<f32>(0.0), dms - vec3<f32>(1.0));
+            let node_world = origin + node_local * spacing;
+
+            let d = distance(p, node_world) - probe_radius;
+            if d < 0.001 {
+                if t > T_MIN && t < primary_hit_t {
+                    sample = vec3<f32>(1.0, 0.5, 0.0); // Orange probes
+                }
+                break;
+            }
+            t += d;
+            if t > primary_hit_t || t > 100.0 {
+                break; // occluded or escaped grid
+            }
+        }
+    }
 
     // Progressive accumulation (running average).
     let weight = 1.0 / f32(min(frame_count, MAX_FRAME_COUNT) + 1u);

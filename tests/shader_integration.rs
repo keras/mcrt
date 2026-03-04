@@ -56,6 +56,14 @@ fn naga_parses_display_shader() {
     );
 }
 
+#[test]
+fn naga_parses_probe_update_shader() {
+    validate_wgsl(
+        "probe_update.wgsl",
+        include_str!("../src/shaders/probe_update.wgsl"),
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tier 2 — headless wgpu pipeline creation
 // ---------------------------------------------------------------------------
@@ -246,6 +254,28 @@ fn make_path_trace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     access: StorageTextureAccess::WriteOnly,
                     format: TextureFormat::Rgba32Float,
                     view_dimension: TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            // 14: Probe grid uniform (IC-1)
+            BindGroupLayoutEntry {
+                binding: 14,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            // 15: Probe irradiance storage (IC-1)
+            BindGroupLayoutEntry {
+                binding: 15,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
                 count: None,
             },
