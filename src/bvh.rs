@@ -205,7 +205,7 @@ impl Aabb {
 
     /// Convert to the GPU-friendly `[f32; 4]` pair used in `GpuBvhNode`.
     #[inline]
-    pub(crate) fn to_gpu_pair(&self) -> ([f32; 4], [f32; 4]) {
+    pub(crate) fn to_gpu_pair(self) -> ([f32; 4], [f32; 4]) {
         (
             [self.min[0], self.min[1], self.min[2], 0.0],
             [self.max[0], self.max[1], self.max[2], 0.0],
@@ -310,7 +310,7 @@ fn build_recursive(
         })
     });
 
-    match find_best_split(&prims, &centroid_bounds, &bounds) {
+    match find_best_split(prims, &centroid_bounds, &bounds) {
         Some((axis, split_idx)) => {
             // Sort prims by centroid along the chosen axis, then split.
             prims.sort_unstable_by(|a, b| {
@@ -546,7 +546,7 @@ mod tests {
             .collect();
         let result = build_bvh(&spheres);
         // Upper bound: 2N-1 internal nodes.
-        assert!(result.nodes.len() <= 2 * spheres.len() - 1);
+        assert!(result.nodes.len() < 2 * spheres.len());
         assert_eq!(result.ordered_spheres.len(), spheres.len());
     }
 

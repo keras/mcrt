@@ -28,6 +28,16 @@ pub struct GpuSphere {
     pub mat_and_pad: [u32; 4],
 }
 
+/// Sentinel sphere placed far outside the scene so BVH traversal never hits it.
+///
+/// Used to pad empty sphere / emissive buffers to satisfy wgpu's
+/// `min_binding_size` requirement (every bound buffer must be at least as large
+/// as the stride declared in the shader).
+pub const STUB_SPHERE: GpuSphere = GpuSphere {
+    center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
+    mat_and_pad: [0; 4],
+};
+
 // ---------------------------------------------------------------------------
 // Scene builders
 // ---------------------------------------------------------------------------
@@ -366,7 +376,7 @@ fn rot3(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
 /// All fields are optional; omitted fields fall back to the identity value:
 /// - `translate` → `[0, 0, 0]`
 /// - `rotate`    → `[0, 0, 0]`  (Euler XYZ degrees, same convention as the
-///                               rest of the scene format)
+///   rest of the scene format)
 /// - `scale`     → `1.0`
 ///
 /// Transforms are applied in **scale → rotate → translate** order, matching

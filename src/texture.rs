@@ -50,7 +50,7 @@ pub fn build_checker_texture(size: u32, color_a: [u8; 4], color_b: [u8; 4]) -> V
     let mut data = Vec::with_capacity(n);
     for y in 0..size {
         for x in 0..size {
-            let c = if (x / tile + y / tile) % 2 == 0 {
+            let c = if (x / tile + y / tile).is_multiple_of(2) {
                 color_a
             } else {
                 color_b
@@ -138,9 +138,9 @@ pub fn try_load_hdr(path: &str) -> Option<Vec<f32>> {
     for chunk in raw.chunks(3) {
         // Replace NaN / Inf (can arise from Lanczos resampling of extreme HDR
         // sun-disk pixels) with 0 so they don't propagate as black fireflies.
-        out.push(chunk[0].max(0.0).min(1e10));
-        out.push(chunk[1].max(0.0).min(1e10));
-        out.push(chunk[2].max(0.0).min(1e10));
+        out.push(chunk[0].clamp(0.0, 1e10));
+        out.push(chunk[1].clamp(0.0, 1e10));
+        out.push(chunk[2].clamp(0.0, 1e10));
         out.push(1.0_f32); // alpha pad — Rgba32Float needs 4 channels
     }
     Some(out)

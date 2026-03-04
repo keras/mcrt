@@ -11,13 +11,15 @@ use bytemuck::bytes_of;
 use glam::Vec3;
 use log::info;
 use wgpu::util::DeviceExt;
+
+use crate::gpu_layout;
 use wgpu::{
     AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
     CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
     Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
     Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
+    RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions,
     SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
     StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
     TextureDescriptor, TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
@@ -37,7 +39,7 @@ use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
-use crate::scene::{GpuSphere, load_scene_from_yaml};
+use crate::scene::{GpuSphere, STUB_SPHERE, load_scene_from_yaml};
 use crate::texture::{
     ENV_MAP_HEIGHT, ENV_MAP_WIDTH, MAX_TEXTURES, TEXTURE_SIZE, load_all_textures, load_env_map_data,
 };
@@ -62,7 +64,7 @@ const CAM_MOVE_EPSILON_SQ: f32 = 1e-12;
 const MOUSE_SENSITIVITY: f32 = 0.005;
 
 /// Maximum camera pitch angle (±85°) in radians.
-const MAX_PITCH_RAD: f32 = 1.483_529_86_f32; // 85° × π/180
+const MAX_PITCH_RAD: f32 = 1.483_529_8_f32; // 85° × π/180
 
 /// Scroll zoom speed multiplier.
 const SCROLL_SPEED: f32 = 0.3;
@@ -145,6 +147,7 @@ impl CameraState {
 // ---------------------------------------------------------------------------
 
 /// Raw input state consumed by the event handlers.
+#[derive(Default)]
 pub struct InputState {
     pub drag_active: bool,
     pub last_cursor: Option<PhysicalPosition<f64>>,
@@ -152,14 +155,90 @@ pub struct InputState {
     pub wasd_held: [bool; 4],
 }
 
-impl Default for InputState {
+// ---------------------------------------------------------------------------
+// DenoiseParams — runtime-tunable denoiser knobs (uploaded as a uniform)
+// ---------------------------------------------------------------------------
+
+/// Runtime-tunable denoiser parameters.  Mirrors the WGSL `DenoiseParams`
+/// struct in `denoise.wgsl`; must stay layout-compatible (std140, 16 bytes).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct DenoiseParams {
+    /// Half-kernel radius in pixels (tap count = (2R+1)²).
+    radius: i32,
+    /// Spatial Gaussian sigma (pixels).
+    sigma_s: f32,
+    /// Depth similarity sigma (world units).
+    sigma_d: f32,
+    /// Exponent for normal dot-product weight factor.
+    normal_pow: f32,
+}
+
+impl Default for DenoiseParams {
     fn default() -> Self {
-        Self {
-            drag_active: false,
-            last_cursor: None,
-            wasd_held: [false; 4],
+        // Match the previous WGSL `const` values exactly so regression output
+        // is pixel-identical at default settings.
+        Self { radius: 3, sigma_s: 2.0, sigma_d: 0.5, normal_pow: 8.0 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CameraController — camera + input grouped for future extraction
+// ---------------------------------------------------------------------------
+
+/// Camera orbit state and raw input bundled together so both can be passed
+/// through one field when IC/VW/SDF add more `GpuState` fields.
+pub struct CameraController {
+    pub camera: CameraState,
+    pub input: InputState,
+}
+
+impl CameraController {
+    /// Apply any held WASD keys as one pan step. Call once per event-loop tick.
+    pub fn apply_movement(&mut self) {
+        if self.input.wasd_held.iter().any(|&h| h) {
+            // Forward/right ignore pitch so WASD feels like flat-plane movement.
+            let forward = Vec3::new(-self.camera.yaw.sin(), 0.0, -self.camera.yaw.cos());
+            let right = Vec3::new(self.camera.yaw.cos(), 0.0, -self.camera.yaw.sin());
+            if self.input.wasd_held[0] { self.camera.tgt_look_at += forward * PAN_SPEED; } // W
+            if self.input.wasd_held[1] { self.camera.tgt_look_at -= right   * PAN_SPEED; } // A
+            if self.input.wasd_held[2] { self.camera.tgt_look_at -= forward * PAN_SPEED; } // S
+            if self.input.wasd_held[3] { self.camera.tgt_look_at += right   * PAN_SPEED; } // D
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// UiState — egui resources, per-frame stats, and material editor data
+// ---------------------------------------------------------------------------
+
+/// All egui and UI-facing state bundled so build_panels can take &mut self
+/// instead of 9 individual parameters.
+struct UiState {
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+    egui_renderer: egui_wgpu::Renderer,
+    show_ui: bool,
+    denoise_enabled: bool,
+    fps_smooth: f32,
+    last_frame_time: std::time::Instant,
+    /// CPU copy of the material table — mutated by the UI and re-uploaded on change.
+    material_data_cpu: GpuMaterialData,
+    /// Human-readable material names (palette YAML keys; inline materials get "inline-N").
+    material_names: Vec<String>,
+    /// CPU mirror of the denoiser parameter uniform; written to GPU each frame.
+    denoise_params: DenoiseParams,
+}
+
+// ---------------------------------------------------------------------------
+// RenderStats — read-only frame statistics passed to build_panels
+// ---------------------------------------------------------------------------
+
+/// Read-only frame statistics forwarded to the egui UI panel.
+struct RenderStats {
+    frame_count: u32,
+    width: u32,
+    height: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -276,12 +355,11 @@ pub struct GpuState {
     denoise_bind_groups: [wgpu::BindGroup; 2],
     /// The joint-bilateral denoiser compute pipeline.
     denoise_pipeline: wgpu::ComputePipeline,
+    /// Uniform buffer holding the runtime-tunable denoiser parameters.
+    denoise_params_buffer: wgpu::Buffer,
     /// Display bind group that reads from the denoised output texture.
     /// Replaces `display_bind_groups[f_idx]` when `denoise_enabled` is true.
     display_bg_denoised: wgpu::BindGroup,
-    /// When `true` the denoiser compute pass runs before the display pass.
-    /// Toggle at runtime with the 'N' key.
-    denoise_enabled: bool,
     // ---- Phase 11: texture resources ----------------------------------------
     /// Albedo texture 2D array (RGBA8 Unorm, MAX_TEXTURES layers; binding 10).
     /// Stored alongside the view so the Texture Arc is not dropped early.
@@ -297,8 +375,8 @@ pub struct GpuState {
     frame_count: u32,
 
     // Sub-structs for non-GPU state.
-    camera: CameraState,
-    input: InputState,
+    /// Camera orbit state and raw input bundled together.
+    cam_ctrl: CameraController,
     // ---- Phase 12: hot-reload ------------------------------------------
     /// Path of the currently loaded scene file (for hot-reload).
     scene_path: String,
@@ -309,24 +387,9 @@ pub struct GpuState {
     /// Receives events from `_scene_watcher`; polled with `try_recv` each frame.
     scene_change_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
 
-    // ---- Phase 15: egui UI -----------------------------------------------
-    /// egui context — persistent across frames (holds font atlas, style, etc.).
-    egui_ctx: egui::Context,
-    /// egui ↔ winit platform bridge: translates OS events into egui input.
-    egui_state: egui_winit::State,
-    /// wgpu-side renderer for egui tessellated geometry.
-    egui_renderer: egui_wgpu::Renderer,
-    /// When `true` the egui side-panel is visible.  Toggle with the 'H' key.
-    show_ui: bool,
-    /// CPU copy of the material table — mutated by the UI and re-uploaded on change.
-    material_data_cpu: GpuMaterialData,
-    /// Human-readable material names (palette YAML keys; inline materials get "inline-N").
-    /// Same index order as `material_data_cpu.materials`.
-    material_names: Vec<String>,
-    /// Timestamp of the previous frame — used for FPS estimation.
-    last_frame_time: std::time::Instant,
-    /// Exponentially-smoothed frames-per-second estimate (α = 0.05 per frame).
-    fps_smooth: f32,
+    // ---- Phase 15: egui UI + material editor state -----------------------
+    /// All egui and UI-facing state bundled.
+    ui: UiState,
 }
 
 impl GpuState {
@@ -437,69 +500,13 @@ impl GpuState {
             mapped_at_creation: false,
         });
 
-        // ---- sphere list + BVH --------------------------------------------
-        // Load the declarative scene from YAML, then build the BVH on the CPU
-        // and upload both the reordered sphere list and the flat node array as
-        // storage buffers.  The loaded scene also carries the material table,
-        // the mesh geometry, and optional camera settings.
+        // ---- Load scene + build all scene-dependent GPU buffers ---------------
         let loaded = load_scene_from_yaml(&scene_path)
             .expect("failed to load initial scene");
-        let bvh_result = build_bvh(&loaded.spheres);
+        let scene = build_scene_buffers(&device, &queue, &loaded);
 
-        // wgpu requires every storage-buffer binding to be at least as large as
-        // the stride declared in the shader (32 bytes = one GpuSphere).  When
-        // the scene has no spheres the buffer would be zero bytes, causing a
-        // validation error.  Pad with a stub sphere placed far outside the
-        // scene so BVH traversal never hits it.
-        let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
-            vec![GpuSphere {
-                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-                mat_and_pad: [0; 4],
-            }]
-        } else {
-            bvh_result.ordered_spheres.clone()
-        };
-        let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sphere storage"),
-            contents: bytemuck::cast_slice(&sphere_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        // Sphere BVH nodes: also needs at least one entry when there are no
-        // spheres (the shader indexes this array unconditionally during traversal).
-        let bvh_node_data: Vec<GpuBvhNode> = if bvh_result.nodes.is_empty() {
-            use bytemuck::Zeroable;
-            vec![GpuBvhNode::zeroed()]
-        } else {
-            bvh_result.nodes.clone()
-        };
-        let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("bvh node storage"),
-            contents: bytemuck::cast_slice(&bvh_node_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-
-        info!(
-            "BVH built: {} spheres → {} nodes",
-            bvh_result.ordered_spheres.len(),
-            bvh_result.nodes.len()
-        );
-
-        // ---- triangle mesh (Phase 12: data-driven from YAML scene file) ----
-        // Mesh geometry is fully declarative: `load_scene_from_yaml` above has
-        // already parsed all `type: mesh` objects and merged their vertices and
-        // triangles.  We just build the BVH here.
-        let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
-
-        info!(
-            "Mesh BVH built: {} triangles, {} vertices → {} nodes",
-            mesh_result.ordered_triangles.len(),
-            mesh_result.vertices.len(),
-            mesh_result.nodes.len()
-        );
-
-        // ---- Phase 11: textures + environment map --------------------------
+        // ---- Phase 11: albedo texture array (not rebuilt on hot-reload) ----
         let (albedo_layers, _) = load_all_textures();
-        let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
 
         // RGBA8 Unorm 2D texture array — MAX_TEXTURES layers, TEXTURE_SIZE².
         let albedo_tex = device.create_texture(&TextureDescriptor {
@@ -551,46 +558,6 @@ impl GpuState {
 
         info!("Albedo texture array: {MAX_TEXTURES} layers @ {TEXTURE_SIZE}×{TEXTURE_SIZE}");
 
-        // RGBA32 Float equirectangular environment map.
-        let env_map_tex = device.create_texture(&TextureDescriptor {
-            label: Some("env map"),
-            size: Extent3d {
-                width: ENV_MAP_WIDTH,
-                height: ENV_MAP_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba32Float,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &env_map_tex,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            bytemuck::cast_slice(&env_map_data),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4), // 4 channels × 4 bytes
-                rows_per_image: Some(ENV_MAP_HEIGHT),
-            },
-            Extent3d {
-                width: ENV_MAP_WIDTH,
-                height: ENV_MAP_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-        );
-
-        let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
-
-        info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
-
         // ---- Phase 14: G-buffer + denoiser output textures ---------------
         // Both need TEXTURE_BINDING (read by denoise/display) and
         // STORAGE_BINDING (written by path_trace / denoise compute passes).
@@ -609,60 +576,6 @@ impl GpuState {
             ..Default::default()
         });
 
-        // Mesh buffers: guard against zero-byte uploads (no-mesh scene).
-        // wgpu requires every bound buffer to be at least as large as the
-        // stride declared in the shader via min_binding_size.
-        let mesh_vertices_data: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
-            use bytemuck::Zeroable;
-            vec![GpuVertex::zeroed()]
-        } else {
-            mesh_result.vertices.clone()
-        };
-        let mesh_triangles_data: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
-            use bytemuck::Zeroable;
-            vec![GpuTriangle::zeroed()]
-        } else {
-            mesh_result.ordered_triangles.clone()
-        };
-        let mesh_bvh_data: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
-            use bytemuck::Zeroable;
-            vec![GpuBvhNode::zeroed()]
-        } else {
-            mesh_result.nodes.clone()
-        };
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh vertex storage"),
-            contents: bytemuck::cast_slice(&mesh_vertices_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh triangle storage"),
-            contents: bytemuck::cast_slice(&mesh_triangles_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let mesh_bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh bvh node storage"),
-            contents: bytemuck::cast_slice(&mesh_bvh_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-
-        // ---- Phase 13: emissive sphere buffer (binding 12) ---------------
-        // Always non-empty: pad with a stub sphere far away so the shader
-        // can unconditionally index the array (no out-of-bounds).
-        let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-            vec![GpuSphere {
-                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-                mat_and_pad: [0; 4],
-            }]
-        } else {
-            loaded.emissive_spheres.clone()
-        };
-        let emissive_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("emissive sphere storage"),
-            contents: bytemuck::cast_slice(&emissive_data),
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-
         // ---- material buffer -----------------------------------------------
         // Use the material table parsed from the YAML scene file.
         let material_data = loaded.materials;
@@ -677,179 +590,8 @@ impl GpuState {
         });
         queue.write_buffer(&material_buffer, 0, bytes_of(&material_data));
 
-        // ---- compute bind group layout ------------------------------------
-        let compute_bind_group_layout =
-            device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-                label: Some("compute bgl"),
-                entries: &[
-                    // 0: write-only storage texture (accum write target)
-                    BindGroupLayoutEntry {
-                        binding:    0,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::StorageTexture {
-                            access:         StorageTextureAccess::WriteOnly,
-                            format:         TextureFormat::Rgba32Float,
-                            view_dimension: TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    // 1: camera parameters uniform
-                    BindGroupLayoutEntry {
-                        binding:    1,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<CameraUniform>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 2: sphere list storage buffer (BVH-reordered; runtime-sized array)
-                    BindGroupLayoutEntry {
-                        binding:    2,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuSphere>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 3: previous-frame accumulation (read via textureLoad)
-                    BindGroupLayoutEntry {
-                        binding:    3,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Texture {
-                            sample_type:    TextureSampleType::Float { filterable: false },
-                            view_dimension: TextureViewDimension::D2,
-                            multisampled:   false,
-                        },
-                        count: None,
-                    },
-                    // 4: material descriptors uniform
-                    BindGroupLayoutEntry {
-                        binding:    4,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuMaterialData>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 5: sphere BVH node array storage buffer (runtime-sized array)
-                    BindGroupLayoutEntry {
-                        binding:    5,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuBvhNode>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 6: mesh vertex buffer (position, normal, UV; runtime-sized array)
-                    BindGroupLayoutEntry {
-                        binding:    6,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuVertex>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 7: mesh triangle index buffer (runtime-sized array)
-                    BindGroupLayoutEntry {
-                        binding:    7,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuTriangle>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 8: mesh BVH node array (runtime-sized array)
-                    BindGroupLayoutEntry {
-                        binding:    8,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuBvhNode>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 9: linear sampler for albedo texture array
-                    BindGroupLayoutEntry {
-                        binding: 9,
-                        visibility: ShaderStages::COMPUTE,
-                        ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    // 10: albedo 2D texture array (RGBA8 Unorm, MAX_TEXTURES layers)
-                    BindGroupLayoutEntry {
-                        binding: 10,
-                        visibility: ShaderStages::COMPUTE,
-                        ty: BindingType::Texture {
-                            sample_type: TextureSampleType::Float { filterable: true },
-                            view_dimension: TextureViewDimension::D2Array,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 11: HDR environment map (RGBA32 Float; non-filterable, textureLoad)
-                    BindGroupLayoutEntry {
-                        binding: 11,
-                        visibility: ShaderStages::COMPUTE,
-                        ty: BindingType::Texture {
-                            sample_type: TextureSampleType::Float { filterable: false },
-                            view_dimension: TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 12: emissive sphere list for NEE (Phase 13)
-                    BindGroupLayoutEntry {
-                        binding:    12,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::Buffer {
-                            ty:                wgpu::BufferBindingType::Storage { read_only: true },
-                            has_dynamic_offset: false,
-                            min_binding_size:   wgpu::BufferSize::new(
-                                size_of::<GpuSphere>() as u64
-                            ),
-                        },
-                        count: None,
-                    },
-                    // 13: G-buffer write target (Phase 14) — normal.xyz + depth.w
-                    BindGroupLayoutEntry {
-                        binding:    13,
-                        visibility: ShaderStages::COMPUTE,
-                        ty:         BindingType::StorageTexture {
-                            access:         StorageTextureAccess::WriteOnly,
-                            format:         TextureFormat::Rgba32Float,
-                            view_dimension: TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                ],
-            });
+        // ---- compute bind group layout (single source of truth in gpu_layout) ---
+        let compute_bind_group_layout = gpu_layout::make_compute_bgl(&device);
 
         // ---- compute shader + pipeline ------------------------------------
         let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -908,6 +650,19 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    // 3: DenoiseParams uniform buffer (runtime-tunable knobs)
+                    BindGroupLayoutEntry {
+                        binding: gpu_layout::BINDING_DENOISE_PARAMS,
+                        visibility: ShaderStages::COMPUTE,
+                        ty: BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                size_of::<DenoiseParams>() as u64,
+                            ),
+                        },
+                        count: None,
+                    },
                 ],
             });
         let denoise_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -926,6 +681,14 @@ impl GpuState {
             entry_point: Some("cs_denoise"),
             compilation_options: Default::default(),
             cache: None,
+        });
+
+        // ---- denoiser parameter buffer (TD-5) --------------------------------
+        let default_denoise = DenoiseParams::default();
+        let denoise_params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("denoise params"),
+            contents: bytes_of(&default_denoise),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
         // ---- initial camera state -----------------------------------------
@@ -988,16 +751,16 @@ impl GpuState {
             &compute_bind_group_layout,
             &accum_views,
             &camera_buffer,
-            &sphere_buffer,
+            &scene.sphere_buffer,
             &material_buffer,
-            &bvh_buffer,
-            &vertex_buffer,
-            &triangle_buffer,
-            &mesh_bvh_buffer,
+            &scene.bvh_buffer,
+            &scene.vertex_buffer,
+            &scene.triangle_buffer,
+            &scene.mesh_bvh_buffer,
             &tex_sampler,
             &albedo_tex_view,
-            &env_map_view,
-            &emissive_buffer,
+            &scene.env_map_view,
+            &scene.emissive_buffer,
             &gbuffer_view,
         );
         let denoise_bind_groups = make_denoise_bind_groups(
@@ -1006,6 +769,7 @@ impl GpuState {
             &accum_views,
             &gbuffer_view,
             &denoise_output_view,
+            &denoise_params_buffer,
         );
         let display_bg_denoised =
             make_display_bg_denoised(&device, &bind_group_layout, &denoise_output_view);
@@ -1041,13 +805,13 @@ impl GpuState {
             compute_bind_group_layout,
             compute_bind_groups,
             compute_pipeline,
-            sphere_buffer,
+            sphere_buffer: scene.sphere_buffer,
             material_buffer,
-            bvh_buffer,
-            vertex_buffer,
-            triangle_buffer,
-            mesh_bvh_buffer,
-            emissive_buffer,
+            bvh_buffer: scene.bvh_buffer,
+            vertex_buffer: scene.vertex_buffer,
+            triangle_buffer: scene.triangle_buffer,
+            mesh_bvh_buffer: scene.mesh_bvh_buffer,
+            emissive_buffer: scene.emissive_buffer,
             _gbuffer_tex,
             gbuffer_view,
             _denoise_output_tex,
@@ -1055,27 +819,33 @@ impl GpuState {
             denoise_bind_group_layout,
             denoise_bind_groups,
             denoise_pipeline,
+            denoise_params_buffer,
             display_bg_denoised,
-            denoise_enabled: false,
             _albedo_tex: albedo_tex,
             albedo_tex_view,
-            _env_map_tex: env_map_tex,
-            env_map_view,
+            _env_map_tex: scene.env_map_tex,
+            env_map_view: scene.env_map_view,
             tex_sampler,
             frame_count: 0,
-            camera,
-            input: InputState::default(),
+            cam_ctrl: CameraController {
+                camera,
+                input: InputState::default(),
+            },
             scene_path: scene_path_str.to_string(),
             _scene_watcher,
             scene_change_rx,
-            egui_ctx,
-            egui_state,
-            egui_renderer,
-            show_ui: true,
-            material_data_cpu,
-            material_names,
-            last_frame_time: std::time::Instant::now(),
-            fps_smooth: 60.0,
+            ui: UiState {
+                egui_ctx,
+                egui_state,
+                egui_renderer,
+                show_ui: true,
+                denoise_enabled: false,
+                fps_smooth: 60.0,
+                last_frame_time: std::time::Instant::now(),
+                material_data_cpu,
+                material_names,
+                denoise_params: DenoiseParams::default(),
+            },
         }
     }
 
@@ -1143,6 +913,7 @@ impl GpuState {
             &self.accum_views,
             &self.gbuffer_view,
             &self.denoise_output_view,
+            &self.denoise_params_buffer,
         );
         self.display_bg_denoised = make_display_bg_denoised(
             &self.device,
@@ -1163,10 +934,8 @@ impl GpuState {
             .as_ref()
             .map(|rx| rx.try_recv().is_ok())
             .unwrap_or(false);
-        if changed {
-            if let Some(ref rx) = self.scene_change_rx {
-                while rx.try_recv().is_ok() {}
-            }
+        if changed && let Some(ref rx) = self.scene_change_rx {
+            while rx.try_recv().is_ok() {}
         }
         changed
     }
@@ -1185,139 +954,23 @@ impl GpuState {
             }
         };
 
-        let bvh_result = build_bvh(&loaded.spheres);
-        let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
-            vec![GpuSphere {
-                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-                mat_and_pad: [0; 4],
-            }]
-        } else {
-            bvh_result.ordered_spheres.clone()
-        };
-        self.sphere_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("sphere storage"),
-                contents: bytemuck::cast_slice(&sphere_data),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-        let reload_bvh_nodes: Vec<GpuBvhNode> = {
-            use bytemuck::Zeroable;
-            if bvh_result.nodes.is_empty() {
-                vec![GpuBvhNode::zeroed()]
-            } else {
-                bvh_result.nodes.clone()
-            }
-        };
-        self.bvh_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("bvh node storage"),
-                contents: bytemuck::cast_slice(&reload_bvh_nodes),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-
-        let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
-        use bytemuck::Zeroable;
-        let reload_mesh_verts: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
-            vec![GpuVertex::zeroed()]
-        } else {
-            mesh_result.vertices.clone()
-        };
-        let reload_mesh_tris: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
-            vec![GpuTriangle::zeroed()]
-        } else {
-            mesh_result.ordered_triangles.clone()
-        };
-        let reload_mesh_bvh: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
-            vec![GpuBvhNode::zeroed()]
-        } else {
-            mesh_result.nodes.clone()
-        };
-        self.vertex_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh vertex storage"),
-                contents: bytemuck::cast_slice(&reload_mesh_verts),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-        self.triangle_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh triangle storage"),
-                contents: bytemuck::cast_slice(&reload_mesh_tris),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-        self.mesh_bvh_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("mesh bvh node storage"),
-                contents: bytemuck::cast_slice(&reload_mesh_bvh),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
+        let scene = build_scene_buffers(&self.device, &self.queue, &loaded);
+        self.sphere_buffer = scene.sphere_buffer;
+        self.bvh_buffer = scene.bvh_buffer;
+        self.vertex_buffer = scene.vertex_buffer;
+        self.triangle_buffer = scene.triangle_buffer;
+        self.mesh_bvh_buffer = scene.mesh_bvh_buffer;
+        self.emissive_buffer = scene.emissive_buffer;
+        self._env_map_tex = scene.env_map_tex;
+        self.env_map_view = scene.env_map_view;
 
         // Material buffer has a fixed GPU layout — just overwrite in place.
         self.queue
             .write_buffer(&self.material_buffer, 0, bytes_of(&loaded.materials));
         // Keep the CPU mirror and material names in sync so the UI panel
         // reflects the hot-reloaded values and slider edits don't re-upload stale data.
-        self.material_data_cpu = loaded.materials;
-        self.material_names = loaded.material_names;
-
-        // Recreate emissive buffer (count may have changed after hot-reload).
-        let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
-            vec![GpuSphere {
-                center_r: [1.0e9, 1.0e9, 1.0e9, 0.0],
-                mat_and_pad: [0; 4],
-            }]
-        } else {
-            loaded.emissive_spheres.clone()
-        };
-        self.emissive_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("emissive sphere storage"),
-                contents: bytemuck::cast_slice(&emissive_data),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-            });
-
-        // Recreate the env map texture (the scene's env_map: field may have changed).
-        let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
-        let env_map_tex = self.device.create_texture(&TextureDescriptor {
-            label: Some("env map"),
-            size: Extent3d {
-                width: ENV_MAP_WIDTH,
-                height: ENV_MAP_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba32Float,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        self.queue.write_texture(
-            TexelCopyTextureInfo {
-                texture: &env_map_tex,
-                mip_level: 0,
-                origin: Origin3d::ZERO,
-                aspect: TextureAspect::All,
-            },
-            bytemuck::cast_slice(&env_map_data),
-            TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4),
-                rows_per_image: Some(ENV_MAP_HEIGHT),
-            },
-            Extent3d {
-                width: ENV_MAP_WIDTH,
-                height: ENV_MAP_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-        );
-        self.env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
-        self._env_map_tex = env_map_tex;
+        self.ui.material_data_cpu = loaded.materials;
+        self.ui.material_names = loaded.material_names;
 
         // G-buffer and denoised-output textures are resolution-dependent, not
         // scene-dependent.  They are not recreated here; resize() handles them.
@@ -1350,13 +1003,13 @@ impl GpuState {
         // ---- FPS estimation (Phase 15) ------------------------------------
         let now = std::time::Instant::now();
         let dt = now
-            .duration_since(self.last_frame_time)
+            .duration_since(self.ui.last_frame_time)
             .as_secs_f32()
             .max(1e-6);
-        self.last_frame_time = now;
+        self.ui.last_frame_time = now;
         // Exponential moving average: α = 0.05 (smooths over ~20 frames).
         let inst_fps = 1.0 / dt;
-        self.fps_smooth = self.fps_smooth * 0.95 + inst_fps * 0.05;
+        self.ui.fps_smooth = self.ui.fps_smooth * 0.95 + inst_fps * 0.05;
 
         // ---- hot-reload: check if scene file has changed on disk ----------
         if self.poll_scene_changed() {
@@ -1364,17 +1017,17 @@ impl GpuState {
         }
 
         // ---- smooth-interpolate camera toward targets ---------------------
-        let prev_look_from = self.camera.look_from();
+        let prev_look_from = self.cam_ctrl.camera.look_from();
 
-        self.camera.yaw += (self.camera.tgt_yaw - self.camera.yaw) * CAM_LERP;
-        self.camera.pitch += (self.camera.tgt_pitch - self.camera.pitch) * CAM_LERP;
-        self.camera.distance += (self.camera.tgt_distance - self.camera.distance) * CAM_LERP;
-        self.camera.look_at += (self.camera.tgt_look_at - self.camera.look_at) * CAM_LERP;
+        self.cam_ctrl.camera.yaw += (self.cam_ctrl.camera.tgt_yaw - self.cam_ctrl.camera.yaw) * CAM_LERP;
+        self.cam_ctrl.camera.pitch += (self.cam_ctrl.camera.tgt_pitch - self.cam_ctrl.camera.pitch) * CAM_LERP;
+        self.cam_ctrl.camera.distance += (self.cam_ctrl.camera.tgt_distance - self.cam_ctrl.camera.distance) * CAM_LERP;
+        self.cam_ctrl.camera.look_at += (self.cam_ctrl.camera.tgt_look_at - self.cam_ctrl.camera.look_at) * CAM_LERP;
         // Keep focus_dist tracking orbit distance so scene stays sharp.
-        self.camera.focus_dist = self.camera.distance;
+        self.cam_ctrl.camera.focus_dist = self.cam_ctrl.camera.distance;
 
-        let look_from = self.camera.look_from();
-        let look_at = self.camera.look_at;
+        let look_from = self.cam_ctrl.camera.look_from();
+        let look_at = self.cam_ctrl.camera.look_at;
 
         // Reset accumulation whenever the camera has moved at all.
         if (look_from - prev_look_from).length_squared() > CAM_MOVE_EPSILON_SQ {
@@ -1386,9 +1039,9 @@ impl GpuState {
             self.config.height,
             look_from,
             look_at,
-            self.camera.vfov,
-            self.camera.aperture,
-            self.camera.focus_dist,
+            self.cam_ctrl.camera.vfov,
+            self.cam_ctrl.camera.aperture,
+            self.cam_ctrl.camera.focus_dist,
         );
 
         // Derive ping-pong index before incrementing so the formula is a
@@ -1418,32 +1071,35 @@ impl GpuState {
             });
             cpass.set_pipeline(&self.compute_pipeline);
             cpass.set_bind_group(0, &self.compute_bind_groups[f_idx], &[]);
-            // Ceil-divide: every pixel covered even for non-multiple-of-WORKGROUP_SIZE sizes.
-            let wg_x = self.config.width.div_ceil(WORKGROUP_SIZE);
-            let wg_y = self.config.height.div_ceil(WORKGROUP_SIZE);
+            let (wg_x, wg_y) = workgroup_dims(self.config.width, self.config.height);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // ---- compute pass: joint-bilateral denoiser (optional, 'N' key) --
+        // Upload the latest denoise parameters before the pass runs.
+        self.queue.write_buffer(
+            &self.denoise_params_buffer,
+            0,
+            bytes_of(&self.ui.denoise_params),
+        );
         // wgpu automatically inserts a pipeline barrier between the two compute
         // passes, ensuring the path-tracer's writes to accum[f_idx] and
         // gbuffer_write are visible to the denoiser's texture reads.
-        if self.denoise_enabled {
+        if self.ui.denoise_enabled {
             let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("denoise pass"),
                 timestamp_writes: None,
             });
             cpass.set_pipeline(&self.denoise_pipeline);
             cpass.set_bind_group(0, &self.denoise_bind_groups[f_idx], &[]);
-            let wg_x = self.config.width.div_ceil(WORKGROUP_SIZE);
-            let wg_y = self.config.height.div_ceil(WORKGROUP_SIZE);
+            let (wg_x, wg_y) = workgroup_dims(self.config.width, self.config.height);
             cpass.dispatch_workgroups(wg_x, wg_y, 1);
         }
 
         // ---- render pass: tone-map (accum or denoised) to swapchain ------
         // When denoising is on the display pass reads from the denoised output
         // texture; otherwise it reads directly from the accumulation buffer.
-        let display_bg: &wgpu::BindGroup = if self.denoise_enabled {
+        let display_bg: &wgpu::BindGroup = if self.ui.denoise_enabled {
             &self.display_bg_denoised
         } else {
             &self.display_bind_groups[f_idx]
@@ -1472,14 +1128,19 @@ impl GpuState {
         // ---- egui UI pass (Phase 15) -------------------------------------
         // Runs after the display pass so the UI overlays the path-traced image.
         // LoadOp::Load preserves whatever the display pass wrote to the swapchain.
-        if self.show_ui {
+        if self.ui.show_ui {
             let pixels_per_point = self.window.scale_factor() as f32;
             let screen_desc = ScreenDescriptor {
                 size_in_pixels: [self.config.width, self.config.height],
                 pixels_per_point,
             };
 
-            let raw_input = self.egui_state.take_egui_input(&self.window);
+            let raw_input = self.ui.egui_state.take_egui_input(&self.window);
+
+            // Clone the egui Context (cheap Arc clone) so the closure can take
+            // mutable borrows on other `self.ui` fields while `egui_ctx.run()`
+            // holds only the cloned reference.
+            let egui_ctx = self.ui.egui_ctx.clone();
 
             // Run the UI build; collect mutation flags as locals to avoid
             // overlapping borrows on `self`.
@@ -1487,24 +1148,20 @@ impl GpuState {
             let mut mat_changed = false;
             let mut save_request = false;
 
-            let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                let (cc, mc, sr) = build_ui_panels(
-                    ctx,
-                    &mut self.camera,
-                    &mut self.denoise_enabled,
-                    &mut self.material_data_cpu,
-                    &self.material_names,
-                    self.config.width,
-                    self.config.height,
-                    self.frame_count,
-                    self.fps_smooth,
-                );
+            let stats = RenderStats {
+                frame_count: self.frame_count,
+                width: self.config.width,
+                height: self.config.height,
+            };
+            let full_output = egui_ctx.run(raw_input, |ctx| {
+                let (cc, mc, sr) =
+                    self.ui.build_panels(ctx, &mut self.cam_ctrl.camera, &stats);
                 cam_changed = cc;
                 mat_changed = mc;
                 save_request = sr;
             });
 
-            self.egui_state
+            self.ui.egui_state
                 .handle_platform_output(&self.window, full_output.platform_output);
 
             if cam_changed {
@@ -1514,7 +1171,7 @@ impl GpuState {
                 self.queue.write_buffer(
                     &self.material_buffer,
                     0,
-                    bytes_of(&self.material_data_cpu),
+                    bytes_of(&self.ui.material_data_cpu),
                 );
                 self.frame_count = 0;
                 // The camera uniform was already written this frame with a non-zero
@@ -1531,17 +1188,15 @@ impl GpuState {
 
             // Upload any new / changed egui font textures.
             for (id, delta) in &full_output.textures_delta.set {
-                self.egui_renderer
+                self.ui.egui_renderer
                     .update_texture(&self.device, &self.queue, *id, delta);
             }
             for id in &full_output.textures_delta.free {
-                self.egui_renderer.free_texture(id);
+                self.ui.egui_renderer.free_texture(id);
             }
 
-            let clipped = self
-                .egui_ctx
-                .tessellate(full_output.shapes, pixels_per_point);
-            self.egui_renderer.update_buffers(
+            let clipped = egui_ctx.tessellate(full_output.shapes, pixels_per_point);
+            self.ui.egui_renderer.update_buffers(
                 &self.device,
                 &self.queue,
                 &mut encoder,
@@ -1568,7 +1223,7 @@ impl GpuState {
                         timestamp_writes: None,
                     })
                     .forget_lifetime();
-                self.egui_renderer
+                self.ui.egui_renderer
                     .render(&mut egui_pass, &clipped, &screen_desc);
             }
         }
@@ -1580,34 +1235,34 @@ impl GpuState {
 
     pub fn handle_mouse_button(&mut self, button: MouseButton, state: ElementState) {
         if button == MouseButton::Left {
-            self.input.drag_active = state == ElementState::Pressed;
-            if !self.input.drag_active {
-                self.input.last_cursor = None;
+            self.cam_ctrl.input.drag_active = state == ElementState::Pressed;
+            if !self.cam_ctrl.input.drag_active {
+                self.cam_ctrl.input.last_cursor = None;
             }
         }
     }
 
     pub fn handle_cursor_moved(&mut self, position: PhysicalPosition<f64>) {
-        if self.input.drag_active {
-            if let Some(last) = self.input.last_cursor {
+        if self.cam_ctrl.input.drag_active {
+            if let Some(last) = self.cam_ctrl.input.last_cursor {
                 let dx = (position.x - last.x) as f32;
                 let dy = (position.y - last.y) as f32;
 
-                self.camera.tgt_yaw -= dx * MOUSE_SENSITIVITY;
+                self.cam_ctrl.camera.tgt_yaw -= dx * MOUSE_SENSITIVITY;
                 // Normalise tgt_yaw so the lerp always takes the short arc
                 // around the Y axis, preventing a long-way-round spin after
                 // rapid drags.
-                let diff = self.camera.tgt_yaw - self.camera.yaw;
+                let diff = self.cam_ctrl.camera.tgt_yaw - self.cam_ctrl.camera.yaw;
                 if diff > std::f32::consts::PI {
-                    self.camera.tgt_yaw -= std::f32::consts::TAU;
+                    self.cam_ctrl.camera.tgt_yaw -= std::f32::consts::TAU;
                 } else if diff < -std::f32::consts::PI {
-                    self.camera.tgt_yaw += std::f32::consts::TAU;
+                    self.cam_ctrl.camera.tgt_yaw += std::f32::consts::TAU;
                 }
 
-                self.camera.tgt_pitch = (self.camera.tgt_pitch + dy * MOUSE_SENSITIVITY)
+                self.cam_ctrl.camera.tgt_pitch = (self.cam_ctrl.camera.tgt_pitch + dy * MOUSE_SENSITIVITY)
                     .clamp(-MAX_PITCH_RAD, MAX_PITCH_RAD);
             }
-            self.input.last_cursor = Some(position);
+            self.cam_ctrl.input.last_cursor = Some(position);
         }
     }
 
@@ -1616,33 +1271,33 @@ impl GpuState {
             MouseScrollDelta::LineDelta(_, y) => y,
             MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
         };
-        self.camera.tgt_distance =
-            (self.camera.tgt_distance - scroll * SCROLL_SPEED).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.cam_ctrl.camera.tgt_distance =
+            (self.cam_ctrl.camera.tgt_distance - scroll * SCROLL_SPEED).clamp(MIN_ZOOM, MAX_ZOOM);
     }
 
     pub fn handle_key(&mut self, key: PhysicalKey, pressed: bool) {
         match key {
-            PhysicalKey::Code(KeyCode::KeyW) => self.input.wasd_held[0] = pressed,
-            PhysicalKey::Code(KeyCode::KeyA) => self.input.wasd_held[1] = pressed,
-            PhysicalKey::Code(KeyCode::KeyS) => self.input.wasd_held[2] = pressed,
-            PhysicalKey::Code(KeyCode::KeyD) => self.input.wasd_held[3] = pressed,
+            PhysicalKey::Code(KeyCode::KeyW) => self.cam_ctrl.input.wasd_held[0] = pressed,
+            PhysicalKey::Code(KeyCode::KeyA) => self.cam_ctrl.input.wasd_held[1] = pressed,
+            PhysicalKey::Code(KeyCode::KeyS) => self.cam_ctrl.input.wasd_held[2] = pressed,
+            PhysicalKey::Code(KeyCode::KeyD) => self.cam_ctrl.input.wasd_held[3] = pressed,
             PhysicalKey::Code(KeyCode::KeyN) => {
                 // Toggle the joint-bilateral denoiser on the key-down event only.
                 if pressed {
-                    self.denoise_enabled = !self.denoise_enabled;
+                    self.ui.denoise_enabled = !self.ui.denoise_enabled;
                     info!(
                         "Denoiser: {}  (press N to toggle)",
-                        if self.denoise_enabled { "ON" } else { "OFF" }
+                        if self.ui.denoise_enabled { "ON" } else { "OFF" }
                     );
                 }
             }
             PhysicalKey::Code(KeyCode::KeyH) => {
                 // Toggle the egui UI panel (Phase 15).
                 if pressed {
-                    self.show_ui = !self.show_ui;
+                    self.ui.show_ui = !self.ui.show_ui;
                     info!(
                         "UI: {}  (press H to toggle)",
-                        if self.show_ui { "visible" } else { "hidden" }
+                        if self.ui.show_ui { "visible" } else { "hidden" }
                     );
                 }
             }
@@ -1652,23 +1307,7 @@ impl GpuState {
 
     /// Apply any held WASD keys as one pan step. Call once per event-loop tick.
     pub fn apply_movement(&mut self) {
-        if self.input.wasd_held.iter().any(|&h| h) {
-            // Forward/right ignore pitch so WASD feels like flat-plane movement.
-            let forward = Vec3::new(-self.camera.yaw.sin(), 0.0, -self.camera.yaw.cos());
-            let right = Vec3::new(self.camera.yaw.cos(), 0.0, -self.camera.yaw.sin());
-            if self.input.wasd_held[0] {
-                self.camera.tgt_look_at += forward * PAN_SPEED;
-            } // W
-            if self.input.wasd_held[1] {
-                self.camera.tgt_look_at -= right * PAN_SPEED;
-            } // A
-            if self.input.wasd_held[2] {
-                self.camera.tgt_look_at -= forward * PAN_SPEED;
-            } // S
-            if self.input.wasd_held[3] {
-                self.camera.tgt_look_at += right * PAN_SPEED;
-            } // D
-        }
+        self.cam_ctrl.apply_movement();
     }
 
     /// Ask the OS to schedule a redraw for this window.
@@ -1695,13 +1334,14 @@ impl GpuState {
     /// camera / orbit handling in that case so the UI receives exclusive input.
     pub fn handle_window_event_egui(&mut self, event: &winit::event::WindowEvent) -> bool {
         let consumed = self
+            .ui
             .egui_state
             .on_window_event(&self.window, event)
             .consumed;
         // If egui claims this event (e.g. a slider drag starts), release all held WASD
         // keys so the camera doesn't drift when the key-release event is swallowed.
         if consumed {
-            self.input.wasd_held = [false; 4];
+            self.cam_ctrl.input.wasd_held = [false; 4];
         }
         consumed
     }
@@ -1722,7 +1362,7 @@ impl GpuState {
 
         // Read from the denoised output when the denoiser is on; otherwise
         // from the last-written accumulation texture.
-        let src_tex: &wgpu::Texture = if self.denoise_enabled {
+        let src_tex: &wgpu::Texture = if self.ui.denoise_enabled {
             &self._denoise_output_tex
         } else {
             let last_written = self.frame_count.wrapping_sub(1) as usize % 2;
@@ -1830,6 +1470,179 @@ impl GpuState {
 }
 
 // ---------------------------------------------------------------------------
+// SceneBuffers — scene-dependent GPU resources built from a LoadedScene
+// ---------------------------------------------------------------------------
+
+/// GPU resources that are rebuilt whenever the scene changes (initial load
+/// or hot-reload).  Grouping them here makes `build_scene_buffers` the single
+/// place where the creation logic lives; both `new()` and `reload_scene()`
+/// call it instead of duplicating ~160 lines.
+struct SceneBuffers {
+    sphere_buffer: wgpu::Buffer,
+    bvh_buffer: wgpu::Buffer,
+    vertex_buffer: wgpu::Buffer,
+    triangle_buffer: wgpu::Buffer,
+    mesh_bvh_buffer: wgpu::Buffer,
+    emissive_buffer: wgpu::Buffer,
+    /// Keep the texture alive so the view's underlying allocation is not freed.
+    env_map_tex: wgpu::Texture,
+    env_map_view: wgpu::TextureView,
+}
+
+/// Build all scene-dependent GPU buffers and textures from a parsed scene.
+///
+/// Called once in `GpuState::new()` and again on every hot-reload in
+/// `GpuState::reload_scene()`.  The albedo texture array is *not* rebuilt here
+/// because it depends only on files on disk, not on the scene YAML.
+fn build_scene_buffers(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    loaded: &crate::scene::LoadedScene,
+) -> SceneBuffers {
+    use bytemuck::Zeroable;
+
+    // ---- Sphere BVH --------------------------------------------------------
+    let bvh_result = build_bvh(&loaded.spheres);
+    // wgpu requires every storage-buffer binding to be at least as large as
+    // the stride declared in the shader.  Pad with a stub sphere when empty.
+    let sphere_data: Vec<GpuSphere> = if bvh_result.ordered_spheres.is_empty() {
+        vec![STUB_SPHERE]
+    } else {
+        bvh_result.ordered_spheres.clone()
+    };
+    let sphere_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("sphere storage"),
+        contents: bytemuck::cast_slice(&sphere_data),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let bvh_node_data: Vec<GpuBvhNode> = if bvh_result.nodes.is_empty() {
+        vec![GpuBvhNode::zeroed()]
+    } else {
+        bvh_result.nodes.clone()
+    };
+    let bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("bvh node storage"),
+        contents: bytemuck::cast_slice(&bvh_node_data),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    info!(
+        "BVH built: {} spheres → {} nodes",
+        bvh_result.ordered_spheres.len(),
+        bvh_result.nodes.len()
+    );
+
+    // ---- Triangle mesh BVH -------------------------------------------------
+    let mesh_result = build_mesh_bvh(&loaded.mesh_vertices, &loaded.mesh_triangles);
+    info!(
+        "Mesh BVH built: {} triangles, {} vertices → {} nodes",
+        mesh_result.ordered_triangles.len(),
+        mesh_result.vertices.len(),
+        mesh_result.nodes.len()
+    );
+    let mesh_verts: Vec<GpuVertex> = if mesh_result.vertices.is_empty() {
+        vec![GpuVertex::zeroed()]
+    } else {
+        mesh_result.vertices.clone()
+    };
+    let mesh_tris: Vec<GpuTriangle> = if mesh_result.ordered_triangles.is_empty() {
+        vec![GpuTriangle::zeroed()]
+    } else {
+        mesh_result.ordered_triangles.clone()
+    };
+    let mesh_bvh_nodes: Vec<GpuBvhNode> = if mesh_result.nodes.is_empty() {
+        vec![GpuBvhNode::zeroed()]
+    } else {
+        mesh_result.nodes.clone()
+    };
+    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh vertex storage"),
+        contents: bytemuck::cast_slice(&mesh_verts),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let triangle_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh triangle storage"),
+        contents: bytemuck::cast_slice(&mesh_tris),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+    let mesh_bvh_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh bvh node storage"),
+        contents: bytemuck::cast_slice(&mesh_bvh_nodes),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
+    // ---- Emissive sphere buffer --------------------------------------------
+    // Always non-empty: the shader unconditionally indexes this array during NEE.
+    let emissive_data: Vec<GpuSphere> = if loaded.emissive_spheres.is_empty() {
+        vec![STUB_SPHERE]
+    } else {
+        loaded.emissive_spheres.clone()
+    };
+    let emissive_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("emissive sphere storage"),
+        contents: bytemuck::cast_slice(&emissive_data),
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+    });
+
+    // ---- Environment map texture -------------------------------------------
+    let env_map_data = load_env_map_data(loaded.env_map_path.as_deref());
+    let env_map_tex = device.create_texture(&TextureDescriptor {
+        label: Some("env map"),
+        size: Extent3d {
+            width: ENV_MAP_WIDTH,
+            height: ENV_MAP_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba32Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &env_map_tex,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        bytemuck::cast_slice(&env_map_data),
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(ENV_MAP_WIDTH * 4 * 4), // 4 channels × 4 bytes
+            rows_per_image: Some(ENV_MAP_HEIGHT),
+        },
+        Extent3d {
+            width: ENV_MAP_WIDTH,
+            height: ENV_MAP_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+    );
+    let env_map_view = env_map_tex.create_view(&TextureViewDescriptor::default());
+    info!("Env map: {ENV_MAP_WIDTH}×{ENV_MAP_HEIGHT}");
+
+    SceneBuffers {
+        sphere_buffer,
+        bvh_buffer,
+        vertex_buffer,
+        triangle_buffer,
+        mesh_bvh_buffer,
+        emissive_buffer,
+        env_map_tex,
+        env_map_view,
+    }
+}
+
+/// Returns the compute dispatch dimensions for the given surface size.
+#[inline]
+fn workgroup_dims(width: u32, height: u32) -> (u32, u32) {
+    (
+        width.div_ceil(WORKGROUP_SIZE),
+        height.div_ceil(WORKGROUP_SIZE),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Free functions creating bind groups
 // (called both from GpuState::new and GpuState::rebuild_bind_groups)
 // ---------------------------------------------------------------------------
@@ -1855,6 +1668,7 @@ fn make_display_bind_groups(
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_compute_bind_groups(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
@@ -1872,65 +1686,66 @@ fn make_compute_bind_groups(
     emissive_buffer: &wgpu::Buffer,
     gbuffer_view: &wgpu::TextureView,
 ) -> [wgpu::BindGroup; 2] {
+    use crate::gpu_layout::*;
     let make = |write_view: &wgpu::TextureView, read_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some(label),
             layout,
             entries: &[
                 BindGroupEntry {
-                    binding: 0,
+                    binding: BINDING_ACCUM_WRITE,
                     resource: BindingResource::TextureView(write_view),
                 },
                 BindGroupEntry {
-                    binding: 1,
+                    binding: BINDING_CAMERA,
                     resource: camera_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 2,
+                    binding: BINDING_SPHERES,
                     resource: sphere_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 3,
+                    binding: BINDING_ACCUM_READ,
                     resource: BindingResource::TextureView(read_view),
                 },
                 BindGroupEntry {
-                    binding: 4,
+                    binding: BINDING_MATERIALS,
                     resource: material_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 5,
+                    binding: BINDING_SPHERE_BVH,
                     resource: bvh_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 6,
+                    binding: BINDING_VERTICES,
                     resource: vertex_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 7,
+                    binding: BINDING_TRIANGLES,
                     resource: triangle_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 8,
+                    binding: BINDING_MESH_BVH,
                     resource: mesh_bvh_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 9,
+                    binding: BINDING_TEX_SAMPLER,
                     resource: BindingResource::Sampler(tex_sampler),
                 },
                 BindGroupEntry {
-                    binding: 10,
+                    binding: BINDING_ALBEDO_TEX,
                     resource: BindingResource::TextureView(albedo_tex_view),
                 },
                 BindGroupEntry {
-                    binding: 11,
+                    binding: BINDING_ENV_MAP,
                     resource: BindingResource::TextureView(env_map_view),
                 },
                 BindGroupEntry {
-                    binding: 12,
+                    binding: BINDING_EMISSIVES,
                     resource: emissive_buffer.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 13,
+                    binding: BINDING_GBUFFER,
                     resource: BindingResource::TextureView(gbuffer_view),
                 },
             ],
@@ -1953,7 +1768,9 @@ fn make_denoise_bind_groups(
     accum_views: &[wgpu::TextureView; 2],
     gbuffer_view: &wgpu::TextureView,
     denoise_output_view: &wgpu::TextureView,
+    denoise_params_buffer: &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
+    use crate::gpu_layout::BINDING_DENOISE_PARAMS;
     let make = |accum_view: &wgpu::TextureView, label: &str| {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some(label),
@@ -1970,6 +1787,10 @@ fn make_denoise_bind_groups(
                 BindGroupEntry {
                     binding: 2,
                     resource: BindingResource::TextureView(denoise_output_view),
+                },
+                BindGroupEntry {
+                    binding: BINDING_DENOISE_PARAMS,
+                    resource: denoise_params_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -2003,33 +1824,37 @@ fn make_display_bg_denoised(
 // Phase 15: egui UI panel
 // ---------------------------------------------------------------------------
 
-/// Build the right-side egui panel for the current frame.
-///
-/// Returns `(camera_changed, materials_changed, save_screenshot_requested)`.
-/// Returning `true` for either of the first two causes the accumulation buffer
-/// to reset so the path tracer re-converges from the updated parameters.
-///
-/// This is a free function (not a method) so the borrow checker can split
-/// `GpuState` fields; `egui::Context::run` holds an immutable borrow on
-/// `egui_ctx` while the closure takes mutable borrows on other fields.
-fn build_ui_panels(
-    ctx: &egui::Context,
-    camera: &mut CameraState,
-    denoise_enabled: &mut bool,
-    material_data: &mut GpuMaterialData,
-    material_names: &[String],
-    width: u32,
-    height: u32,
-    frame_count: u32,
-    fps: f32,
-) -> (bool, bool, bool) {
-    use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};
+impl UiState {
+    /// Build the right-side egui panel for the current frame.
+    ///
+    /// Returns `(camera_changed, materials_changed, save_screenshot_requested)`.
+    /// Returning `true` for either of the first two causes the accumulation buffer
+    /// to reset so the path tracer re-converges from the updated parameters.
+    ///
+    /// `egui::Context::run` holds a borrow on the cloned `egui_ctx` from render();
+    /// passing `ctx` in here lets this method mutably borrow `self` (UiState) and
+    /// `camera` (from cam_ctrl) at the same time without conflict.
+    fn build_panels(
+        &mut self,
+        ctx: &egui::Context,
+        camera: &mut CameraState,
+        stats: &RenderStats,
+    ) -> (bool, bool, bool) {
+        let denoise_enabled = &mut self.denoise_enabled;
+        let dp = &mut self.denoise_params;
+        let material_data = &mut self.material_data_cpu;
+        let material_names = &self.material_names;
+        let width = stats.width;
+        let height = stats.height;
+        let frame_count = stats.frame_count;
+        let fps = self.fps_smooth;
+        use crate::material::{MAT_DIELECTRIC, MAT_EMISSIVE, MAT_LAMBERTIAN, MAT_METAL};
 
-    let mut cam_changed = false;
-    let mut mat_changed = false;
-    let mut save_request = false;
+        let mut cam_changed = false;
+        let mut mat_changed = false;
+        let mut save_request = false;
 
-    egui::SidePanel::right("mcrt_panel")
+        egui::SidePanel::right("mcrt_panel")
         .resizable(true)
         .min_width(240.0)
         .default_width(270.0)
@@ -2070,6 +1895,30 @@ fn build_ui_panels(
                         "Denoiser: {} (UI)",
                         if *denoise_enabled { "ON" } else { "OFF" }
                     );
+                }
+                if *denoise_enabled {
+                    ui.add_space(2.0);
+                    egui::Grid::new("denoise_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.label("Radius (px):");
+                            ui.add(egui::Slider::new(&mut dp.radius, 1..=8));
+                            ui.end_row();
+                            ui.label("σ spatial:");
+                            ui.add(
+                                egui::Slider::new(&mut dp.sigma_s, 0.1..=10.0).step_by(0.1),
+                            );
+                            ui.end_row();
+                            ui.label("σ depth:");
+                            ui.add(
+                                egui::Slider::new(&mut dp.sigma_d, 0.01..=5.0).step_by(0.01),
+                            );
+                            ui.end_row();
+                            ui.label("Normal pow:");
+                            ui.add(egui::Slider::new(&mut dp.normal_pow, 1.0..=32.0));
+                            ui.end_row();
+                        });
                 }
                 ui.add_space(4.0);
                 if ui.button("💾  Save PNG").clicked() {
@@ -2179,7 +2028,8 @@ fn build_ui_panels(
             });
         });
 
-    (cam_changed, mat_changed, save_request)
+        (cam_changed, mat_changed, save_request)
+    }
 }
 
 // ---------------------------------------------------------------------------

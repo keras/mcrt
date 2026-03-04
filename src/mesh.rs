@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(result.ordered_triangles.len(), tris.len());
         assert!(!result.nodes.is_empty());
         // Node count bound: ≤ 2n − 1.
-        assert!(result.nodes.len() <= 2 * tris.len() - 1);
+        assert!(result.nodes.len() < 2 * tris.len());
     }
 
     #[test]
@@ -992,7 +992,7 @@ mod tests {
         let f = 1.0 / a;
         let s = [o[0] - p0[0], o[1] - p0[1], o[2] - p0[2]];
         let u = f * (s[0] * h[0] + s[1] * h[1] + s[2] * h[2]);
-        if u < 0.0 || u > 1.0 {
+        if !(0.0..=1.0).contains(&u) {
             return None;
         }
         let q = cross3(s, e1);

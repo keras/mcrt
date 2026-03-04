@@ -317,6 +317,76 @@ fn ray_triangle_uvt(r: Ray, v0: vec3<f32>, v1: vec3<f32>, v2: vec3<f32>,
 }
 
 // ---------------------------------------------------------------------------
+// BVH traversal helpers — shared stack/AABB DFS logic
+//
+// WGSL does not support ptr<storage> parameters or generic functions, so we
+// cannot write a single traversal helper that works with both sphere_bvh and
+// mesh_bvh.  Instead, each BVH gets its own `*_next_leaf` helper that shares
+// identical stack-management code.  Bug fixes to the DFS or AABB test only
+// need to be applied to the two ~10-line helpers, not to both full hit
+// functions.
+//
+// Both helpers:
+//   • Pop nodes from the stack and AABB-cull with the caller's current t_max.
+//   • On finding a leaf (prim_count > 0) they return the node index so the
+//     caller can test its primitives.
+//   • On finding an internal node they push right then left child (DFS order).
+//   • Return 0xFFFFFFFFu when the stack is exhausted (traversal complete).
+//
+// Because t_max is passed by value the caller must re-pass its updated t_max
+// after recording a closer hit — this ensures subsequent AABB tests cull more
+// aggressively and mirrors the original in-loop t_max shrinkage.
+// ---------------------------------------------------------------------------
+
+/// Advance the sphere BVH stack to the next leaf node.
+/// Returns the node index, or 0xFFFFFFFFu when traversal is complete.
+fn sphere_bvh_next_leaf(
+    r:     Ray,
+    t_min: f32,
+    t_max: f32,
+    stack: ptr<function, array<u32, 64>>,
+    top:   ptr<function, u32>,
+) -> u32 {
+    while *top > 0u {
+        *top -= 1u;
+        let ni   = (*stack)[*top];
+        let node = sphere_bvh[ni];
+        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, t_max) { continue; }
+        if node.prim_count > 0u { return ni; }
+        // Push right child first so left child (ni+1) is visited first (DFS).
+        // Guard: BVH depth for N prims is ⌈log₂ N⌉ ≪ 64; overflow is unreachable.
+        if *top + 2u <= BVH_STACK_SIZE {
+            (*stack)[*top] = node.right_or_offset; *top += 1u;
+            (*stack)[*top] = ni + 1u;              *top += 1u;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+/// Advance the mesh BVH stack to the next leaf node.
+/// Returns the node index, or 0xFFFFFFFFu when traversal is complete.
+fn mesh_bvh_next_leaf(
+    r:     Ray,
+    t_min: f32,
+    t_max: f32,
+    stack: ptr<function, array<u32, 64>>,
+    top:   ptr<function, u32>,
+) -> u32 {
+    while *top > 0u {
+        *top -= 1u;
+        let ni   = (*stack)[*top];
+        let node = mesh_bvh[ni];
+        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, t_max) { continue; }
+        if node.prim_count > 0u { return ni; }
+        if *top + 2u <= BVH_STACK_SIZE {
+            (*stack)[*top] = node.right_or_offset; *top += 1u;
+            (*stack)[*top] = ni + 1u;              *top += 1u;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
+// ---------------------------------------------------------------------------
 // BVH traversal — sphere BVH (binding 5)
 // ---------------------------------------------------------------------------
 
@@ -325,31 +395,18 @@ fn sphere_bvh_hit(r: Ray, t_min: f32, t_max_in: f32) -> HitRecord {
     best.t = -1.0;
     if arrayLength(&sphere_bvh) == 0u { return best; }
 
-    var t_max: f32 = t_max_in;
+    var t_max = t_max_in;
     var stack: array<u32, 64>;
-    var top: u32 = 0u;
-    stack[top] = 0u;
-    top += 1u;
+    var top = 0u;
+    stack[top] = 0u; top += 1u;
 
-    while top > 0u {
-        top -= 1u;
-        let ni   = stack[top];
-        let node = sphere_bvh[ni];
-        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, t_max) { continue; }
-
-        if node.prim_count > 0u {
-            for (var j = 0u; j < node.prim_count; j += 1u) {
-                let hit = ray_sphere_hit(
-                    r, spheres[node.right_or_offset + j], t_min, t_max);
-                if hit.t > 0.0 { best = hit; t_max = hit.t; }
-            }
-        } else if top + 2u <= BVH_STACK_SIZE {
-            // Push right child first so left child (node+1) is popped/visited first (DFS).
-            // Guard ensures two writes land within [0, BVH_STACK_SIZE-1].
-            // BVH depth for N primitives is ⌈log₂ N⌉ ≪ 64; this branch is
-            // effectively unreachable for all practical scenes.
-            stack[top] = node.right_or_offset; top += 1u;
-            stack[top] = ni + 1u;              top += 1u;
+    loop {
+        let leaf_ni = sphere_bvh_next_leaf(r, t_min, t_max, &stack, &top);
+        if leaf_ni == 0xFFFFFFFFu { break; }
+        let node = sphere_bvh[leaf_ni];
+        for (var j = 0u; j < node.prim_count; j += 1u) {
+            let hit = ray_sphere_hit(r, spheres[node.right_or_offset + j], t_min, t_max);
+            if hit.t > 0.0 { best = hit; t_max = hit.t; }
         }
     }
     return best;
@@ -364,55 +421,44 @@ fn mesh_bvh_hit(r: Ray, t_min: f32, t_max_in: f32) -> HitRecord {
     best.t = -1.0;
     if arrayLength(&mesh_bvh) == 0u { return best; }
 
-    var t_max: f32 = t_max_in;
+    var t_max = t_max_in;
     var stack: array<u32, 64>;
-    var top: u32 = 0u;
-    stack[top] = 0u;
-    top += 1u;
+    var top = 0u;
+    stack[top] = 0u; top += 1u;
 
-    while top > 0u {
-        top -= 1u;
-        let ni   = stack[top];
-        let node = mesh_bvh[ni];
-        if !ray_aabb_hit(r, node.aabb_min.xyz, node.aabb_max.xyz, t_min, t_max) { continue; }
-
-        if node.prim_count > 0u {
-            for (var j = 0u; j < node.prim_count; j += 1u) {
-                let tri = triangles[node.right_or_offset + j];
-                let va  = vertices[tri.v0];
-                let vb  = vertices[tri.v1];
-                let vc  = vertices[tri.v2];
-                // Bit 31 of mat_idx carries the backface-cull flag set by
-                // scene.rs (BACKFACE_CULL_FLAG = 1u32 << 31).
-                // Strip it before any material-table lookup.
-                let backface_cull = (tri.mat_idx >> 31u) != 0u;
-                let clean_mat_idx = tri.mat_idx & 0x7FFFFFFFu;
-                let res = ray_triangle_uvt(
-                    r, va.position.xyz, vb.position.xyz, vc.position.xyz, t_min, t_max);
-                if res.x > 0.0 {
-                    let t = res.x;
-                    let u = res.y;
-                    let v = res.z;
-                    let w = 1.0 - u - v;
-                    // Barycentric interpolation of normal and UV.
-                    let n = normalize(w * va.normal.xyz + u * vb.normal.xyz + v * vc.normal.xyz);
-                    let front = dot(r.dir, n) < 0.0;
-                    // Skip back-face hits when culling is requested.
-                    if backface_cull && !front { continue; }
-                    var hit: HitRecord;
-                    hit.t          = t;
-                    hit.point      = r.origin + t * r.dir;
-                    hit.normal     = select(-n, n, front);
-                    hit.front_face = front;
-                    hit.mat_index  = clean_mat_idx;
-                    hit.uv         = w * va.uv.xy + u * vb.uv.xy + v * vc.uv.xy;
-                    best = hit; t_max = t;
-                }
+    loop {
+        let leaf_ni = mesh_bvh_next_leaf(r, t_min, t_max, &stack, &top);
+        if leaf_ni == 0xFFFFFFFFu { break; }
+        let node = mesh_bvh[leaf_ni];
+        for (var j = 0u; j < node.prim_count; j += 1u) {
+            let tri = triangles[node.right_or_offset + j];
+            let va  = vertices[tri.v0];
+            let vb  = vertices[tri.v1];
+            let vc  = vertices[tri.v2];
+            // Bit 31 of mat_idx carries the backface-cull flag set by
+            // scene.rs (BACKFACE_CULL_FLAG = 1u32 << 31).
+            let backface_cull = (tri.mat_idx >> 31u) != 0u;
+            let clean_mat_idx = tri.mat_idx & 0x7FFFFFFFu;
+            let res = ray_triangle_uvt(
+                r, va.position.xyz, vb.position.xyz, vc.position.xyz, t_min, t_max);
+            if res.x > 0.0 {
+                let t = res.x;
+                let u = res.y;
+                let v = res.z;
+                let w = 1.0 - u - v;
+                // Barycentric interpolation of normal and UV.
+                let n = normalize(w * va.normal.xyz + u * vb.normal.xyz + v * vc.normal.xyz);
+                let front = dot(r.dir, n) < 0.0;
+                if backface_cull && !front { continue; }
+                var hit: HitRecord;
+                hit.t          = t;
+                hit.point      = r.origin + t * r.dir;
+                hit.normal     = select(-n, n, front);
+                hit.front_face = front;
+                hit.mat_index  = clean_mat_idx;
+                hit.uv         = w * va.uv.xy + u * vb.uv.xy + v * vc.uv.xy;
+                best = hit; t_max = t;
             }
-        } else if top + 2u <= BVH_STACK_SIZE {
-            // Same safe-push guard as sphere_bvh_hit above.
-            stack[top] = node.right_or_offset; top += 1u;
-            stack[top] = ni + 1u;              top += 1u;
         }
     }
     return best;

@@ -22,6 +22,7 @@ use wgpu::*;
 
 use crate::bvh::{GpuBvhNode, build_bvh};
 use crate::camera::{CameraUniform, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
+use crate::gpu_layout::{self, *};
 use crate::material::GpuMaterialData;
 use crate::mesh::{GpuTriangle, GpuVertex, build_mesh_bvh};
 use crate::scene::{GpuSphere, load_scene_from_yaml};
@@ -383,162 +384,8 @@ pub fn run(
         ..Default::default()
     });
 
-    // --- compute bind group layout (must match gpu.rs / path_trace.wgsl) ---
-    let compute_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("compute bgl"),
-        entries: &[
-            // 0: accum write target (storage texture, write-only)
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::StorageTexture {
-                    access: StorageTextureAccess::WriteOnly,
-                    format: TextureFormat::Rgba32Float,
-                    view_dimension: TextureViewDimension::D2,
-                },
-                count: None,
-            },
-            // 1: camera uniform
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<CameraUniform>() as u64),
-                },
-                count: None,
-            },
-            // 2: sphere list (storage, read-only)
-            BindGroupLayoutEntry {
-                binding: 2,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuSphere>() as u64),
-                },
-                count: None,
-            },
-            // 3: previous-frame accum (texture read via textureLoad)
-            BindGroupLayoutEntry {
-                binding: 3,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            // 4: material descriptors uniform
-            BindGroupLayoutEntry {
-                binding: 4,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuMaterialData>() as u64),
-                },
-                count: None,
-            },
-            // 5: sphere BVH node array
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuBvhNode>() as u64),
-                },
-                count: None,
-            },
-            // 6: mesh vertex buffer
-            BindGroupLayoutEntry {
-                binding: 6,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuVertex>() as u64),
-                },
-                count: None,
-            },
-            // 7: mesh triangle index buffer
-            BindGroupLayoutEntry {
-                binding: 7,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuTriangle>() as u64),
-                },
-                count: None,
-            },
-            // 8: mesh BVH node array
-            BindGroupLayoutEntry {
-                binding: 8,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuBvhNode>() as u64),
-                },
-                count: None,
-            },
-            // 9: linear sampler for albedo texture array
-            BindGroupLayoutEntry {
-                binding: 9,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                count: None,
-            },
-            // 10: albedo 2D texture array (RGBA8 Unorm sRGB, MAX_TEXTURES layers)
-            BindGroupLayoutEntry {
-                binding: 10,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D2Array,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            // 11: HDR environment map (Rgba32Float, non-filterable)
-            BindGroupLayoutEntry {
-                binding: 11,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            // 12: emissive sphere list for NEE
-            BindGroupLayoutEntry {
-                binding: 12,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size_of::<GpuSphere>() as u64),
-                },
-                count: None,
-            },
-            // 13: G-buffer write target (normal.xyz + depth.w)
-            BindGroupLayoutEntry {
-                binding: 13,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::StorageTexture {
-                    access: StorageTextureAccess::WriteOnly,
-                    format: TextureFormat::Rgba32Float,
-                    view_dimension: TextureViewDimension::D2,
-                },
-                count: None,
-            },
-        ],
-    });
+    // --- compute bind group layout (single source of truth in gpu_layout) ---
+    let compute_bgl = gpu_layout::make_compute_bgl(&device);
 
     // --- compute pipeline --------------------------------------------------
     let compute_shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -570,59 +417,59 @@ pub fn run(
                 layout: &compute_bgl,
                 entries: &[
                     BindGroupEntry {
-                        binding: 0,
+                        binding: BINDING_ACCUM_WRITE,
                         resource: BindingResource::TextureView(write_view),
                     },
                     BindGroupEntry {
-                        binding: 1,
+                        binding: BINDING_CAMERA,
                         resource: camera_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 2,
+                        binding: BINDING_SPHERES,
                         resource: sphere_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 3,
+                        binding: BINDING_ACCUM_READ,
                         resource: BindingResource::TextureView(read_view),
                     },
                     BindGroupEntry {
-                        binding: 4,
+                        binding: BINDING_MATERIALS,
                         resource: material_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 5,
+                        binding: BINDING_SPHERE_BVH,
                         resource: bvh_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 6,
+                        binding: BINDING_VERTICES,
                         resource: vertex_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 7,
+                        binding: BINDING_TRIANGLES,
                         resource: triangle_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 8,
+                        binding: BINDING_MESH_BVH,
                         resource: mesh_bvh_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 9,
+                        binding: BINDING_TEX_SAMPLER,
                         resource: BindingResource::Sampler(&tex_sampler),
                     },
                     BindGroupEntry {
-                        binding: 10,
+                        binding: BINDING_ALBEDO_TEX,
                         resource: BindingResource::TextureView(&albedo_tex_view),
                     },
                     BindGroupEntry {
-                        binding: 11,
+                        binding: BINDING_ENV_MAP,
                         resource: BindingResource::TextureView(&env_map_view),
                     },
                     BindGroupEntry {
-                        binding: 12,
+                        binding: BINDING_EMISSIVES,
                         resource: emissive_buffer.as_entire_binding(),
                     },
                     BindGroupEntry {
-                        binding: 13,
+                        binding: BINDING_GBUFFER,
                         resource: BindingResource::TextureView(&gbuffer_view),
                     },
                 ],
@@ -789,10 +636,10 @@ pub fn run(
 
     // --- write PNG ---------------------------------------------------------
     // Ensure the output directory exists.
-    if let Some(parent) = Path::new(&output_path).parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = Path::new(&output_path).parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     let img = image::RgbaImage::from_raw(width, height, pixels)

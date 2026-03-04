@@ -18,6 +18,7 @@ mod app;
 mod bvh;
 mod camera;
 mod gpu;
+mod gpu_layout;
 mod headless;
 mod material;
 mod mesh;

@@ -253,7 +253,7 @@ fn make_path_trace_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     })
 }
 
-/// Recreates the 3-entry bind-group layout used by the denoiser pass.
+/// Recreates the 4-entry bind-group layout used by the denoiser pass.
 fn make_denoise_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
     device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("denoise bgl (test)"),
@@ -288,6 +288,17 @@ fn make_denoise_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
                     access: StorageTextureAccess::WriteOnly,
                     format: TextureFormat::Rgba32Float,
                     view_dimension: TextureViewDimension::D2,
+                },
+                count: None,
+            },
+            // 3: DenoiseParams uniform buffer (runtime-tunable knobs, TD-5)
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
                 },
                 count: None,
             },
@@ -332,7 +343,7 @@ fn wgpu_path_trace_pipeline_creation() {
     });
 }
 
-/// Verifies that the denoiser shader compiles with its 3-binding layout.
+/// Verifies that the denoiser shader compiles with its 4-binding layout (TD-5 adds params uniform).
 ///
 /// Skips if no wgpu adapter is available.
 #[test]

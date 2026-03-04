@@ -48,7 +48,7 @@ pub struct GpuMaterial {
 /// The 16-byte header packs two logical fields plus two padding words:
 /// - `mat_count`  : number of active materials (≤ MAX_MATERIALS)
 /// - `n_emissive` : number of emissive spheres in the companion `emissive_buffer`
-///                  (Phase 13); `0` disables Next-Event Estimation in the shader.
+///   (Phase 13); `0` disables Next-Event Estimation in the shader.
 ///
 /// Size = 16 + [`MAX_MATERIALS`] × 48 = 3088 bytes.
 #[repr(C)]

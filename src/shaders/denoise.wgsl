@@ -7,7 +7,7 @@
 //
 // Weight for neighbour q relative to centre pixel p:
 //   w = exp(−‖p−q‖² / (2·σ_s²))        [spatial Gaussian]
-//     × max(0, dot(n_p, n_q))^NORMAL_POW [normal similarity]
+//     × max(0, dot(n_p, n_q))^normal_pow [normal similarity]
 //     × exp(−(d_p−d_q)² / (2·σ_d²))     [depth proximity]
 //
 // Sky pixels (depth == −1) are blended only with other sky pixels, which
@@ -15,21 +15,20 @@
 //
 // Dispatch: same 16×16 workgroup grid as the path tracer.
 
-// ---- tuneable constants ---------------------------------------------------
+// ---- runtime-tunable parameters (TD-5: uniform buffer, binding 3) ---------
 
-/// Half-kernel radius in pixels.  Total tap count = (2R+1)² = 49 for R=3.
-const RADIUS: i32     = 3;
-
-/// Spatial Gaussian sigma (pixels).
-const SIGMA_S: f32    = 2.0;
-
-/// Depth similarity sigma (world units).  Neighbours more than ~σ_d away in
-/// depth receive strongly attenuated weight, preserving depth discontinuities.
-const SIGMA_D: f32    = 0.5;
-
-/// Exponent for the normal dot-product weight factor.
-/// Higher value = sharper edge preservation (cos(θ)^8 ≈ 0 for θ > 45°).
-const NORMAL_POW: f32 = 8.0;
+/// Denoiser knobs uploaded from the CPU each frame.
+/// Mirrors `DenoiseParams` in gpu.rs (repr(C), std140, 16 bytes).
+struct DenoiseParams {
+    /// Half-kernel radius in pixels.  Total tap count = (2R+1)².
+    radius:     i32,
+    /// Spatial Gaussian sigma (pixels).
+    sigma_s:    f32,
+    /// Depth similarity sigma (world units).
+    sigma_d:    f32,
+    /// Exponent for the normal dot-product weight factor.
+    normal_pow: f32,
+}
 
 // ---- bindings -------------------------------------------------------------
 
@@ -44,6 +43,9 @@ const NORMAL_POW: f32 = 8.0;
 
 /// Denoised output (write-only; read by the display pass when denoising is on).
 @group(0) @binding(2) var out_tex   : texture_storage_2d<rgba32float, write>;
+
+/// Runtime-tunable denoiser parameters.
+@group(0) @binding(3) var<uniform> dp: DenoiseParams;
 
 // ---- denoiser kernel ------------------------------------------------------
 
@@ -60,14 +62,14 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>) {
     let on_sky = d_p < 0.0;
 
     // Pre-compute constant denominators for the Gaussian exponents.
-    let inv2ss = 1.0 / (2.0 * SIGMA_S * SIGMA_S);
-    let inv2ds = 1.0 / (2.0 * SIGMA_D * SIGMA_D);
+    let inv2ss = 1.0 / (2.0 * dp.sigma_s * dp.sigma_s);
+    let inv2ds = 1.0 / (2.0 * dp.sigma_d * dp.sigma_d);
 
     var color_acc:  vec3<f32> = vec3<f32>(0.0);
     var weight_acc: f32       = 0.0;
 
-    for (var dy = -RADIUS; dy <= RADIUS; dy++) {
-        for (var dx = -RADIUS; dx <= RADIUS; dx++) {
+    for (var dy = -dp.radius; dy <= dp.radius; dy++) {
+        for (var dx = -dp.radius; dx <= dp.radius; dx++) {
             // Clamp neighbour address to valid pixel range (border duplication).
             let q = clamp(p + vec2<i32>(dx, dy),
                           vec2<i32>(0),
@@ -86,10 +88,10 @@ fn cs_denoise(@builtin(global_invocation_id) gid: vec3<u32>) {
             let dist_sq = f32(dx * dx + dy * dy);
             let w_s     = exp(-dist_sq * inv2ss);
 
-            // Normal similarity: cos(θ)^NORMAL_POW — falls to ~0 for θ > 45°.
+            // Normal similarity: cos(θ)^normal_pow — falls to ~0 for θ > 45°.
             // Only applied to surface pixels (sky has no meaningful normal).
             let w_n = select(1.0,
-                             pow(max(0.0, dot(n_p, n_q)), NORMAL_POW),
+                             pow(max(0.0, dot(n_p, n_q)), dp.normal_pow),
                              !on_sky);
 
             // Depth proximity (relative formulation, surface pixels only).
