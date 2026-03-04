@@ -95,9 +95,9 @@ fn is_up_to_date(current_png: &Path, scene_yaml: &Path, binary: &Path) -> bool {
         return false; // PNG does not exist
     };
     let sidecar = scene_yaml.with_extension("").with_extension("test.toml");
-    let yaml_mtime    = mtime(scene_yaml).unwrap_or(SystemTime::UNIX_EPOCH);
+    let yaml_mtime = mtime(scene_yaml).unwrap_or(SystemTime::UNIX_EPOCH);
     let sidecar_mtime = mtime(&sidecar).unwrap_or(SystemTime::UNIX_EPOCH);
-    let bin_mtime     = mtime(binary).unwrap_or_else(SystemTime::now);
+    let bin_mtime = mtime(binary).unwrap_or_else(SystemTime::now);
     png_mtime > yaml_mtime && png_mtime > sidecar_mtime && png_mtime > bin_mtime
 }
 
@@ -117,7 +117,10 @@ fn render_scene(
     render: &RenderSection,
 ) -> Result<(), String> {
     let mut cmd = std::process::Command::new(binary);
-    cmd.arg("--headless").arg(scene_yaml).arg("--output").arg(output);
+    cmd.arg("--headless")
+        .arg(scene_yaml)
+        .arg("--output")
+        .arg(output);
     if let Some(w) = render.width {
         cmd.arg("--width").arg(w.to_string());
     }
@@ -227,8 +230,8 @@ fn regression_suite() {
     let force = std::env::var("MCRT_REGRESSION_FORCE")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
-    let diff_dir = std::env::var("MCRT_REGRESSION_DIFF_DIR")
-        .unwrap_or_else(|_| DEFAULT_DIFF_DIR.to_string());
+    let diff_dir =
+        std::env::var("MCRT_REGRESSION_DIFF_DIR").unwrap_or_else(|_| DEFAULT_DIFF_DIR.to_string());
 
     let baseline_dir = PathBuf::from(&baseline_str);
     let current_dir = PathBuf::from(&current_str);
@@ -294,13 +297,13 @@ fn regression_suite() {
 
         // (b) No current render — GPU unavailable or earlier render failed.
         if !current_png.exists() {
-            println!("[SKIP   ] {} — current PNG absent (render failed?)", scene.stem);
+            println!(
+                "[SKIP   ] {} — current PNG absent (render failed?)",
+                scene.stem
+            );
             rows.push(SummaryRow {
                 stem: scene.stem.clone(),
-                result: SceneResult::SkipNoRender(format!(
-                    "`{}` absent",
-                    current_png.display()
-                )),
+                result: SceneResult::SkipNoRender(format!("`{}` absent", current_png.display())),
             });
             continue;
         }
@@ -351,11 +354,7 @@ fn regression_suite() {
             let _ = std::fs::create_dir_all(&diff_path);
             let diff_png = diff_path.join(format!("{}_diff.png", scene.stem));
             match write_diff_image(&img_baseline, &img_current, &diff_png, 4.0) {
-                Ok(()) => println!(
-                    "[FAIL   ] {} — diff → {}",
-                    scene.stem,
-                    diff_png.display()
-                ),
+                Ok(()) => println!("[FAIL   ] {} — diff → {}", scene.stem, diff_png.display()),
                 Err(e) => println!("[FAIL   ] {} (diff write error: {e})", scene.stem),
             }
             let reason = build_fail_reason(&diff, &thresholds, mse_fail, psnr_fail);
@@ -388,9 +387,9 @@ fn regression_suite() {
         .filter_map(|r| match &r.result {
             // IoError is a hard failure: a corrupted or unreadable PNG must not
             // silently pass the suite.
-            SceneResult::Fail { .. }
-            | SceneResult::DimMismatch(_)
-            | SceneResult::IoError(_) => Some(r.stem.as_str()),
+            SceneResult::Fail { .. } | SceneResult::DimMismatch(_) | SceneResult::IoError(_) => {
+                Some(r.stem.as_str())
+            }
             _ => None,
         })
         .collect();
