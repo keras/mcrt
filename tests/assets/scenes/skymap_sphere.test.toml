@@ -6,9 +6,9 @@
 # threshold to match.
 
 [render]
-width  = 128
-height = 128
-spp    = 128         # env-map scenes converge more slowly
+width  = 256
+height = 256
+spp    = 128
 
 [regression]
 threshold_mse  = 0.003   # slightly looser than direct-light scenes

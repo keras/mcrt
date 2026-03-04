@@ -2,9 +2,9 @@
 # Regression-test parameters for mirror_sphere.yaml.
 
 [render]
-width  = 128
-height = 128
-spp    = 64          # samples per pixel
+width  = 256
+height = 256
+spp    = 256          # samples per pixel
 
 [regression]
 threshold_mse  = 0.002   # mean squared error (linear, 0-1 range)
