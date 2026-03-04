@@ -2,10 +2,10 @@
 #
 # Regression test scene: area-light emission + soft shadows.
 #
-# A small white room lit exclusively by a warm emissive ceiling panel.
+# A small room lit exclusively by a warm emissive ceiling panel.
 # There is no other light source and no env_map, so all illumination comes
 # from the single area light — directly testing the emissive sampling and
-# soft-shadow code paths.  A single white diffuse box sits on the floor to
+# soft-shadow code paths.  A single blue diffuse box sits on the floor to
 # cast a soft shadow.
 #
 # NOTE: Emission-only scenes converge slowly, so the sidecar requests
@@ -22,10 +22,22 @@ materials:
     type: lambertian
     albedo: [0.73, 0.73, 0.73]
 
+  box:
+    type: lambertian
+    albedo: [0.3, 0.3, 0.73]
+
+  left:
+    type: lambertian
+    albedo: [0.73, 0.3, 0.3]
+
+  right:
+    type: lambertian
+    albedo: [0.3, 0.73, 0.3]
+
   ceiling_light:
     type: emissive
     albedo:            [1.0, 0.95, 0.85]
-    emission_strength: 80.0
+    emission_strength: 8.0
 
 objects:
   # Floor (y = 0, normal up).
@@ -59,7 +71,7 @@ objects:
   - type: plane
     normal:        [1.0, 0.0, 0.0]
     half_extents:  [4, 4]
-    material:      white
+    material:      left
     backface_culling: true
     transform:
       translate: [-4.0, 3.5, 0.0]
@@ -68,7 +80,7 @@ objects:
   - type: plane
     normal:        [-1.0, 0.0, 0.0]
     half_extents:  [4, 4]
-    material:      white
+    material:      right
     backface_culling: true
     transform:
       translate: [4.0, 3.5, 0.0]
@@ -94,7 +106,7 @@ objects:
   # Small white box on the floor — casts a soft shadow.
   - type: box
     half_extents: [0.8, 0.8, 0.8]
-    material:     white
+    material:     box
     transform:
       translate: [0.0, 0.8, -1.5]
       rotate:    [0.0, 20.0, 0.0]
