@@ -12,11 +12,13 @@
 //              (Phase 11 textures & environment maps)
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
+//   headless — Phase RT-2: offline PNG renderer (no window, deterministic)
 
 mod app;
 mod bvh;
 mod camera;
 mod gpu;
+mod headless;
 mod material;
 mod mesh;
 mod scene;
@@ -30,23 +32,53 @@ const DEFAULT_SCENE: &str = "assets/scene.yaml";
 fn main() {
     env_logger::init();
 
-    // Parse optional `--load-scene-yaml <path>` argument.
-    let scene_path = {
-        let mut args = std::env::args().skip(1);
-        let mut path = None;
-        while let Some(arg) = args.next() {
-            if arg == "--load-scene-yaml" {
-                path = args.next().or_else(|| {
-                    eprintln!("error: --load-scene-yaml requires a file path argument");
-                    std::process::exit(1);
-                });
-                break;
-            }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // -----------------------------------------------------------------------
+    // Headless mode: --headless <scene.yaml> --output <out.png>
+    //                           [--width W] [--height H] [--spp N]
+    //
+    // Detected before the EventLoop is created so no windowing system is
+    // initialised at all.
+    // -----------------------------------------------------------------------
+    if args.contains(&"--headless".to_string()) {
+        let scene = get_next_after(&args, "--headless").unwrap_or_else(|| {
+            eprintln!("error: --headless requires a scene YAML path");
+            std::process::exit(1);
+        });
+        let output = get_next_after(&args, "--output").unwrap_or_else(|| {
+            eprintln!("error: --headless mode requires --output <path>");
+            std::process::exit(1);
+        });
+        let width: Option<u32> = get_next_after(&args, "--width")
+            .and_then(|s| s.parse().ok());
+        let height: Option<u32> = get_next_after(&args, "--height")
+            .and_then(|s| s.parse().ok());
+        let spp: Option<u32> = get_next_after(&args, "--spp")
+            .and_then(|s| s.parse().ok());
+
+        if let Err(e) = headless::run(scene, output, width, height, spp) {
+            eprintln!("headless render failed: {e}");
+            std::process::exit(1);
         }
-        path.unwrap_or_else(|| DEFAULT_SCENE.to_string())
-    };
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // Windowed (interactive) mode.
+    // -----------------------------------------------------------------------
+    let scene_path = get_next_after(&args, "--load-scene-yaml")
+        .unwrap_or_else(|| DEFAULT_SCENE.to_string());
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let mut app = app::App::new(scene_path);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+/// Return the argument immediately following `flag` in `args`, or `None`.
+fn get_next_after(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }

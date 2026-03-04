@@ -220,7 +220,7 @@ threshold_psnr = 36.0
 - [x] Author `tests/assets/scenes/skymap_sphere.yaml` and its sidecar
   `skymap_sphere.test.toml`.
 - [x] Add the new scene to `tests/assets/scenes/README.md`.
-- [ ] Verify visually: open the scene in the interactive renderer and confirm
+- [x] Verify visually: open the scene in the interactive renderer and confirm
   the sky gradient and sun highlight are visible on the sphere.
 
 **Output:** `tmp/regression/skyboxes/test_sky.hdr` (generated, git-ignored),
@@ -263,21 +263,21 @@ if neither is provided.
 
 ### Tasks
 
-- [ ] Audit the current render pipeline to identify which parts are
+- [x] Audit the current render pipeline to identify which parts are
   `winit`/surface-dependent and which are purely compute.
-- [ ] Design a `HeadlessRenderer` struct that holds the wgpu device/queue and
+- [x] Design a `HeadlessRenderer` struct that holds the wgpu device/queue and
   the compute + display pipelines but owns a plain `wgpu::Texture` instead of
   a swapchain surface.
-- [ ] Implement the `--headless` CLI flag in `main.rs`; parse width, height,
+- [x] Implement the `--headless` CLI flag in `main.rs`; parse width, height,
   and SPP overrides.
-- [ ] Implement sidecar `.test.toml` discovery and parsing (look for
+- [x] Implement sidecar `.test.toml` discovery and parsing (look for
   `<scene_stem>.test.toml` next to the scene YAML).
-- [ ] Implement the accumulation loop: dispatch the path-trace compute shader
+- [x] Implement the accumulation loop: dispatch the path-trace compute shader
   `spp` times, accumulating into the existing float32 texture.
-- [ ] Implement texture readback: map the texture to CPU memory, apply
+- [x] Implement texture readback: map the texture to CPU memory, apply
   per-channel gamma-2.2 tonemap (`v.powf(1.0/2.2).clamp(0.0,1.0)`),
   convert to `u8`, and encode as 8-bit sRGB PNG using the `image` crate.
-- [ ] Verify determinism: render the same scene twice consecutively and assert
+- [x] Verify determinism: render the same scene twice consecutively and assert
   the output PNGs are byte-identical.
 
 **Output:** `cargo run --release -- --headless tests/assets/scenes/diffuse_sphere.yaml --output tmp/regression/current/diffuse_sphere.png --spp 64` produces a valid PNG.

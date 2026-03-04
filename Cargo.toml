@@ -15,6 +15,7 @@ log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr"] }
 serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0"
+toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
 notify = "7"
 egui = "0.33"
