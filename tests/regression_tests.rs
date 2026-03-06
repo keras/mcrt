@@ -188,8 +188,10 @@ enum SceneResult {
     },
     /// Baseline PNG absent — schema-change skip.
     SkipNoBaseline,
-    /// Current render missing or failed.
+    /// Current PNG absent and no render was attempted (e.g. cached path skipped).
     SkipNoRender(String),
+    /// Renderer subprocess exited non-zero — always a hard failure.
+    RenderFailed(String),
     /// Images have incompatible dimensions.
     DimMismatch(String),
     /// PNG could not be opened.
@@ -253,6 +255,8 @@ fn regression_suite() {
     // -----------------------------------------------------------------------
     println!("\n=== Render step (baseline: {baseline_str}) ===\n");
 
+    let mut render_errors: std::collections::HashMap<String, String> = Default::default();
+
     for scene in &scenes {
         let current_png = current_dir.join(format!("{}.png", scene.stem));
         let render = load_render_params(&scene.yaml_path);
@@ -269,7 +273,10 @@ fn regression_suite() {
 
         match render_scene(&binary, &scene.yaml_path, &current_png, &render) {
             Ok(()) => println!("ok"),
-            Err(msg) => println!("FAILED — {msg}"),
+            Err(msg) => {
+                println!("FAILED — {msg}");
+                render_errors.insert(scene.stem.clone(), msg);
+            }
         }
     }
 
@@ -295,16 +302,28 @@ fn regression_suite() {
             continue;
         }
 
-        // (b) No current render — GPU unavailable or earlier render failed.
+        // (b) No current render — either the render subprocess failed (hard
+        // failure) or the PNG was never produced for another reason (skip).
         if !current_png.exists() {
-            println!(
-                "[SKIP   ] {} — current PNG absent (render failed?)",
-                scene.stem
-            );
-            rows.push(SummaryRow {
-                stem: scene.stem.clone(),
-                result: SceneResult::SkipNoRender(format!("`{}` absent", current_png.display())),
-            });
+            if let Some(err) = render_errors.get(&scene.stem) {
+                println!("[FAIL   ] {} — render failed: {err}", scene.stem);
+                rows.push(SummaryRow {
+                    stem: scene.stem.clone(),
+                    result: SceneResult::RenderFailed(err.clone()),
+                });
+            } else {
+                println!(
+                    "[SKIP   ] {} — current PNG absent (render not attempted?)",
+                    scene.stem
+                );
+                rows.push(SummaryRow {
+                    stem: scene.stem.clone(),
+                    result: SceneResult::SkipNoRender(format!(
+                        "`{}` absent",
+                        current_png.display()
+                    )),
+                });
+            }
             continue;
         }
 
@@ -385,11 +404,13 @@ fn regression_suite() {
     let failures: Vec<&str> = rows
         .iter()
         .filter_map(|r| match &r.result {
-            // IoError is a hard failure: a corrupted or unreadable PNG must not
-            // silently pass the suite.
-            SceneResult::Fail { .. } | SceneResult::DimMismatch(_) | SceneResult::IoError(_) => {
-                Some(r.stem.as_str())
-            }
+            // RenderFailed: renderer exited non-zero (e.g. no GPU adapter).
+            // IoError: corrupted or unreadable PNG.
+            // Both must not silently pass the suite.
+            SceneResult::Fail { .. }
+            | SceneResult::RenderFailed(_)
+            | SceneResult::DimMismatch(_)
+            | SceneResult::IoError(_) => Some(r.stem.as_str()),
             _ => None,
         })
         .collect();
@@ -465,6 +486,12 @@ fn print_summary_table(rows: &[SummaryRow], baseline: &str) {
                 "—".into(),
                 "—".into(),
                 format!("⚠ SKIP — {msg}"),
+            ),
+            SceneResult::RenderFailed(msg) => (
+                "—".into(),
+                "—".into(),
+                "—".into(),
+                format!("✗ RENDER FAILED — {msg}"),
             ),
             SceneResult::DimMismatch(msg) => (
                 "—".into(),

@@ -80,6 +80,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libvulkan-dev mesa-vulkan-drivers
 
+      - name: Locate lavapipe ICD and export Vulkan env vars
+        run: |
+          ICD=$(find /usr/share/vulkan/icd.d /etc/vulkan/icd.d \
+                     -name 'lvp_icd*.json' 2>/dev/null | sort | head -1)
+          if [ -z "$ICD" ]; then
+            echo "ERROR: lavapipe ICD not found. Available ICDs:" >&2
+            find /usr/share/vulkan /etc/vulkan -name '*.json' 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "Found lavapipe ICD: $ICD"
+          # VK_ICD_FILENAMES: legacy name; VK_DRIVER_FILES: name used by Vulkan loader >= 1.3.207
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$ICD"  >> "$GITHUB_ENV"
+
       - name: Install uv (for gen-test-assets)
         uses: astral-sh/setup-uv@v5
 
@@ -99,7 +113,5 @@ jobs:
           # Force wgpu to use the Vulkan back-end so lavapipe is selected on
           # runners without a physical GPU.
           WGPU_BACKEND: vulkan
-          # Pin the Vulkan loader to only the lavapipe ICD.  Without this the
-          # loader scans every installed ICD (including stubs for absent
-          # hardware), which can block indefinitely on GHA runners.
-          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+          # VK_ICD_FILENAMES / VK_DRIVER_FILES are set dynamically by the
+          # "Locate lavapipe ICD" step above and exported via $GITHUB_ENV.
