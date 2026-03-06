@@ -18,7 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history is required by `make regress` (compares HEAD vs HEAD^).
+          # Full history is required by `make regress`: on pushes it compares
+          # HEAD vs HEAD^; on PRs it compares HEAD vs origin/main.
           fetch-depth: 0
 
       - name: Install Rust toolchain
@@ -82,11 +83,16 @@ jobs:
       - name: Install uv (for gen-test-assets)
         uses: astral-sh/setup-uv@v5
 
+      - name: Fetch main branch (for PR regression baseline)
+        if: github.event_name == 'pull_request'
+        run: git fetch origin main
+
       - name: Generate test assets
         run: make gen-test-assets
 
       - name: make regress
-        run: make regress
+        # On pull requests compare against main; otherwise compare against HEAD^.
+        run: make regress FROM=${{ github.event_name == 'pull_request' && 'origin/main' || 'HEAD^' }}
         env:
           # Force wgpu to use the Vulkan back-end so lavapipe is selected on
           # runners without a physical GPU.
