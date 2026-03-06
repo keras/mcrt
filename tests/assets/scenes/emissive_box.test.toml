@@ -7,7 +7,7 @@
 [render]
 width  = 256
 height = 256
-spp    = 1024         # 4x default — emission-only scenes converge slowly
+spp    = 512          # 4x default — emission-only scenes converge slowly
 
 [regression]
 threshold_mse  = 0.005   # looser: higher residual variance at 256 spp
