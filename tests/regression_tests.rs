@@ -256,6 +256,7 @@ fn regression_suite() {
     println!("\n=== Render step (baseline: {baseline_str}) ===\n");
 
     let mut render_errors: std::collections::HashMap<String, String> = Default::default();
+    let render_step_start = std::time::Instant::now();
 
     for scene in &scenes {
         let current_png = current_dir.join(format!("{}.png", scene.stem));
@@ -271,14 +272,16 @@ fn regression_suite() {
         use std::io::Write as _;
         let _ = std::io::stdout().flush();
 
+        let t = std::time::Instant::now();
         match render_scene(&binary, &scene.yaml_path, &current_png, &render) {
-            Ok(()) => println!("ok"),
+            Ok(()) => println!("ok ({:.2?})", t.elapsed()),
             Err(msg) => {
-                println!("FAILED — {msg}");
+                println!("FAILED — {msg} ({:.2?})", t.elapsed());
                 render_errors.insert(scene.stem.clone(), msg);
             }
         }
     }
+    println!("\nRender step total: {:.2?}", render_step_start.elapsed());
 
     // -----------------------------------------------------------------------
     // 3. Compare step.
