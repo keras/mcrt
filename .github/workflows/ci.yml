@@ -92,8 +92,14 @@ jobs:
 
       - name: make regress
         # On pull requests compare against main; otherwise compare against HEAD^.
+        # timeout-minutes guards against wgpu/Vulkan adapter init hanging.
+        timeout-minutes: 20
         run: make regress FROM=${{ github.event_name == 'pull_request' && 'origin/main' || 'HEAD^' }}
         env:
           # Force wgpu to use the Vulkan back-end so lavapipe is selected on
           # runners without a physical GPU.
           WGPU_BACKEND: vulkan
+          # Pin the Vulkan loader to only the lavapipe ICD.  Without this the
+          # loader scans every installed ICD (including stubs for absent
+          # hardware), which can block indefinitely on GHA runners.
+          VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
