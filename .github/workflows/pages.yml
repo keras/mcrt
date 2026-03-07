@@ -1,0 +1,60 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  # Allow manual re-runs from the Actions tab.
+  workflow_dispatch:
+
+# Grant the GITHUB_TOKEN write access to the gh-pages branch.
+permissions:
+  contents: write
+
+jobs:
+  build-and-deploy:
+    name: Build WASM and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # Cache Cargo registry and build artefacts so rebuilds are fast.
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── Trunk ───────────────────────────────────────────────────────────────
+      - name: Install Trunk
+        uses: jetli/trunk-action@v0.5.0
+        with:
+          # Pin to a specific version for reproducible builds.
+          version: "v0.21.4"
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Build WASM (release)
+        # Trunk.toml sets target = "web/index.html"; no extra args needed.
+        run: trunk build --release
+
+      # The dist/ directory now contains: index.html, mcrt_bg.wasm, mcrt.js,
+      # snippets/, and the copied assets/ directory.
+
+      # ── Deploy ──────────────────────────────────────────────────────────────
+      - name: Deploy to gh-pages branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist
+          # Keep a clean branch — old artefacts are replaced, not accumulated.
+          force_orphan: true

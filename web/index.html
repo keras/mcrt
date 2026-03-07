@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>mcrt — WebGPU Path Tracer</title>
+  <!-- Trunk: compile Rust → WASM and inject the hashed JS/WASM pair. -->
+  <link data-trunk rel="rust" href=".." />
+  <!-- Trunk: copy the assets/ directory into dist/ for browser fetch access. -->
+  <link data-trunk rel="copy-dir" href="../assets" />
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%; height: 100%;
+      background: #111;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      /* winit sizes the canvas; we just let it fill the viewport. */
+      width: 100vw;
+      height: 100vh;
+    }
+    #loading {
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #ccc;
+      font: 16px/1.5 monospace;
+      text-align: center;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- winit attaches to this canvas via WindowAttributesExtWebSys::with_canvas -->
+  <canvas id="canvas"></canvas>
+  <div id="loading">Loading WebGPU path tracer…</div>
+
+  <script>
+    // Hide the loading overlay once winit starts painting the canvas.
+    const loading = document.getElementById('loading');
+    const obs = new MutationObserver(() => {
+      loading.style.display = 'none';
+      obs.disconnect();
+    });
+    obs.observe(document.getElementById('canvas'), { attributes: true });
+    // Fallback: hide after 5 s regardless.
+    setTimeout(() => { loading.style.display = 'none'; }, 5000);
+  </script>
+</body>
+</html>

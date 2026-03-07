@@ -4,14 +4,53 @@
 # Only source files (scene YAMLs, sidecar TOMLs, generator scripts) are
 # committed.  Run `make help` for a brief description of each target.
 
-.PHONY: help gen-test-assets regress-baseline regress clean-regression
+.PHONY: help web web-release web-serve gen-test-assets regress-baseline regress clean-regression
+
+TRUNK := ./bin/trunk
+TRUNK_VERSION := 0.21.4
 
 # Default FROM commitish when not supplied by the caller.
 FROM ?= HEAD^
 
+# ---------------------------------------------------------------------------
+# web / web-release / web-serve — WASM build targets using Trunk.
+#
+# trunk is installed project-locally into ./bin/ on first use; no global
+# install is needed.  Requires the wasm32-unknown-unknown Rust target:
+#   rustup target add wasm32-unknown-unknown
+#
+# trunk reads web/index.html and Trunk.toml automatically.
+# Output lands in dist/ (see Trunk.toml: dist = "dist").
+# ---------------------------------------------------------------------------
+
+# Bootstrap: install trunk into ./bin/ if not already present.
+$(TRUNK):
+	@echo "→ Installing trunk $(TRUNK_VERSION) into ./bin/ …"
+	cargo install --locked trunk --version $(TRUNK_VERSION) --root .
+	@echo "✓ trunk installed at $(TRUNK)"
+
+# Bootstrap: add wasm32 target if not already installed.
+.PHONY: wasm-target
+wasm-target:
+	@rustup target list --installed | grep -q wasm32-unknown-unknown \
+		|| (echo "→ Installing wasm32-unknown-unknown target …" \
+		    && rustup target add wasm32-unknown-unknown)
+
+web: $(TRUNK) wasm-target
+	$(TRUNK) build
+
+web-release: $(TRUNK) wasm-target
+	$(TRUNK) build --release
+
+web-serve: $(TRUNK) wasm-target
+	$(TRUNK) serve
+
 # Default target: print help.
 help:
 	@echo "Targets:"
+	@echo "  web               Build the WASM web renderer (debug) into dist/"
+	@echo "  web-release       Build the WASM web renderer (release) into dist/"
+	@echo "  web-serve         Build and serve the web renderer at http://localhost:8080"
 	@echo "  gen-test-assets   Generate all synthetic test assets (HDR skymaps, etc.)"
 	@echo "  regress-baseline  Capture regression baseline from a git commitish."
 	@echo "                    Usage: make regress-baseline FROM=HEAD^"

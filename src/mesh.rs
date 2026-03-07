@@ -472,8 +472,10 @@ pub fn build_torus_mesh(
 /// vertex has no normal reference the face's geometric normal is computed and
 /// applied to all three of its vertices (flat shading for that triangle).
 pub fn load_obj(path: &str, mat_idx: u32) -> Result<(Vec<GpuVertex>, Vec<GpuTriangle>), String> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read '{path}': {e}"))?;
+    let bytes = crate::platform::load_bytes(path)
+        .map_err(|e| format!("cannot read '{path}': {e}"))?;
+    let content = String::from_utf8(bytes)
+        .map_err(|e| format!("'{path}' is not valid UTF-8: {e}"))?;
 
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();

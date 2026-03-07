@@ -13,24 +13,39 @@
 //   gpu      — GpuState: all wgpu resources, render loop, input methods
 //   app      — App: winit ApplicationHandler, window lifecycle, event dispatch
 //   headless — Phase RT-2: offline PNG renderer (no window, deterministic)
+//   platform — platform-abstracted asset loading (std::fs on native, fetch on WASM)
+//   web      — WASM browser entry point (replaces app/main on WASM)
 
+// app.rs calls GpuState::new() which is native-only (uses pollster::block_on).
+// On WASM the browser entry point is web.rs / WasmApp, which uses new_async().
+#[cfg(not(target_arch = "wasm32"))]
 mod app;
 mod bvh;
 mod camera;
 mod gpu;
 mod gpu_layout;
-mod headless;
 mod material;
 mod mesh;
-mod regression;
+mod platform;
 mod scene;
 mod texture;
 
+#[cfg(not(target_arch = "wasm32"))]
+mod headless;
+#[cfg(not(target_arch = "wasm32"))]
+mod regression;
+
+#[cfg(target_arch = "wasm32")]
+mod web;
+
+#[cfg(not(target_arch = "wasm32"))]
 use winit::event_loop::EventLoop;
 
 /// Default scene file loaded when `--load-scene-yaml` is not supplied.
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_SCENE: &str = "assets/scene.yaml";
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() {
     env_logger::init();
 
@@ -75,9 +90,16 @@ fn main() {
 }
 
 /// Return the argument immediately following `flag` in `args`, or `None`.
+#[cfg(not(target_arch = "wasm32"))]
 fn get_next_after(args: &[String], flag: &str) -> Option<String> {
     args.iter()
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
 }
+
+// On WASM the real entry point is #[wasm_bindgen(start)] in web.rs.
+// Cargo still requires a main() symbol for a binary crate, so provide a
+// no-op stub.  The wasm-bindgen runtime calls web_main() before main().
+#[cfg(target_arch = "wasm32")]
+fn main() {}
