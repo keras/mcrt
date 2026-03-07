@@ -6,27 +6,37 @@
 
 .PHONY: help web web-release web-serve gen-test-assets regress-baseline regress clean-regression
 
+TRUNK := ./bin/trunk
+TRUNK_VERSION := 0.21.4
+
 # Default FROM commitish when not supplied by the caller.
 FROM ?= HEAD^
 
 # ---------------------------------------------------------------------------
 # web / web-release / web-serve — WASM build targets using Trunk.
 #
-# Requires: trunk (https://trunkrs.dev) and the wasm32-unknown-unknown target.
+# trunk is installed project-locally into ./bin/ on first use; no global
+# install is needed.  Requires the wasm32-unknown-unknown Rust target:
 #   rustup target add wasm32-unknown-unknown
-#   cargo install --locked trunk
 #
 # trunk reads web/index.html and Trunk.toml automatically.
 # Output lands in dist/ (see Trunk.toml: dist = "dist").
 # ---------------------------------------------------------------------------
-web:
-	trunk build
 
-web-release:
-	trunk build --release
+# Bootstrap: install trunk into ./bin/ if not already present.
+$(TRUNK):
+	@echo "→ Installing trunk $(TRUNK_VERSION) into ./bin/ …"
+	cargo install --locked trunk --version $(TRUNK_VERSION) --root .
+	@echo "✓ trunk installed at $(TRUNK)"
 
-web-serve:
-	trunk serve
+web: $(TRUNK)
+	$(TRUNK) build
+
+web-release: $(TRUNK)
+	$(TRUNK) build --release
+
+web-serve: $(TRUNK)
+	$(TRUNK) serve
 
 # Default target: print help.
 help:
