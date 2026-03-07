@@ -20,7 +20,8 @@
     }
     canvas {
       display: block;
-      /* winit sizes the canvas; we just let it fill the viewport. */
+      /* CSS display size tracks the viewport; winit reads innerWidth/Height
+         on startup and its ResizeObserver keeps pixel dims in sync on resize. */
       width: 100vw;
       height: 100vh;
     }

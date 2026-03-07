@@ -29,7 +29,7 @@ use winit::{
 use winit::platform::web::EventLoopExtWebSys as _;
 use winit::platform::web::WindowAttributesExtWebSys as _;
 
-use crate::gpu::{GpuState, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
+use crate::gpu::GpuState;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -88,15 +88,18 @@ impl ApplicationHandler for WasmApp {
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .expect("no <canvas id=\"canvas\"> found in the page");
 
+        // Read the actual browser viewport so the canvas starts at the right
+        // resolution rather than the hardcoded 1280×720 fallback.
+        let js_win = web_sys::window().expect("no JS window");
+        let vw = js_win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1280.0) as u32;
+        let vh = js_win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(720.0) as u32;
+
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
                         .with_title("mcrt — path tracer")
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            DEFAULT_WINDOW_WIDTH,
-                            DEFAULT_WINDOW_HEIGHT,
-                        ))
+                        .with_inner_size(winit::dpi::LogicalSize::new(vw, vh))
                         .with_canvas(Some(canvas)),
                 )
                 .expect("failed to create window"),
