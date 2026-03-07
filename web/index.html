@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>mcrt — WebGPU Path Tracer</title>
+  <!-- Trunk: compile Rust → WASM and inject the hashed JS/WASM pair. -->
+  <link data-trunk rel="rust" />
   <!-- Trunk: copy the assets/ directory into dist/ for browser fetch access. -->
   <link data-trunk rel="copy-dir" href="../assets" />
   <style>
@@ -38,20 +40,16 @@
   <canvas id="canvas"></canvas>
   <div id="loading">Loading WebGPU path tracer…</div>
 
-  <script type="module">
-    import init from './mcrt.js';
-    // Hide loading text once the WASM module calls web_main() and the first
-    // frame starts rendering.  We detect this by observing canvas paint.
-    init().then(() => {
-      const loading = document.getElementById('loading');
-      const obs = new MutationObserver(() => {
-        loading.style.display = 'none';
-        obs.disconnect();
-      });
-      obs.observe(document.getElementById('canvas'), { attributes: true });
-      // Fallback: hide after 5 s regardless.
-      setTimeout(() => { loading.style.display = 'none'; }, 5000);
+  <script>
+    // Hide the loading overlay once winit starts painting the canvas.
+    const loading = document.getElementById('loading');
+    const obs = new MutationObserver(() => {
+      loading.style.display = 'none';
+      obs.disconnect();
     });
+    obs.observe(document.getElementById('canvas'), { attributes: true });
+    // Fallback: hide after 5 s regardless.
+    setTimeout(() => { loading.style.display = 'none'; }, 5000);
   </script>
 </body>
 </html>
