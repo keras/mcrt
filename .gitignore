@@ -5,3 +5,5 @@ tmp/
 /dist
 # Project-local tool binaries (installed by `make web` bootstrap).
 /bin
+/.crates.toml
+/.crates2.json
