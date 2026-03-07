@@ -13,15 +13,12 @@
     html, body {
       width: 100%; height: 100%;
       background: #111;
-      display: flex;
-      align-items: center;
-      justify-content: center;
       overflow: hidden;
     }
     canvas {
       display: block;
-      /* CSS display size tracks the viewport; winit reads innerWidth/Height
-         on startup and its ResizeObserver keeps pixel dims in sync on resize. */
+      /* Fill the viewport; the ResizeObserver below keeps the drawing-buffer
+         (canvas.width / canvas.height) in sync with the actual pixel size. */
       width: 100vw;
       height: 100vh;
     }
@@ -34,6 +31,35 @@
       text-align: center;
       pointer-events: none;
     }
+    #scene-picker {
+      position: fixed;
+      top: 12px;
+      right: 12px;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: rgba(0, 0, 0, 0.55);
+      padding: 6px 10px;
+      border-radius: 6px;
+      backdrop-filter: blur(4px);
+    }
+    #scene-picker label {
+      color: #bbb;
+      font: 13px/1 monospace;
+      user-select: none;
+    }
+    #scene-picker select {
+      background: #1e1e1e;
+      color: #eee;
+      border: 1px solid #555;
+      border-radius: 4px;
+      padding: 3px 6px;
+      font: 13px/1 monospace;
+      cursor: pointer;
+      outline: none;
+    }
+    #scene-picker select:hover { border-color: #888; }
   </style>
 </head>
 <body>
@@ -41,14 +67,75 @@
   <canvas id="canvas"></canvas>
   <div id="loading">Loading WebGPU path tracer…</div>
 
+  <!-- Scene selection overlay (top-right corner) -->
+  <div id="scene-picker">
+    <label for="scene-select">Scene</label>
+    <select id="scene-select">
+      <option value="cornell-box">Cornell Box</option>
+      <option value="scene">Demo Scene</option>
+      <option value="skybox">Skybox</option>
+    </select>
+  </div>
+
   <script>
-    // Hide the loading overlay once winit starts painting the canvas.
+    // -------------------------------------------------------------------------
+    // Scene picker — read current scene from ?scene= and reload on change.
+    // -------------------------------------------------------------------------
+    const sceneSelect = document.getElementById('scene-select');
+    const urlParams = new URLSearchParams(window.location.search);
+    const currentScene = urlParams.get('scene') || 'cornell-box';
+    sceneSelect.value = currentScene;
+
+    sceneSelect.addEventListener('change', () => {
+      const url = new URL(window.location.href);
+      url.searchParams.set('scene', sceneSelect.value);
+      window.location.href = url.toString();
+    });
+
+    // -------------------------------------------------------------------------
+    // Dynamic canvas sizing — keep the drawing buffer in sync with the viewport.
+    //
+    // The canvas CSS is 100vw × 100vh, so the element always fills the window.
+    // We still need to update canvas.width / canvas.height (the drawing-buffer
+    // resolution) whenever the browser is resized, accounting for devicePixelRatio.
+    // winit's own ResizeObserver then detects the attribute change and fires a
+    // WindowEvent::Resized so the GPU surface is recreated at the new size.
+    // -------------------------------------------------------------------------
+    const canvas = document.getElementById('canvas');
+
+    function syncCanvasSize() {
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.round(window.innerWidth  * dpr);
+      const h = Math.round(window.innerHeight * dpr);
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width  = w;
+        canvas.height = h;
+      }
+    }
+
+    // Initial sizing before WASM starts (winit will read innerWidth/Height, but
+    // setting the attributes early avoids a blank frame at wrong resolution).
+    syncCanvasSize();
+
+    // Keep in sync whenever the viewport or DPR changes.
+    window.addEventListener('resize', syncCanvasSize);
+
+    // Also cover DPR changes (zoom, moving between monitors).
+    function watchDpr() {
+      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
+      mq.addEventListener('change', () => { syncCanvasSize(); watchDpr(); }, { once: true });
+    }
+    watchDpr();
+
+    // -------------------------------------------------------------------------
+    // Loading overlay — hide once winit starts painting the canvas.
+    // -------------------------------------------------------------------------
     const loading = document.getElementById('loading');
     const obs = new MutationObserver(() => {
       loading.style.display = 'none';
       obs.disconnect();
     });
-    obs.observe(document.getElementById('canvas'), { attributes: true });
+    obs.observe(canvas, { attributes: true });
     // Fallback: hide after 5 s regardless.
     setTimeout(() => { loading.style.display = 'none'; }, 5000);
   </script>
