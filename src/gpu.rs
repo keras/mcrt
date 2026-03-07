@@ -343,9 +343,117 @@ pub struct GpuState {
     #[cfg(not(target_arch = "wasm32"))]
     scene_change_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
 
+    // ---- VW-5: Procedural voxel world state (None when no world: block) -----
+    /// Holds the generator, loaded chunks, and material map for the procedural
+    /// world.  `None` when the current scene file does not have a `world:` key.
+    world_state: Option<WorldState>,
+
     // ---- Phase 15: egui UI + material editor state -----------------------
     /// All egui and UI-facing state bundled.
     ui: UiState,
+}
+
+// ---------------------------------------------------------------------------
+// WorldState — voxel world generator state (VW-5)
+// ---------------------------------------------------------------------------
+
+/// Persistent world-generator state kept on `GpuState`.
+///
+/// Owning the generator here means we can regenerate chunks on hot-reload
+/// without re-parsing the seed from YAML again.
+/// Fields are retained for VW-6 (dynamic chunk streaming).
+#[allow(dead_code)]
+struct WorldState {
+    generator: crate::world::WorldGenerator,
+    /// All currently loaded chunk meshes, keyed by their column coordinates.
+    loaded_chunks: crate::world::ChunkMap,
+    material_map: crate::world::BlockMaterialMap,
+    view_distance: i32,
+}
+
+// ---------------------------------------------------------------------------
+// build_world_geometry — VW-5 integration helper
+// ---------------------------------------------------------------------------
+
+/// Generate the procedural voxel world for `loaded` (if a `world:` block is
+/// present) and append the resulting triangle mesh to `loaded.mesh_vertices`
+/// and `loaded.mesh_triangles` before they are uploaded to the GPU.
+///
+/// Returns the live `WorldState` (generator + chunk cache + material map)
+/// so the renderer can regenerate chunks on hot-reload or camera movement.
+/// Returns `None` when the scene has no `world:` key.
+fn build_world_geometry(loaded: &mut crate::scene::LoadedScene) -> Option<WorldState> {
+    use crate::world::{
+        BlockMaterialMap, ChunkMap, WorldGenerator, chunk_world_origin,
+        mesh_chunk, merge_chunk_meshes, visible_chunk_coords,
+    };
+
+    let wc = loaded.world_config.as_ref()?.clone();
+
+    let generator = WorldGenerator::new(wc.seed);
+    let material_map = BlockMaterialMap::from_palette(&loaded.world_material_name_to_slot);
+
+    // Generate and mesh all visible chunks around the world origin.
+    let coords = visible_chunk_coords([0.0, 0.0, 0.0], wc.view_distance);
+    let mut chunk_map = ChunkMap::new();
+    let mut meshes = Vec::with_capacity(coords.len());
+
+    for (cx, cz) in &coords {
+        let chunk = generator.generate_chunk(*cx, *cz);
+        chunk_map.insert(*cx, *cz, chunk);
+    }
+
+    for (cx, cz) in &coords {
+        let chunk = chunk_map.get(*cx, *cz).unwrap();
+        // Provide immediate neighbours for face culling.
+        let neighbours = [
+            chunk_map.get(cx + 1, *cz),
+            chunk_map.get(cx - 1, *cz),
+            None, // +Y: never a separate chunk
+            None, // −Y: never a separate chunk
+            chunk_map.get(*cx, cz + 1),
+            chunk_map.get(*cx, cz - 1),
+        ];
+        let origin = chunk_world_origin(*cx, *cz);
+        let mesh = mesh_chunk(chunk, neighbours, origin, &material_map);
+        meshes.push(mesh);
+    }
+
+    info!(
+        "world: generated {} chunks ({} view_distance), seed={}",
+        coords.len(),
+        wc.view_distance,
+        wc.seed,
+    );
+
+    let (world_verts, world_tris) = merge_chunk_meshes(&meshes);
+    info!(
+        "world: {} vertices, {} triangles after greedy meshing",
+        world_verts.len(),
+        world_tris.len(),
+    );
+
+    // Append world geometry into the scene's mesh buffers.
+    // Offset triangle indices by the existing vertex count.
+    let vert_offset = loaded.mesh_vertices.len() as u32;
+    loaded.mesh_vertices.extend_from_slice(&world_verts);
+    for tri in &world_tris {
+        loaded.mesh_triangles.push(crate::mesh::GpuTriangle {
+            v: [
+                tri.v[0] + vert_offset,
+                tri.v[1] + vert_offset,
+                tri.v[2] + vert_offset,
+            ],
+            mat_idx: tri.mat_idx,
+        });
+    }
+
+    Some(WorldState {
+        generator,
+        loaded_chunks: chunk_map,
+        material_map,
+        view_distance: wc.view_distance,
+    })
 }
 
 impl GpuState {
@@ -498,8 +606,9 @@ impl GpuState {
         });
 
         // ---- Load scene + build all scene-dependent GPU buffers ---------------
-        let loaded = load_scene_from_yaml(&scene_path)
+        let mut loaded = load_scene_from_yaml(&scene_path)
             .expect("failed to load initial scene");
+        let world_state = build_world_geometry(&mut loaded);
         let scene = gpu_layout::build_scene_buffers(&device, &queue, &loaded);
 
         // ---- Phase 11: albedo texture array (not rebuilt on hot-reload) ----
@@ -770,6 +879,7 @@ impl GpuState {
             _scene_watcher,
             #[cfg(not(target_arch = "wasm32"))]
             scene_change_rx,
+            world_state,
             ui: UiState {
                 egui_ctx,
                 egui_state,
@@ -884,13 +994,14 @@ impl GpuState {
     #[cfg(not(target_arch = "wasm32"))]
     fn reload_scene(&mut self) {
         let path = self.scene_path.clone();
-        let loaded = match load_scene_from_yaml(&path) {
+        let mut loaded = match load_scene_from_yaml(&path) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("reload_scene: {e}");
                 return;
             }
         };
+        self.world_state = build_world_geometry(&mut loaded);
 
         let scene = gpu_layout::build_scene_buffers(&self.device, &self.queue, &loaded);
         self.sphere_buffer = scene.sphere_buffer;

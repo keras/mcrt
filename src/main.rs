@@ -29,6 +29,7 @@ mod mesh;
 mod platform;
 mod scene;
 mod texture;
+mod world;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod headless;

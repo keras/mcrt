@@ -244,6 +244,26 @@ enum ObjectDesc {
     // Torus { center, major_r, minor_r, material }
 }
 
+/// World-generation parameters from the optional `world:` YAML block.
+///
+/// When present, the renderer instantiates a [`crate::world::WorldGenerator`]
+/// and merges the resulting voxel chunk meshes with the static scene geometry
+/// before BVH construction.
+#[derive(serde::Deserialize, Debug, Clone)]
+struct WorldDesc {
+    /// 64-bit seed for deterministic terrain generation.
+    #[serde(default)]
+    seed: u64,
+    /// Half-size of the square chunk region centred on the world origin.
+    /// `view_distance = 4` → 9×9 = 81 chunks ≈ 18 m × 18 m footprint.
+    #[serde(default = "default_view_distance")]
+    view_distance: i32,
+}
+
+fn default_view_distance() -> i32 {
+    4
+}
+
 /// Top-level structure of a YAML scene file.
 #[derive(serde::Deserialize)]
 struct SceneFile {
@@ -251,6 +271,12 @@ struct SceneFile {
     /// camera from these values instead of the built-in defaults.
     #[serde(default)]
     camera: Option<CameraDesc>,
+    /// World-generator block material palette.  Processed **before** the
+    /// regular `materials:` map so block material names are always available
+    /// when objects reference them.  Distinct from `materials:` only in
+    /// semantics — both feed into the same GPU material table.
+    #[serde(default)]
+    world_materials: indexmap::IndexMap<String, MaterialDesc>,
     /// Named material palette.  Keys are material names; values are their
     /// definitions.  Insertion order is preserved by `IndexMap`, so GPU
     /// indices are deterministic.  Duplicate keys are a YAML parse error,
@@ -258,12 +284,17 @@ struct SceneFile {
     #[serde(default)]
     materials: indexmap::IndexMap<String, MaterialDesc>,
     /// Ordered list of scene objects.
+    #[serde(default)]
     objects: Vec<ObjectDesc>,
     /// Optional path (relative to the working directory) to an HDR equirectangular
     /// environment map.  When absent the renderer falls back to `textures/env.hdr`,
     /// then to the procedural gradient sky.
     #[serde(default)]
     env_map: Option<String>,
+    /// Optional voxel world configuration.  When present, a procedural
+    /// Mediterranean landscape is generated and merged with the scene geometry.
+    #[serde(default)]
+    world: Option<WorldDesc>,
 }
 
 /// The result of loading a YAML scene file — ready for BVH construction and
@@ -294,6 +325,13 @@ pub struct LoadedScene {
     ///
     /// Note: emissive *mesh* triangles are not tracked here (Phase 13 scope).
     pub emissive_spheres: Vec<GpuSphere>,
+    /// Procedural world configuration parsed from the `world:` YAML block.
+    /// `None` when the scene file has no `world:` key.
+    pub world_config: Option<crate::world::WorldConfig>,
+    /// Material name → GPU slot index map used to build
+    /// [`crate::world::BlockMaterialMap`] in the GPU layer.  Only meaningful
+    /// when `world_config` is `Some`; always present (may be empty) otherwise.
+    pub world_material_name_to_slot: std::collections::HashMap<String, u32>,
     /// Optional path to an HDR equirectangular environment map, as declared in
     /// the scene YAML via `env_map: <path>`.  `None` means use the default
     /// fallback chain (`textures/env.hdr` → procedural gradient).
@@ -598,12 +636,18 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScen
     let scene: SceneFile = serde_yml::from_str(text)
         .map_err(|e| SceneError::Parse(format!("failed to parse '{}': {}", source, e)))?;
 
-    // Build the material palette from the top-level `materials:` dict.
-    // IndexMap preserves insertion order so GPU indices are deterministic.
-    // Duplicate keys are rejected at parse time by serde_yml.
+    // Build the material palette.  `world_materials:` is processed first so
+    // block material names are always resolvable when objects reference them.
+    // Both maps feed into the same flat GPU material table.
     let mut name_to_idx: HashMap<String, u32> = HashMap::new();
     let mut gpu_mats = Vec::<crate::material::GpuMaterial>::new();
-    for (name, desc) in &scene.materials {
+
+    for (name, desc) in scene.world_materials.iter().chain(scene.materials.iter()) {
+        if name_to_idx.contains_key(name.as_str()) {
+            // Duplicate key across world_materials + materials: last wins.
+            // (Duplicates within a single map are already a YAML parse error.)
+            continue;
+        }
         let idx = gpu_mats.len() as u32;
         gpu_mats.push(material_desc_to_gpu(desc));
         name_to_idx.insert(name.clone(), idx);
@@ -890,6 +934,12 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScen
         }
     });
 
+    // Build world config if the YAML contains a `world:` block.
+    let world_config = scene.world.as_ref().map(|w| crate::world::WorldConfig {
+        seed: w.seed,
+        view_distance: w.view_distance,
+    });
+
     Ok(LoadedScene {
         spheres,
         materials: mat_data,
@@ -897,6 +947,8 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScen
         mesh_triangles,
         camera,
         emissive_spheres,
+        world_config,
+        world_material_name_to_slot: name_to_idx.clone(),
         env_map_path: scene.env_map,
         material_names: {
             // Palette entries are named; any inline materials added later get

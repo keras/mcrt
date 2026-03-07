@@ -16,6 +16,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0"
 toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
+noise = "0.9"
 egui = "0.33"
 egui-wgpu = "0.33"
 # Drop-in replacement for std::time that works on both native and WASM.
