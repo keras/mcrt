@@ -4,14 +4,36 @@
 # Only source files (scene YAMLs, sidecar TOMLs, generator scripts) are
 # committed.  Run `make help` for a brief description of each target.
 
-.PHONY: help gen-test-assets regress-baseline regress clean-regression
+.PHONY: help web web-release web-serve gen-test-assets regress-baseline regress clean-regression
 
 # Default FROM commitish when not supplied by the caller.
 FROM ?= HEAD^
 
+# ---------------------------------------------------------------------------
+# web / web-release / web-serve — WASM build targets using Trunk.
+#
+# Requires: trunk (https://trunkrs.dev) and the wasm32-unknown-unknown target.
+#   rustup target add wasm32-unknown-unknown
+#   cargo install --locked trunk
+#
+# trunk reads web/index.html and Trunk.toml automatically.
+# Output lands in dist/ (see Trunk.toml: dist = "dist").
+# ---------------------------------------------------------------------------
+web:
+	trunk build
+
+web-release:
+	trunk build --release
+
+web-serve:
+	trunk serve
+
 # Default target: print help.
 help:
 	@echo "Targets:"
+	@echo "  web               Build the WASM web renderer (debug) into dist/"
+	@echo "  web-release       Build the WASM web renderer (release) into dist/"
+	@echo "  web-serve         Build and serve the web renderer at http://localhost:8080"
 	@echo "  gen-test-assets   Generate all synthetic test assets (HDR skymaps, etc.)"
 	@echo "  regress-baseline  Capture regression baseline from a git commitish."
 	@echo "                    Usage: make regress-baseline FROM=HEAD^"
