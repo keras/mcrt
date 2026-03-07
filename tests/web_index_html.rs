@@ -41,3 +41,23 @@ fn has_trunk_rust_link() {
          Trunk injects the hashed WASM module script"
     );
 }
+
+/// Because `web/index.html` lives in a subdirectory, Trunk defaults to looking
+/// for `web/Cargo.toml` (which doesn't exist).  The `<link data-trunk
+/// rel="rust">` tag must carry `href=".."` to point Trunk at the project root
+/// where `Cargo.toml` actually lives.
+#[test]
+fn trunk_rust_link_points_to_project_root() {
+    let html = html();
+    // Find the <link ... rel="rust" ...> tag and check it has href="..".
+    let has_href = html.lines().any(|line| {
+        line.contains("data-trunk")
+            && line.contains(r#"rel="rust""#)
+            && line.contains(r#"href="..""#)
+    });
+    assert!(
+        has_href,
+        "The data-trunk rust link must include href=\"..\" because index.html \
+         is in web/ but Cargo.toml is at the project root"
+    );
+}
