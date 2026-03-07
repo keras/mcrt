@@ -17,13 +17,15 @@ use wgpu::{
     AddressMode, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, BufferDescriptor, BufferUsages,
     CommandEncoderDescriptor, ComputePassDescriptor, ComputePipelineDescriptor, DeviceDescriptor,
-    Extent3d, FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    Origin3d, PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
+    FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    PipelineLayoutDescriptor, PowerPreference, PrimitiveState, RenderPassColorAttachment,
     RenderPassDescriptor, RenderPipelineDescriptor, RequestAdapterOptions,
     SamplerDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StorageTextureAccess,
-    StoreOp, SurfaceError, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect,
-    TextureFormat, TextureSampleType, TextureViewDimension, VertexState,
+    StoreOp, SurfaceError, TextureFormat, TextureSampleType, TextureViewDimension, VertexState,
 };
+// These types are only needed for the native-only screenshot functionality.
+#[cfg(not(target_arch = "wasm32"))]
+use wgpu::{Extent3d, Origin3d, TexelCopyBufferLayout, TexelCopyTextureInfo, TextureAspect};
 use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, MouseButton, MouseScrollDelta},
@@ -34,9 +36,12 @@ use winit::{
 // Phase 15: egui immediate-mode GUI.
 use egui_wgpu::ScreenDescriptor;
 
+use web_time::Instant;
+
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
 use crate::material::GpuMaterialData;
 use crate::scene::load_scene_from_yaml;
+#[cfg(not(target_arch = "wasm32"))]
 use notify::Watcher as _;
 
 // ---------------------------------------------------------------------------
@@ -215,7 +220,7 @@ struct UiState {
     show_ui: bool,
     denoise_enabled: bool,
     fps_smooth: f32,
-    last_frame_time: std::time::Instant,
+    last_frame_time: Instant,
     /// CPU copy of the material table — mutated by the UI and re-uploaded on change.
     material_data_cpu: GpuMaterialData,
     /// Human-readable material names (palette YAML keys; inline materials get "inline-N").
@@ -325,14 +330,17 @@ pub struct GpuState {
     // Sub-structs for non-GPU state.
     /// Camera orbit state and raw input bundled together.
     cam_ctrl: CameraController,
-    // ---- Phase 12: hot-reload ------------------------------------------
+    // ---- Phase 12: hot-reload (native only) ----------------------------
     /// Path of the currently loaded scene file (for hot-reload).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     scene_path: String,
     /// File-system watcher that fires when the scene file changes on disk.
     /// Owned here only to keep the OS registration alive; never read after
     /// construction.
+    #[cfg(not(target_arch = "wasm32"))]
     _scene_watcher: Option<notify::RecommendedWatcher>,
     /// Receives events from `_scene_watcher`; polled with `try_recv` each frame.
+    #[cfg(not(target_arch = "wasm32"))]
     scene_change_rx: Option<std::sync::mpsc::Receiver<notify::Result<notify::Event>>>,
 
     // ---- Phase 15: egui UI + material editor state -----------------------
@@ -345,28 +353,69 @@ impl GpuState {
     // Construction
     // -----------------------------------------------------------------------
 
+    /// Synchronous constructor used on native platforms.
+    ///
+    /// Blocks on the wgpu adapter and device futures using `pollster`.
+    /// On WASM, use [`Self::new_async`] instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new(window: Arc<Window>, scene_path: String) -> Self {
         let instance = wgpu::Instance::new(&InstanceDescriptor::default());
-
         let surface = instance
             .create_surface(Arc::clone(&window))
             .expect("failed to create surface");
-
         let adapter = pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::HighPerformance,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
         .expect("no suitable GPU adapter found");
-
         info!("Adapter: {}", adapter.get_info().name);
-
         let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
             label: Some("mcrt device"),
             ..Default::default()
         }))
         .expect("failed to create device");
+        Self::build(window, surface, adapter, device, queue, scene_path)
+    }
 
+    /// Async constructor used on WASM (WebGPU requires async adapter/device init).
+    ///
+    /// Must be called inside a `wasm_bindgen_futures::spawn_local` task.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn new_async(window: Arc<Window>, scene_path: String) -> Self {
+        let instance = wgpu::Instance::new(&InstanceDescriptor::default());
+        let surface = instance
+            .create_surface(Arc::clone(&window))
+            .expect("failed to create surface");
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("no suitable GPU adapter found");
+        info!("Adapter: {}", adapter.get_info().name);
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("mcrt device"),
+                ..Default::default()
+            })
+            .await
+            .expect("failed to create device");
+        Self::build(window, surface, adapter, device, queue, scene_path)
+    }
+
+    /// Shared synchronous construction logic — called by both [`Self::new`] and
+    /// [`Self::new_async`] after the wgpu adapter and device are ready.
+    fn build(
+        window: Arc<Window>,
+        surface: wgpu::Surface<'static>,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        scene_path: String,
+    ) -> Self {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -594,22 +643,23 @@ impl GpuState {
             CameraState::from_initial_position(INIT_LOOK_FROM, INIT_LOOK_AT)
         };
 
-        // ---- Phase 12: scene file watcher for hot-reload ------------------
-        let scene_path_str = scene_path.as_str();
+        // ---- Phase 12: scene file watcher for hot-reload (native only) -----
+        #[cfg(not(target_arch = "wasm32"))]
         let (sc_tx, sc_rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        #[cfg(not(target_arch = "wasm32"))]
         let _scene_watcher: Option<notify::RecommendedWatcher> =
             match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
                 let _ = sc_tx.send(res);
             }) {
                 Ok(mut w) => {
                     if let Err(e) = w.watch(
-                        std::path::Path::new(scene_path_str),
+                        std::path::Path::new(&scene_path),
                         notify::RecursiveMode::NonRecursive,
                     ) {
                         log::warn!("scene hot-reload disabled (watch failed): {e}");
                         None
                     } else {
-                        info!("watching '{}' for hot-reload", scene_path_str);
+                        info!("watching '{}' for hot-reload", &scene_path);
                         Some(w)
                     }
                 }
@@ -618,6 +668,7 @@ impl GpuState {
                     None
                 }
             };
+        #[cfg(not(target_arch = "wasm32"))]
         let scene_change_rx = if _scene_watcher.is_some() {
             Some(sc_rx)
         } else {
@@ -714,8 +765,10 @@ impl GpuState {
                 camera,
                 input: InputState::default(),
             },
-            scene_path: scene_path_str.to_string(),
+            scene_path: scene_path.clone(),
+            #[cfg(not(target_arch = "wasm32"))]
             _scene_watcher,
+            #[cfg(not(target_arch = "wasm32"))]
             scene_change_rx,
             ui: UiState {
                 egui_ctx,
@@ -724,7 +777,7 @@ impl GpuState {
                 show_ui: true,
                 denoise_enabled: false,
                 fps_smooth: 60.0,
-                last_frame_time: std::time::Instant::now(),
+                last_frame_time: Instant::now(),
                 material_data_cpu,
                 material_names,
                 denoise_params: DenoiseParams::default(),
@@ -806,11 +859,12 @@ impl GpuState {
     }
 
     // -----------------------------------------------------------------------
-    // Scene hot-reload
+    // Scene hot-reload (native only — no file-system watcher on WASM)
     // -----------------------------------------------------------------------
 
     /// Returns `true` if the watched scene file has changed since the last call,
     /// and drains any additional queued events so no spurious second reload fires.
+    #[cfg(not(target_arch = "wasm32"))]
     fn poll_scene_changed(&self) -> bool {
         let changed = self
             .scene_change_rx
@@ -827,6 +881,7 @@ impl GpuState {
     /// recreate scene GPU buffers, rebuild compute bind groups, reset
     /// accumulation.  The camera position is intentionally preserved so the
     /// user's viewpoint survives edits.
+    #[cfg(not(target_arch = "wasm32"))]
     fn reload_scene(&mut self) {
         let path = self.scene_path.clone();
         let loaded = match load_scene_from_yaml(&path) {
@@ -884,7 +939,7 @@ impl GpuState {
     /// compute path tracer and the display (tone-map) render pass.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
         // ---- FPS estimation (Phase 15) ------------------------------------
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let dt = now
             .duration_since(self.ui.last_frame_time)
             .as_secs_f32()
@@ -895,6 +950,7 @@ impl GpuState {
         self.ui.fps_smooth = self.ui.fps_smooth * 0.95 + inst_fps * 0.05;
 
         // ---- hot-reload: check if scene file has changed on disk ----------
+        #[cfg(not(target_arch = "wasm32"))]
         if self.poll_scene_changed() {
             self.reload_scene();
         }
@@ -1065,6 +1121,7 @@ impl GpuState {
                 self.queue
                     .write_buffer(&self.camera_buffer, 0, bytes_of(&cam));
             }
+            #[cfg(not(target_arch = "wasm32"))]
             if save_request {
                 self.save_screenshot();
             }
@@ -1230,7 +1287,7 @@ impl GpuState {
     }
 
     // -----------------------------------------------------------------------
-    // Phase 15: screenshot saving
+    // Phase 15: screenshot saving (native only — no local FS write on WASM)
     // -----------------------------------------------------------------------
 
     /// Read back the current accumulation (or denoised) texture from the GPU,
@@ -1239,6 +1296,7 @@ impl GpuState {
     /// The file is named `render_<unix_seconds>.png` and placed in the current
     /// working directory.  The call blocks for one frame while the GPU finishes
     /// and the buffer is mapped — acceptable for an infrequent user action.
+    #[cfg(not(target_arch = "wasm32"))]
     fn save_screenshot(&self) {
         let width = self.config.width;
         let height = self.config.height;
@@ -1666,6 +1724,7 @@ impl UiState {
 // ---------------------------------------------------------------------------
 
 /// ACES filmic tone-map for a single HDR channel (Narkowicz 2016).
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn aces_channel_cpu(x: f32) -> f32 {
     let x = x.max(0.0);
@@ -1678,6 +1737,7 @@ fn aces_channel_cpu(x: f32) -> f32 {
 }
 
 /// Linear → sRGB transfer function (IEC 61966-2-1) for a single channel.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn linear_to_srgb_cpu(c: f32) -> f32 {
     if c <= 0.0 {
@@ -1693,6 +1753,7 @@ fn linear_to_srgb_cpu(c: f32) -> f32 {
 }
 
 /// Apply ACES tone-map + sRGB and quantise to `u8` for PNG output.
+#[cfg(not(target_arch = "wasm32"))]
 #[inline]
 fn screenshot_to_u8(x: f32) -> u8 {
     (linear_to_srgb_cpu(aces_channel_cpu(x)) * 255.0 + 0.5) as u8

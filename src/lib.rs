@@ -8,4 +8,5 @@
 //! The rendering pipeline modules (`gpu`, `headless`, etc.) remain binary-only
 //! to avoid pulling heavyweight GPU crates into the integration-test compile graph.
 
+#[cfg(not(target_arch = "wasm32"))]
 pub mod regression;

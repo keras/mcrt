@@ -8,7 +8,6 @@
 // queue.write_texture.  This module never imports wgpu so it remains
 // independently unit-testable.
 
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -67,7 +66,8 @@ pub fn build_checker_texture(size: u32, color_a: [u8; 4], color_b: [u8; 4]) -> V
 /// Returns `None` if the path does not exist, the format is unsupported,
 /// or any other I/O error occurs.
 pub fn try_load_rgba8(path: &str) -> Option<Vec<u8>> {
-    let img = image::open(Path::new(path)).ok()?;
+    let bytes = crate::platform::load_bytes(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
     let resized = img.resize_exact(
         TEXTURE_SIZE,
         TEXTURE_SIZE,
@@ -122,7 +122,8 @@ pub fn build_albedo_layers(paths: &[Option<&str>]) -> Vec<Vec<u8>> {
 ///
 /// **Requires** the `hdr` feature of the `image` crate (enabled in Cargo.toml).
 pub fn try_load_hdr(path: &str) -> Option<Vec<f32>> {
-    let img = image::open(Path::new(path)).ok()?;
+    let bytes = crate::platform::load_bytes(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?;
     let resized = img.resize_exact(
         ENV_MAP_WIDTH,
         ENV_MAP_HEIGHT,

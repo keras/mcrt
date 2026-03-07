@@ -1,0 +1,19 @@
+# Trunk.toml — configuration for the Trunk WASM bundler
+# https://trunkrs.dev/configuration/
+#
+# Build:  trunk build --release
+# Dev:    trunk serve               (hot-reload on localhost:8080)
+#
+# Asset copying is declared via <link data-trunk rel="copy-dir"> tags in
+# index.html, which Trunk processes during the build.
+
+[build]
+# Trunk output directory (also the GitHub Pages publish root).
+dist = "dist"
+# All URLs are relative so the page works at any path on GitHub Pages.
+public_url = "./"
+
+[watch]
+# Rebuild on changes to Rust sources or assets.
+paths = ["src", "assets"]
+ignore = ["dist"]

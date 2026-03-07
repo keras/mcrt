@@ -929,12 +929,10 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScen
 /// an object references an unknown material name, or more than `MAX_MATERIALS`
 /// unique materials are used.
 pub fn load_scene_from_yaml(path: &str) -> Result<LoadedScene, SceneError> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        SceneError::Io(std::io::Error::new(
-            e.kind(),
-            format!("failed to read scene file '{}': {}", path, e),
-        ))
-    })?;
+    let bytes = crate::platform::load_bytes(path)
+        .map_err(|e| SceneError::Io(std::io::Error::other(e)))?;
+    let text = String::from_utf8(bytes)
+        .map_err(|e| SceneError::Io(std::io::Error::other(e.to_string())))?;
     load_scene_from_str(&text, path)
 }
 

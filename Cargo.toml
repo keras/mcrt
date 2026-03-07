@@ -7,7 +7,6 @@ rust-version = "1.92"
 [dependencies]
 wgpu = "27"
 winit = "0.30"
-pollster = "0.4"
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = "0.32"
 env_logger = "0.11"
@@ -17,10 +16,37 @@ serde = { version = "1", features = ["derive"] }
 serde_yml = "0.0"
 toml = "0.8"
 indexmap = { version = "2", features = ["serde"] }
-notify = "7"
 egui = "0.33"
 egui-wgpu = "0.33"
+# Drop-in replacement for std::time that works on both native and WASM.
+web-time = "1"
+
+# ---- Native-only dependencies -----------------------------------------------
+# egui-winit's default features include 'clipboard' (via arboard) which does
+# not compile on wasm32.  Only add it on native where it is fully supported.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster = "0.4"
+notify = "7"
 egui-winit = "0.33"
+
+# ---- WASM-only dependencies -------------------------------------------------
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# Enable the WebGPU backend explicitly (it is wgpu's default on wasm32, but
+# being explicit avoids surprises during feature resolution).
+wgpu = { version = "27", features = ["webgpu"] }
+# egui-winit without default-features excludes arboard (clipboard), which has
+# no wasm32 implementation.  Event handling and State still compile fine.
+egui-winit = { version = "0.33", default-features = false }
+# winit 0.30 automatically activates its web/canvas backend for wasm32 targets.
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window", "Document", "Element", "HtmlCanvasElement",
+    "Response", "UrlSearchParams", "Location",
+] }
+console_error_panic_hook = "0.1"
+console_log = "0.2"
 
 [dev-dependencies]
 # Offline WGSL parser/validator — same naga version bundled inside wgpu 27.
