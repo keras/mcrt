@@ -8,12 +8,14 @@
 # index.html, which Trunk processes during the build.
 
 [build]
+# Entry-point HTML file (moved to web/ to keep root clean).
+target = "web/index.html"
 # Trunk output directory (also the GitHub Pages publish root).
 dist = "dist"
 # All URLs are relative so the page works at any path on GitHub Pages.
 public_url = "./"
 
 [watch]
-# Rebuild on changes to Rust sources or assets.
-paths = ["src", "assets"]
+# Rebuild on changes to Rust sources, web assets, or scene assets.
+paths = ["src", "web", "assets"]
 ignore = ["dist"]

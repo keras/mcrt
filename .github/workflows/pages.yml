@@ -44,6 +44,7 @@ jobs:
 
       # ── Build ───────────────────────────────────────────────────────────────
       - name: Build WASM (release)
+        # Trunk.toml sets target = "web/index.html"; no extra args needed.
         run: trunk build --release
 
       # The dist/ directory now contains: index.html, mcrt_bg.wasm, mcrt.js,
