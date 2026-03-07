@@ -4,7 +4,7 @@
 [render]
 width  = 256
 height = 256
-spp    = 128          # samples per pixel
+spp    = 64           # samples per pixel
 
 [regression]
 threshold_mse  = 0.002   # mean squared error (linear, 0-1 range)
