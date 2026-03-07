@@ -29,13 +29,20 @@ $(TRUNK):
 	cargo install --locked trunk --version $(TRUNK_VERSION) --root .
 	@echo "✓ trunk installed at $(TRUNK)"
 
-web: $(TRUNK)
+# Bootstrap: add wasm32 target if not already installed.
+.PHONY: wasm-target
+wasm-target:
+	@rustup target list --installed | grep -q wasm32-unknown-unknown \
+		|| (echo "→ Installing wasm32-unknown-unknown target …" \
+		    && rustup target add wasm32-unknown-unknown)
+
+web: $(TRUNK) wasm-target
 	$(TRUNK) build
 
-web-release: $(TRUNK)
+web-release: $(TRUNK) wasm-target
 	$(TRUNK) build --release
 
-web-serve: $(TRUNK)
+web-serve: $(TRUNK) wasm-target
 	$(TRUNK) serve
 
 # Default target: print help.
