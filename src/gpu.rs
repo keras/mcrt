@@ -799,16 +799,24 @@ impl GpuState {
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
 
-        // On WASM the HTML canvas width/height attributes must be kept in sync
-        // with the wgpu surface manually — wgpu does not write them itself.
-        // Doing it here (the single place that calls surface.configure) avoids
-        // any race between JavaScript and the GPU surface.
+        // On WASM the HTML canvas drawing-buffer and its CSS display size must
+        // both be managed from Rust — wgpu does not do either automatically.
+        //
+        // • canvas.width/height (drawing buffer) must match the surface pixel size.
+        // • canvas.style.width/height: winit sets these to fixed pixel values when
+        //   it attaches to the canvas, overriding our CSS `width:100vw;height:100vh`.
+        //   We reset them to "100%" after every resize so the CSS rules win and the
+        //   canvas always fills the viewport visually.
         #[cfg(target_arch = "wasm32")]
         {
             use winit::platform::web::WindowExtWebSys as _;
             if let Some(canvas) = self.window.canvas() {
                 canvas.set_width(new_width);
                 canvas.set_height(new_height);
+                // Override the fixed pixel inline styles winit writes.
+                let style = canvas.style();
+                let _ = style.set_property("width",  "100%");
+                let _ = style.set_property("height", "100%");
             }
         }
 

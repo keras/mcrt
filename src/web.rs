@@ -182,24 +182,20 @@ impl ApplicationHandler for WasmApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Poll the canvas CSS layout size every frame and resize the GPU surface
-        // if it has changed.  winit's ResizeObserver fires asynchronously; this
-        // polling closes the gap so the surface is always correctly sized before
-        // the next redraw — eliminating the stretched-render artefact that occurs
-        // when surface.configure() and canvas.width diverge for even one frame.
+        // Poll the true viewport size every frame and resize the GPU surface if
+        // it has changed.
+        //
+        // We use window.innerWidth/Height (not canvas.client_width/height) because
+        // winit sets canvas.style.width/height to fixed pixel values when it
+        // attaches to the canvas, which overrides our CSS and makes client_width
+        // always return the initial size regardless of the viewport size.
         {
-            let canvas_size = {
-                let win = self.window_slot.borrow();
-                win.as_ref().and_then(|w| {
-                    use winit::platform::web::WindowExtWebSys as _;
-                    let canvas = w.canvas()?;
-                    let js_win = web_sys::window()?;
-                    let dpr = js_win.device_pixel_ratio();
-                    let pw = (canvas.client_width()  as f64 * dpr).round() as u32;
-                    let ph = (canvas.client_height() as f64 * dpr).round() as u32;
-                    (pw > 0 && ph > 0).then_some((pw, ph))
-                })
-            };
+            let canvas_size = web_sys::window().and_then(|js_win| {
+                let dpr = js_win.device_pixel_ratio();
+                let pw = (js_win.inner_width() .ok()?.as_f64()? * dpr).round() as u32;
+                let ph = (js_win.inner_height().ok()?.as_f64()? * dpr).round() as u32;
+                (pw > 0 && ph > 0).then_some((pw, ph))
+            });
             if let Some((pw, ph)) = canvas_size {
                 if let Some(state) = self.state.borrow_mut().as_mut() {
                     if pw != state.surface_width() || ph != state.surface_height() {
