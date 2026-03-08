@@ -55,6 +55,9 @@ pub struct WorldGenerator {
     detail_fbm: Fbm<SuperSimplex>,
     /// 3D Perlin FBM used for karst cave carving.
     cave_fbm: Fbm<Perlin>,
+    /// 3D Perlin FBM that warps the leaf-sphere radius, giving each tree a
+    /// unique bumpy silhouette instead of a perfect sphere.
+    leaf_fbm: Fbm<Perlin>,
 }
 
 impl WorldGenerator {
@@ -83,12 +86,22 @@ impl WorldGenerator {
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
+        // Base frequency 1.0 in MC-block space → ~1-block-scale coarse bumps,
+        // with finer octaves adding surface detail.  At vpb=8 this gives
+        // variation every ~8 voxels, well below the tree radius.
+        let leaf_fbm = Fbm::<Perlin>::new(s32.wrapping_add(0x2d35_9631))
+            .set_octaves(3)
+            .set_frequency(1.0)
+            .set_lacunarity(2.0)
+            .set_persistence(0.5);
+
         Self {
             seed,
             voxels_per_block,
             height_fbm,
             detail_fbm,
             cave_fbm,
+            leaf_fbm,
         }
     }
 
@@ -300,6 +313,76 @@ impl WorldGenerator {
             }
         }
 
+        // Step 5 — Connectivity prune.
+        //
+        // Remove LEAVES that float in the air disconnected from any trunk.
+        // We BFS from two seed sets:
+        //  a) every WOOD voxel in the chunk  (in-chunk tree trunks)
+        //  b) every LEAVES voxel on the chunk XZ boundary (x==0, x==last,
+        //     z==0, z==last) — these may belong to a tree whose trunk sits in
+        //     a neighbouring chunk; treating them as trusted prevents the pass
+        //     from stripping the cross-chunk canopy contribution.
+        //
+        // Only LEAVES are expanded during BFS; WOOD acts as a seed but not as
+        // a propagation medium.
+        {
+            let vol = CHUNK_XZ * CHUNK_XZ * CHUNK_Y;
+            let idx =
+                |x: usize, y: usize, z: usize| x * CHUNK_XZ * CHUNK_Y + z * CHUNK_Y + y;
+            let mut visited = vec![false; vol];
+            let mut queue: std::collections::VecDeque<(usize, usize, usize)> =
+                std::collections::VecDeque::new();
+
+            for y in 0..CHUNK_Y {
+                for x in 0..CHUNK_XZ {
+                    for z in 0..CHUNK_XZ {
+                        let b = chunk.get(x, y, z);
+                        let on_border =
+                            x == 0 || x == CHUNK_XZ - 1 || z == 0 || z == CHUNK_XZ - 1;
+                        let is_seed = b == WOOD || (on_border && b == LEAVES);
+                        if is_seed && !visited[idx(x, y, z)] {
+                            visited[idx(x, y, z)] = true;
+                            queue.push_back((x, y, z));
+                        }
+                    }
+                }
+            }
+
+            const DIRS: [(i32, i32, i32); 6] =
+                [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
+            while let Some((x, y, z)) = queue.pop_front() {
+                for (dx, dy, dz) in DIRS {
+                    let nx = x as i32 + dx;
+                    let ny = y as i32 + dy;
+                    let nz = z as i32 + dz;
+                    if nx < 0
+                        || nx >= CHUNK_XZ as i32
+                        || ny < 0
+                        || ny >= CHUNK_Y as i32
+                        || nz < 0
+                        || nz >= CHUNK_XZ as i32
+                    {
+                        continue;
+                    }
+                    let (nx, ny, nz) = (nx as usize, ny as usize, nz as usize);
+                    if !visited[idx(nx, ny, nz)] && chunk.get(nx, ny, nz) == LEAVES {
+                        visited[idx(nx, ny, nz)] = true;
+                        queue.push_back((nx, ny, nz));
+                    }
+                }
+            }
+
+            for y in 0..CHUNK_Y {
+                for x in 0..CHUNK_XZ {
+                    for z in 0..CHUNK_XZ {
+                        if chunk.get(x, y, z) == LEAVES && !visited[idx(x, y, z)] {
+                            chunk.set(x, y, z, AIR);
+                        }
+                    }
+                }
+            }
+        }
+
         chunk
     }
 
@@ -322,6 +405,12 @@ impl WorldGenerator {
     /// Write the leaves of a canopy centred at world voxel `(wvx, canopy_wy, wvz)`
     /// into `chunk`, clipping to the chunk's local bounds.  Only AIR voxels are
     /// overwritten (trunks and terrain are preserved).
+    ///
+    /// The sphere radius is warped per-voxel by multi-frequency 3-D Perlin noise
+    /// (±40 %), so each tree gets an organic, bumpy silhouette.  The inner 60 %
+    /// of the sphere is always solid; only the outer shell is noise-dependent,
+    /// so the canopy stays well-connected.  Isolated floating voxels are removed
+    /// by the BFS connectivity pass that runs after all vegetation is placed.
     fn place_canopy_clipped(
         &self,
         chunk: &mut Chunk,
@@ -332,12 +421,37 @@ impl WorldGenerator {
         wvz: i32,
         radius: i32,
     ) {
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                for dz in -radius..=radius {
-                    if dx * dx + dy * dy + dz * dz > radius * radius + 1 {
-                        continue;
-                    }
+        let vpb = self.voxels_per_block as f64;
+        let r = radius as f32;
+        // The noise can add at most 40 % to the radius, so we extend the
+        // bounding box by that amount (plus one voxel for safety).
+        let r_max = (r * 1.40) as i32 + 1;
+        // Precompute thresholds to skip the FBM call for the solid inner core
+        // and the empty outer region.
+        let r_inner_sq = (r * 0.60) * (r * 0.60);
+        let r_outer_sq = (r * 1.40 + 1.0) * (r * 1.40 + 1.0);
+
+        for dy in -r_max..=r_max {
+            for dx in -r_max..=r_max {
+                for dz in -r_max..=r_max {
+                    let dist_sq = (dx * dx + dy * dy + dz * dz) as f32;
+                    // Definitely outside — skip without noise lookup.
+                    if dist_sq > r_outer_sq { continue; }
+
+                    let place = if dist_sq <= r_inner_sq {
+                        // Definitely inside — no noise needed.
+                        true
+                    } else {
+                        // Transition shell: warp radius with 3-D FBM noise.
+                        let nx = (wvx + dx) as f64 / vpb;
+                        let ny = (canopy_wy + dy) as f64 / vpb;
+                        let nz = (wvz + dz) as f64 / vpb;
+                        let n = self.leaf_fbm.get([nx, ny, nz]) as f32;
+                        let r_eff = r * (1.0 + n * 0.40);
+                        dist_sq <= r_eff * r_eff
+                    };
+                    if !place { continue; }
+
                     let lx = wvx + dx - chunk_ox;
                     let ly = canopy_wy + dy;
                     let lz = wvz + dz - chunk_oz;
