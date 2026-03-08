@@ -97,12 +97,17 @@ impl WorldGenerator {
         let mut chunk = Chunk::new();
 
         // Scale-dependent parameters derived from `voxels_per_block` (vpb).
-        // Expressing heights in Minecraft-block units and multiplying by vpb
-        // keeps the world visually consistent regardless of voxel resolution.
         let vpb = self.voxels_per_block as f32;
+        let vpb_d = self.voxels_per_block as f64;
         let terrain_base: i32 = (8.0 * vpb) as i32; // 8 MC blocks above bedrock
         let terrain_amp: f32 = 10.0 * vpb; // ±10 MC blocks amplitude
-        let grass_slope_max: f32 = 1.8 * vpb; // voxels/cell threshold for grass
+
+        // Slope threshold in voxels-of-height per voxel-of-horizontal-distance.
+        // When noise is sampled in MC-block coords (see below), adjacent-voxel
+        // height differences scale as terrain_amp / (feature_width_voxels)
+        // = (10·vpb) / (8.3·vpb) ≈ 1.2, independent of vpb — so a constant
+        // threshold gives consistent grass/rock coverage at any resolution.
+        let grass_slope_max: f32 = 0.8;
 
         // ---- Step 1: build per-column heightmap and slope ----------------
         // We sample a (CHUNK_XZ+1)×(CHUNK_XZ+1) grid so we can compute
@@ -113,14 +118,17 @@ impl WorldGenerator {
 
         for (gx, row) in height_grid.iter_mut().enumerate() {
             for (gz, cell) in row.iter_mut().enumerate() {
-                let wx = (cx * CHUNK_XZ as i32 + gx as i32) as f64 * VOXEL_SIZE as f64;
-                let wz = (cz * CHUNK_XZ as i32 + gz as i32) as f64 * VOXEL_SIZE as f64;
+                // Sample noise in Minecraft-block coordinates (voxel index / vpb).
+                // This makes terrain feature width scale with vpb so hills cover
+                // the same number of MC blocks at any voxel resolution.
+                let mx = (cx * CHUNK_XZ as i32 + gx as i32) as f64 / vpb_d;
+                let mz = (cz * CHUNK_XZ as i32 + gz as i32) as f64 / vpb_d;
 
                 // Base FBM in [−1, +1].  Low frequency (0.12) keeps features
-                // broad relative to the 18 m viewport — no micro-spikes.
-                let h = self.height_fbm.get([wx * 0.12, wz * 0.12]);
+                // broad relative to the viewport — no micro-spikes.
+                let h = self.height_fbm.get([mx * 0.12, mz * 0.12]);
                 // Detail layer adds gentle surface variation (reduced weight).
-                let d = self.detail_fbm.get([wx * 0.28, wz * 0.28]) * 0.08;
+                let d = self.detail_fbm.get([mx * 0.28, mz * 0.28]) * 0.08;
                 let combined = (h + d).clamp(-1.0, 1.0);
                 // Mild non-linear bias: slightly flatten peaks, deepen valleys
                 // to give a Mediterranean eroded-limestone feel without spikes.
@@ -156,12 +164,13 @@ impl WorldGenerator {
                         continue;
                     }
 
-                    // Cave carving.
-                    let world_x = (cx * CHUNK_XZ as i32 + x as i32) as f64 * VOXEL_SIZE as f64;
-                    let world_z = (cz * CHUNK_XZ as i32 + z as i32) as f64 * VOXEL_SIZE as f64;
+                    // Cave carving — sample in MC-block coords so cave feature
+                    // size scales with vpb just like surface terrain.
+                    let mc_x = (cx * CHUNK_XZ as i32 + x as i32) as f64 / vpb_d;
+                    let mc_z = (cz * CHUNK_XZ as i32 + z as i32) as f64 / vpb_d;
                     // Compress Y so caves are elongated horizontally (tunnel-like).
-                    let world_y = y as f64 * VOXEL_SIZE as f64 * 0.5;
-                    let cave_n = self.cave_fbm.get([world_x * 0.5, world_y * 0.7, world_z * 0.5]);
+                    let mc_y = y as f64 / vpb_d * 0.5;
+                    let cave_n = self.cave_fbm.get([mc_x * 0.5, mc_y * 0.7, mc_z * 0.5]);
                     if cave_n > CAVE_THRESHOLD && y > CAVE_MIN_Y as usize {
                         // Check for cave glow: small clusters at mid-cave height.
                         let glow_hash = lcg_hash(
@@ -197,12 +206,13 @@ impl WorldGenerator {
         }
 
         // ---- Step 3: vegetation -----------------------------------------
-        // Vegetation is placed based on slope only — the surface block is by
-        // definition the topmost solid block, so sky visibility is always 1.0
-        // and the old sky_vis proxy (which was based on absolute Y height and
-        // always returned near-zero for low-amplitude terrain) is removed.
-        for x in 0..CHUNK_XZ {
-            for z in 0..CHUNK_XZ {
+        // Vegetation density is expressed in Minecraft blocks, not voxels.
+        // We only consider voxel columns that sit at a MC-block boundary
+        // (local_x % vpb == 0, local_z % vpb == 0).  This keeps tree/shrub
+        // counts constant regardless of voxels_per_block.
+        let vpb_usize = self.voxels_per_block as usize;
+        for x in (0..CHUNK_XZ).step_by(vpb_usize.max(1)) {
+            for z in (0..CHUNK_XZ).step_by(vpb_usize.max(1)) {
                 let surface_y = height_grid[x][z];
                 if surface_y as usize >= CHUNK_Y - 10 || surface_y < CAVE_MIN_Y + 4 {
                     continue;
@@ -213,23 +223,23 @@ impl WorldGenerator {
                 let dh_dz = (height_grid[x][z + 1] - height_grid[x][z]) as f32;
                 let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
 
-                // Unique per-column deterministic hash.
+                // Hash on MC-block world coordinates so density is vpb-independent.
+                let mc_bx = (cx * CHUNK_XZ as i32 + x as i32) / self.voxels_per_block as i32;
+                let mc_bz = (cz * CHUNK_XZ as i32 + z as i32) / self.voxels_per_block as i32;
                 let col_hash = lcg_hash(
                     self.seed
-                        ^ ((cx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
-                        ^ ((cz as u64) << 32)
-                        ^ (x as u64).wrapping_mul(31)
-                        ^ (z as u64).wrapping_mul(97),
+                        ^ ((mc_bx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
+                        ^ ((mc_bz as u64) << 32),
                 );
 
                 // Olive tree: gentle slope only, hash-gated density.
-                if slope < 1.0 * vpb && col_hash.is_multiple_of(TREE_DENSITY) {
+                if slope < grass_slope_max && col_hash.is_multiple_of(TREE_DENSITY) {
                     self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
                     continue; // don't also add a shrub beneath the trunk
                 }
 
                 // Shrub: tolerates moderate slopes.
-                if slope < 2.5 * vpb
+                if slope < grass_slope_max * 2.5
                     && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
