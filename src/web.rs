@@ -114,7 +114,13 @@ impl ApplicationHandler for WasmApp {
             // Pre-fetch the scene YAML so `platform::load_bytes` can serve it
             // synchronously later when the scene is parsed inside `new_async`.
             match crate::platform::fetch_bytes(&scene_path).await {
-                Ok(bytes) => crate::platform::cache_asset(&scene_path, bytes),
+                Ok(bytes) => {
+                    // Scan the YAML for secondary asset references (mesh OBJ
+                    // files under `path:` and env-maps under `env_map:`) and
+                    // fetch them into the cache before the renderer starts.
+                    prefetch_scene_assets(&bytes).await;
+                    crate::platform::cache_asset(&scene_path, bytes);
+                }
                 Err(e) => log::warn!("scene pre-fetch failed ({e}); load will fail"),
             }
 
@@ -189,6 +195,39 @@ impl ApplicationHandler for WasmApp {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pre-fetch every secondary asset referenced by a scene YAML.
+///
+/// Scans the raw YAML bytes for `path:` (mesh OBJ files) and `env_map:`
+/// (HDR environment maps) lines and fetches each referenced file into the
+/// platform asset cache so that the synchronous `platform::load_bytes` calls
+/// inside `GpuState::new_async` find them already available.
+async fn prefetch_scene_assets(yaml_bytes: &[u8]) {
+    let text = match std::str::from_utf8(yaml_bytes) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let asset_path = if let Some(p) = trimmed.strip_prefix("path:") {
+            p.trim()
+        } else if let Some(p) = trimmed.strip_prefix("env_map:") {
+            p.trim()
+        } else {
+            continue;
+        };
+        if asset_path.is_empty() {
+            continue;
+        }
+        match crate::platform::fetch_bytes(asset_path).await {
+            Ok(bytes) => {
+                log::info!("pre-fetched asset: {asset_path}");
+                crate::platform::cache_asset(asset_path, bytes);
+            }
+            Err(e) => log::warn!("asset pre-fetch failed ({asset_path}): {e}"),
+        }
+    }
+}
 
 /// Extract `?scene=<name>` from the current URL and return the asset path.
 ///
