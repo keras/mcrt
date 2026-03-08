@@ -36,6 +36,13 @@ use winit::{
 // Phase 15: egui immediate-mode GUI.
 use egui_wgpu::ScreenDescriptor;
 
+/// All scenes available in the UI scene picker: (display name, asset path).
+const SCENES: &[(&str, &str)] = &[
+    ("Cornell Box", "assets/cornell-box.yaml"),
+    ("Demo Scene",  "assets/scene.yaml"),
+    ("Skybox",      "assets/skybox.yaml"),
+];
+
 use web_time::Instant;
 
 use crate::camera::{CameraUniform, DEFAULT_VFOV, INIT_LOOK_AT, INIT_LOOK_FROM, compute_camera};
@@ -76,12 +83,6 @@ const MAX_ZOOM: f32 = 50.0;
 
 /// WASD pan speed: world units moved per event-loop tick.
 const PAN_SPEED: f32 = 0.04;
-
-/// Default window width in pixels.
-pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;
-
-/// Default window height in pixels.
-pub const DEFAULT_WINDOW_HEIGHT: u32 = 720;
 
 // ---------------------------------------------------------------------------
 // CameraState — orbit + DOF parameters
@@ -798,6 +799,27 @@ impl GpuState {
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
 
+        // On WASM the HTML canvas drawing-buffer and its CSS display size must
+        // both be managed from Rust — wgpu does not do either automatically.
+        //
+        // • canvas.width/height (drawing buffer) must match the surface pixel size.
+        // • canvas.style.width/height: winit sets these to fixed pixel values when
+        //   it attaches to the canvas, overriding our CSS `width:100vw;height:100vh`.
+        //   We reset them to "100%" after every resize so the CSS rules win and the
+        //   canvas always fills the viewport visually.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowExtWebSys as _;
+            if let Some(canvas) = self.window.canvas() {
+                canvas.set_width(new_width);
+                canvas.set_height(new_height);
+                // Override the fixed pixel inline styles winit writes.
+                let style = canvas.style();
+                let _ = style.set_property("width",  "100%");
+                let _ = style.set_property("height", "100%");
+            }
+        }
+
         let (tex0, view0) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
         let (tex1, view1) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
         self.accum_textures = [tex0, tex1];
@@ -1086,6 +1108,7 @@ impl GpuState {
             let mut cam_changed = false;
             let mut mat_changed = false;
             let mut save_request = false;
+            let mut scene_change: Option<String> = None;
 
             let stats = RenderStats {
                 frame_count: self.frame_count,
@@ -1093,11 +1116,12 @@ impl GpuState {
                 height: self.config.height,
             };
             let full_output = egui_ctx.run(raw_input, |ctx| {
-                let (cc, mc, sr) =
-                    self.ui.build_panels(ctx, &mut self.cam_ctrl.camera, &stats);
+                let (cc, mc, sr, sc) =
+                    self.ui.build_panels(ctx, &mut self.cam_ctrl.camera, &stats, &self.scene_path);
                 cam_changed = cc;
                 mat_changed = mc;
                 save_request = sr;
+                scene_change = sc;
             });
 
             self.ui.egui_state
@@ -1124,6 +1148,25 @@ impl GpuState {
             #[cfg(not(target_arch = "wasm32"))]
             if save_request {
                 self.save_screenshot();
+            }
+            if let Some(new_path) = scene_change {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    self.scene_path = new_path;
+                    self.reload_scene();
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // On WASM the whole renderer must be re-initialised for a new
+                    // scene (async pre-fetch + GPU rebuild), so navigate to the
+                    // same page with the new ?scene= query parameter.
+                    let name = new_path
+                        .trim_start_matches("assets/")
+                        .trim_end_matches(".yaml");
+                    if let Some(win) = web_sys::window() {
+                        let _ = win.location().set_search(&format!("?scene={name}"));
+                    }
+                }
             }
 
             // Upload any new / changed egui font textures.
@@ -1526,7 +1569,8 @@ impl UiState {
         ctx: &egui::Context,
         camera: &mut CameraState,
         stats: &RenderStats,
-    ) -> (bool, bool, bool) {
+        scene_path: &str,
+    ) -> (bool, bool, bool, Option<String>) {
         let denoise_enabled = &mut self.denoise_enabled;
         let dp = &mut self.denoise_params;
         let material_data = &mut self.material_data_cpu;
@@ -1540,6 +1584,7 @@ impl UiState {
         let mut cam_changed = false;
         let mut mat_changed = false;
         let mut save_request = false;
+        let mut scene_change: Option<String> = None;
 
         egui::SidePanel::right("mcrt_panel")
         .resizable(true)
@@ -1547,6 +1592,29 @@ impl UiState {
         .default_width(270.0)
         .show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
+                // ── Scene ─────────────────────────────────────────────────
+                ui.add_space(4.0);
+                ui.heading("Scene");
+                ui.separator();
+                let current_label = SCENES
+                    .iter()
+                    .find(|(_, path)| *path == scene_path)
+                    .map(|(label, _)| *label)
+                    .unwrap_or("Custom");
+                egui::ComboBox::from_id_salt("scene_picker")
+                    .selected_text(current_label)
+                    .width(ui.available_width())
+                    .show_ui(ui, |ui| {
+                        for (label, path) in SCENES {
+                            if ui.selectable_label(*path == scene_path, *label).clicked()
+                                && *path != scene_path
+                            {
+                                scene_change = Some(path.to_string());
+                            }
+                        }
+                    });
+                ui.add_space(8.0);
+
                 // ── Render Stats ──────────────────────────────────────────
                 ui.add_space(4.0);
                 ui.heading("Render Stats");
@@ -1715,7 +1783,7 @@ impl UiState {
             });
         });
 
-        (cam_changed, mat_changed, save_request)
+        (cam_changed, mat_changed, save_request, scene_change)
     }
 }
 

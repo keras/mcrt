@@ -29,7 +29,7 @@ use winit::{
 use winit::platform::web::EventLoopExtWebSys as _;
 use winit::platform::web::WindowAttributesExtWebSys as _;
 
-use crate::gpu::{GpuState, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
+use crate::gpu::GpuState;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -88,15 +88,18 @@ impl ApplicationHandler for WasmApp {
             .and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok())
             .expect("no <canvas id=\"canvas\"> found in the page");
 
+        // Read the actual browser viewport so the canvas starts at the right
+        // resolution rather than the hardcoded 1280×720 fallback.
+        let js_win = web_sys::window().expect("no JS window");
+        let vw = js_win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1280.0) as u32;
+        let vh = js_win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(720.0) as u32;
+
         let window = Arc::new(
             event_loop
                 .create_window(
                     Window::default_attributes()
                         .with_title("mcrt — path tracer")
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            DEFAULT_WINDOW_WIDTH,
-                            DEFAULT_WINDOW_HEIGHT,
-                        ))
+                        .with_inner_size(winit::dpi::LogicalSize::new(vw, vh))
                         .with_canvas(Some(canvas)),
                 )
                 .expect("failed to create window"),
@@ -111,7 +114,13 @@ impl ApplicationHandler for WasmApp {
             // Pre-fetch the scene YAML so `platform::load_bytes` can serve it
             // synchronously later when the scene is parsed inside `new_async`.
             match crate::platform::fetch_bytes(&scene_path).await {
-                Ok(bytes) => crate::platform::cache_asset(&scene_path, bytes),
+                Ok(bytes) => {
+                    // Scan the YAML for secondary asset references (mesh OBJ
+                    // files under `path:` and env-maps under `env_map:`) and
+                    // fetch them into the cache before the renderer starts.
+                    prefetch_scene_assets(&bytes).await;
+                    crate::platform::cache_asset(&scene_path, bytes);
+                }
                 Err(e) => log::warn!("scene pre-fetch failed ({e}); load will fail"),
             }
 
@@ -173,6 +182,28 @@ impl ApplicationHandler for WasmApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Poll the true viewport size every frame and resize the GPU surface if
+        // it has changed.
+        //
+        // We use window.innerWidth/Height (not canvas.client_width/height) because
+        // winit sets canvas.style.width/height to fixed pixel values when it
+        // attaches to the canvas, which overrides our CSS and makes client_width
+        // always return the initial size regardless of the viewport size.
+        {
+            let canvas_size = web_sys::window().and_then(|js_win| {
+                let dpr = js_win.device_pixel_ratio();
+                let pw = (js_win.inner_width() .ok()?.as_f64()? * dpr).round() as u32;
+                let ph = (js_win.inner_height().ok()?.as_f64()? * dpr).round() as u32;
+                (pw > 0 && ph > 0).then_some((pw, ph))
+            });
+            if let Some((pw, ph)) = canvas_size {
+                if let Some(state) = self.state.borrow_mut().as_mut() {
+                    if pw != state.surface_width() || ph != state.surface_height() {
+                        state.resize(pw, ph);
+                    }
+                }
+            }
+        }
         // Drive continuous rendering and WASD translation.
         if let Some(window) = self.window_slot.borrow().as_ref() {
             window.request_redraw();
@@ -186,6 +217,39 @@ impl ApplicationHandler for WasmApp {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Pre-fetch every secondary asset referenced by a scene YAML.
+///
+/// Scans the raw YAML bytes for `path:` (mesh OBJ files) and `env_map:`
+/// (HDR environment maps) lines and fetches each referenced file into the
+/// platform asset cache so that the synchronous `platform::load_bytes` calls
+/// inside `GpuState::new_async` find them already available.
+async fn prefetch_scene_assets(yaml_bytes: &[u8]) {
+    let text = match std::str::from_utf8(yaml_bytes) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let asset_path = if let Some(p) = trimmed.strip_prefix("path:") {
+            p.trim()
+        } else if let Some(p) = trimmed.strip_prefix("env_map:") {
+            p.trim()
+        } else {
+            continue;
+        };
+        if asset_path.is_empty() {
+            continue;
+        }
+        match crate::platform::fetch_bytes(asset_path).await {
+            Ok(bytes) => {
+                log::info!("pre-fetched asset: {asset_path}");
+                crate::platform::cache_asset(asset_path, bytes);
+            }
+            Err(e) => log::warn!("asset pre-fetch failed ({asset_path}): {e}"),
+        }
+    }
+}
 
 /// Extract `?scene=<name>` from the current URL and return the asset path.
 ///

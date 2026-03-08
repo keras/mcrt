@@ -17,5 +17,5 @@ public_url = "./"
 
 [watch]
 # Rebuild on changes to Rust sources, web assets, or scene assets.
-paths = ["src", "web", "assets"]
+paths = ["src", "web", "assets", "models"]
 ignore = ["dist"]

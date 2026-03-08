@@ -8,19 +8,20 @@
   <link data-trunk rel="rust" href=".." />
   <!-- Trunk: copy the assets/ directory into dist/ for browser fetch access. -->
   <link data-trunk rel="copy-dir" href="../assets" />
+  <!-- Trunk: copy the models/ directory so mesh scenes (e.g. bunny) can load. -->
+  <link data-trunk rel="copy-dir" href="../models" />
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body {
       width: 100%; height: 100%;
       background: #111;
-      display: flex;
-      align-items: center;
-      justify-content: center;
       overflow: hidden;
     }
     canvas {
       display: block;
-      /* winit sizes the canvas; we just let it fill the viewport. */
+      /* Fill the viewport at all times.  The drawing-buffer (canvas.width /
+         canvas.height) is kept in sync from Rust via wgpu surface.configure()
+         + the per-frame size poll in web.rs about_to_wait(). */
       width: 100vw;
       height: 100vh;
     }
@@ -41,13 +42,30 @@
   <div id="loading">Loading WebGPU path tracer…</div>
 
   <script>
-    // Hide the loading overlay once winit starts painting the canvas.
+    const canvas = document.getElementById('canvas');
+
+    // Set the drawing-buffer size once before WASM loads so the canvas has
+    // the right physical resolution during the loading animation.
+    // After GPU initialisation, Rust owns canvas.width / canvas.height:
+    //   • resize() calls canvas.set_width/set_height after surface.configure()
+    //   • about_to_wait() polls client dimensions each frame as a safety net
+    // No ongoing JS resize listeners are registered — they race with the GPU
+    // surface configuration and cause the stretched-render artefact.
+    (function() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = Math.round(window.innerWidth  * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+    })();
+
+    // -------------------------------------------------------------------------
+    // Loading overlay — hide once winit starts painting the canvas.
+    // -------------------------------------------------------------------------
     const loading = document.getElementById('loading');
     const obs = new MutationObserver(() => {
       loading.style.display = 'none';
       obs.disconnect();
     });
-    obs.observe(document.getElementById('canvas'), { attributes: true });
+    obs.observe(canvas, { attributes: true });
     // Fallback: hide after 5 s regardless.
     setTimeout(() => { loading.style.display = 'none'; }, 5000);
   </script>
