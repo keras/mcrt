@@ -15,7 +15,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use crate::gpu::{GpuState, DEFAULT_WINDOW_HEIGHT, DEFAULT_WINDOW_WIDTH};
+use crate::gpu::GpuState;
 
 // ---------------------------------------------------------------------------
 // App
@@ -56,10 +56,7 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("mcrt — path tracer")
-                        .with_inner_size(winit::dpi::LogicalSize::new(
-                            DEFAULT_WINDOW_WIDTH,
-                            DEFAULT_WINDOW_HEIGHT,
-                        )),
+                        .with_inner_size(winit::dpi::LogicalSize::new(1280_u32, 720_u32)),
                 )
                 .expect("failed to create window"),
         );

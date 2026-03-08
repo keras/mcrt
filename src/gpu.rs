@@ -77,12 +77,6 @@ const MAX_ZOOM: f32 = 50.0;
 /// WASD pan speed: world units moved per event-loop tick.
 const PAN_SPEED: f32 = 0.04;
 
-/// Default window width in pixels.
-pub const DEFAULT_WINDOW_WIDTH: u32 = 1280;
-
-/// Default window height in pixels.
-pub const DEFAULT_WINDOW_HEIGHT: u32 = 720;
-
 // ---------------------------------------------------------------------------
 // CameraState — orbit + DOF parameters
 // ---------------------------------------------------------------------------
