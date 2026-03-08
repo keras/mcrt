@@ -22,19 +22,26 @@ use super::chunk::{CHUNK_XZ, CHUNK_Y, Chunk, VOXEL_SIZE};
 // Terrain constants
 // ---------------------------------------------------------------------------
 
-/// Y level of the "sea floor" / minimum terrain height (voxels).
-const TERRAIN_BASE: i32 = 64;
-/// Maximum additional height above `TERRAIN_BASE` (voxels).
-const TERRAIN_AMP: f32 = 80.0;
+/// Y level of the base terrain height (voxels).
+/// At 0.125 m/voxel this places the ground at ~3 m, well below the default
+/// camera height so the viewer starts above the landscape.
+const TERRAIN_BASE: i32 = 24;
+/// Maximum additional height above/below `TERRAIN_BASE` (voxels).
+/// 30 voxels = 3.75 m variation across an ~18 m wide footprint → rolling hills,
+/// not spiky mountains.
+const TERRAIN_AMP: f32 = 30.0;
 /// Cave noise threshold above which a voxel is carved to AIR.
-const CAVE_THRESHOLD: f64 = 0.55;
+/// Raised from 0.55 to limit caves to rarer, more interesting formations.
+const CAVE_THRESHOLD: f64 = 0.65;
 /// Minimum absolute Y for caves (keep bedrock intact).
 const CAVE_MIN_Y: i32 = 6;
-/// Gradient magnitude threshold below which the surface gets grass.
-const GRASS_SLOPE_MAX: f32 = 0.35;
-/// Hash-based vegetation density (lower = more trees).
-const TREE_DENSITY: u64 = 7;
-const SHRUB_DENSITY: u64 = 4;
+/// Gradient magnitude threshold (in voxels/cell) below which the surface gets
+/// grass.  With TERRAIN_AMP ≈ 30 over a 16-cell chunk, gentle slopes are 0–2,
+/// steep limestone faces are 3–6, so 1.8 gives ample grass on flat areas.
+const GRASS_SLOPE_MAX: f32 = 1.8;
+/// Hash-based vegetation density (lower = more vegetation).
+const TREE_DENSITY: u64 = 5;
+const SHRUB_DENSITY: u64 = 3;
 
 // ---------------------------------------------------------------------------
 // WorldGenerator
@@ -101,14 +108,15 @@ impl WorldGenerator {
                 let wx = (cx * CHUNK_XZ as i32 + gx as i32) as f64 * VOXEL_SIZE as f64;
                 let wz = (cz * CHUNK_XZ as i32 + gz as i32) as f64 * VOXEL_SIZE as f64;
 
-                // Base FBM in [−1, +1]
-                let h = self.height_fbm.get([wx * 0.18, wz * 0.18]);
-                // Detail layer adds small-scale ridges
-                let d = self.detail_fbm.get([wx * 0.35, wz * 0.35]) * 0.15;
-                // Erosion carving: valleys are amplified by flow term
+                // Base FBM in [−1, +1].  Low frequency (0.12) keeps features
+                // broad relative to the 18 m viewport — no micro-spikes.
+                let h = self.height_fbm.get([wx * 0.12, wz * 0.12]);
+                // Detail layer adds gentle surface variation (reduced weight).
+                let d = self.detail_fbm.get([wx * 0.28, wz * 0.28]) * 0.08;
                 let combined = (h + d).clamp(-1.0, 1.0);
-                // Non-linear mapping: flatten peaks, sharpen valleys
-                let eroded = combined.signum() * combined.abs().powf(0.75);
+                // Mild non-linear bias: slightly flatten peaks, deepen valleys
+                // to give a Mediterranean eroded-limestone feel without spikes.
+                let eroded = combined.signum() * combined.abs().powf(0.85);
 
                 let surf_y = TERRAIN_BASE + (eroded as f32 * TERRAIN_AMP) as i32;
                 *cell = surf_y.clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2);
@@ -143,9 +151,9 @@ impl WorldGenerator {
                     // Cave carving.
                     let world_x = (cx * CHUNK_XZ as i32 + x as i32) as f64 * VOXEL_SIZE as f64;
                     let world_z = (cz * CHUNK_XZ as i32 + z as i32) as f64 * VOXEL_SIZE as f64;
-                    // Compress Y to keep caves mostly below mid-terrain.
-                    let world_y = y as f64 * VOXEL_SIZE as f64 * 0.6;
-                    let cave_n = self.cave_fbm.get([world_x * 0.4, world_y * 0.6, world_z * 0.4]);
+                    // Compress Y so caves are elongated horizontally (tunnel-like).
+                    let world_y = y as f64 * VOXEL_SIZE as f64 * 0.5;
+                    let cave_n = self.cave_fbm.get([world_x * 0.5, world_y * 0.7, world_z * 0.5]);
                     if cave_n > CAVE_THRESHOLD && y > CAVE_MIN_Y as usize {
                         // Check for cave glow: small clusters at mid-cave height.
                         let glow_hash = lcg_hash(
@@ -163,10 +171,10 @@ impl WorldGenerator {
                     }
 
                     // Sub-surface stratigraphy:
-                    //   top 3 layers → red soil in gentle valleys
-                    //   below → limestone
+                    //   top 5 layers → terra-rossa red soil on gentle terrain
+                    //   below → limestone bedrock
                     let depth_from_surface = surface_y as usize - y;
-                    if depth_from_surface < 3 && slope < GRASS_SLOPE_MAX * 2.0 {
+                    if depth_from_surface < 5 && slope < GRASS_SLOPE_MAX * 2.0 {
                         chunk.set(x, y, z, RED_SOIL);
                     } else {
                         chunk.set(x, y, z, LIMESTONE);
@@ -181,6 +189,10 @@ impl WorldGenerator {
         }
 
         // ---- Step 3: vegetation -----------------------------------------
+        // Vegetation is placed based on slope only — the surface block is by
+        // definition the topmost solid block, so sky visibility is always 1.0
+        // and the old sky_vis proxy (which was based on absolute Y height and
+        // always returned near-zero for low-amplitude terrain) is removed.
         for x in 0..CHUNK_XZ {
             for z in 0..CHUNK_XZ {
                 let surface_y = height_grid[x][z];
@@ -188,17 +200,12 @@ impl WorldGenerator {
                     continue;
                 }
 
-                // Slope at this column.
+                // Slope at this column (voxel-height difference per adjacent cell).
                 let dh_dx = (height_grid[x + 1][z] - height_grid[x][z]) as f32;
                 let dh_dz = (height_grid[x][z + 1] - height_grid[x][z]) as f32;
                 let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
 
-                // Sky visibility: approximate by checking if nothing blocks upward.
-                // A voxel at surface_y+1 should be AIR after step 2.
-                // We use surface_y relative to CHUNK_Y as a simple proxy.
-                let sky_vis = surface_y as f32 / (CHUNK_Y as f32 * 0.9);
-
-                // Unique per-column hash.
+                // Unique per-column deterministic hash.
                 let col_hash = lcg_hash(
                     self.seed
                         ^ ((cx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
@@ -207,14 +214,15 @@ impl WorldGenerator {
                         ^ (z as u64).wrapping_mul(97),
                 );
 
-                // Olive tree: gentle slope, high sky exposure.
-                if slope < 0.25 && sky_vis > 0.55 && col_hash.is_multiple_of(TREE_DENSITY) {
+                // Olive tree: gentle slope only, hash-gated density.
+                if slope < 1.0 && col_hash.is_multiple_of(TREE_DENSITY) {
                     self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
-                    continue;
+                    continue; // don't also add a shrub beneath the trunk
                 }
 
-                // Shrub: tolerates steeper slopes, lower sky exposure.
-                if slope < 0.55 && sky_vis > 0.30 && col_hash % SHRUB_DENSITY == 1
+                // Shrub: tolerates moderate slopes.
+                if slope < 2.5
+                    && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
                     chunk.set(x, surface_y as usize + 1, z, SHRUB);

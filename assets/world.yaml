@@ -1,8 +1,9 @@
 # Procedural Mediterranean Voxel World — Demo Scene
 #
 # Generates a 9×9 chunk region (≈ 18 m × 18 m) of eroded limestone terrain
-# with karst caves, terra-rossa soil, dry Mediterranean vegetation (olive
-# trees, shrubs), and a large emissive sky sphere for ambient lighting.
+# with karst caves, terra-rossa soil, and dry Mediterranean vegetation (olive
+# trees, shrubs).  Lighting comes from the built-in procedural sky gradient —
+# no emissive sphere needed, and no over-exposure.
 #
 # Usage (interactive):
 #   cargo run -- --load-scene-yaml assets/world.yaml
@@ -12,13 +13,15 @@
 #                --width 1280 --height 720 --spp 64
 
 camera:
-  look_from: [0.0, 7.0, 14.0]
-  look_at:   [0.0, 2.0, 0.0]
+  # Camera sits ~3–5 m above the tallest terrain (max surface ≈ 6 m world-Y).
+  # A 50° FOV and gentle downward angle give a wide landscape overview.
+  look_from: [0.0, 9.0, 18.0]
+  look_at:   [0.0, 3.0, 0.0]
   vfov: 50.0
   aperture: 0.0
 
 # World generator parameters.
-# Removing this block disables world generation (scene becomes sky-sphere only).
+# Removing this block disables world generation entirely.
 world:
   seed: 42
   view_distance: 4    # (2*4+1)² = 81 chunks, 18 m × 18 m footprint
@@ -26,30 +29,20 @@ world:
 # Block material palette — must contain an entry for each block type used by
 # the generator.  Names match BLOCK_META[id].material_name in block.rs.
 world_materials:
-  limestone: { type: lambertian, albedo: [0.82, 0.78, 0.70] }
-  red_soil:  { type: lambertian, albedo: [0.55, 0.25, 0.15] }
-  grass:     { type: lambertian, albedo: [0.35, 0.42, 0.18] }
+  limestone: { type: lambertian, albedo: [0.80, 0.76, 0.68] }
+  red_soil:  { type: lambertian, albedo: [0.52, 0.22, 0.12] }
+  grass:     { type: lambertian, albedo: [0.32, 0.45, 0.18] }
   sand:      { type: lambertian, albedo: [0.76, 0.69, 0.50] }
   water:     { type: lambertian, albedo: [0.10, 0.30, 0.70] }
-  wood:      { type: lambertian, albedo: [0.32, 0.28, 0.20] }
-  leaves:    { type: lambertian, albedo: [0.20, 0.35, 0.15] }
-  shrub:     { type: lambertian, albedo: [0.25, 0.35, 0.12] }
+  wood:      { type: lambertian, albedo: [0.32, 0.26, 0.18] }
+  leaves:    { type: lambertian, albedo: [0.18, 0.38, 0.14] }
+  shrub:     { type: lambertian, albedo: [0.22, 0.36, 0.10] }
   gravel:    { type: lambertian, albedo: [0.45, 0.42, 0.40] }
   cave_glow:
     type: emissive
-    albedo: [0.60, 0.85, 1.00]
-    emission_strength: 3.0
+    albedo: [0.55, 0.80, 1.00]
+    emission_strength: 2.0
 
-# Static scene objects layered on top of the generated terrain.
-materials:
-  sky:
-    type: emissive
-    albedo: [0.72, 0.87, 1.00]
-    emission_strength: 2.5
-
-objects:
-  # Large emissive sphere acts as sky / ambient dome light.
-  - type: sphere
-    center: [0.0, 0.0, 0.0]
-    radius: 500.0
-    material: sky
+# No static objects — the procedural world provides all geometry.
+# The 'objects' key is required by the YAML parser even when empty.
+objects: []
