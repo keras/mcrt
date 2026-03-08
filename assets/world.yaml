@@ -13,18 +13,20 @@
 #                --width 1280 --height 720 --spp 64
 
 camera:
-  # Camera sits ~3–5 m above the tallest terrain (max surface ≈ 6 m world-Y).
-  # A 50° FOV and gentle downward angle give a wide landscape overview.
-  look_from: [0.0, 9.0, 18.0]
-  look_at:   [0.0, 3.0, 0.0]
-  vfov: 50.0
+  # With voxels_per_block=8: terrain_base=8m, terrain_amp=10m → max surface
+  # ~18 m.  Trees add up to 5 MC blocks (=5 m) → treetops ≤ 23 m.
+  # Camera at 30 m sits comfortably above everything.
+  look_from: [0.0, 30.0, 50.0]
+  look_at:   [0.0,  8.0,  0.0]
+  vfov: 55.0
   aperture: 0.0
 
 # World generator parameters.
 # Removing this block disables world generation entirely.
 world:
   seed: 42
-  view_distance: 4    # (2*4+1)² = 81 chunks, 18 m × 18 m footprint
+  view_distance: 4          # (2*4+1)² = 81 chunks, 18 m × 18 m footprint
+  voxels_per_block: 8       # 1 MC block = 8 MCRT voxels = 1 m physical
 
 # Block material palette — must contain an entry for each block type used by
 # the generator.  Names match BLOCK_META[id].material_name in block.rs.

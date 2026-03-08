@@ -22,26 +22,22 @@ use super::chunk::{CHUNK_XZ, CHUNK_Y, Chunk, VOXEL_SIZE};
 // Terrain constants
 // ---------------------------------------------------------------------------
 
-/// Y level of the base terrain height (voxels).
-/// At 0.125 m/voxel this places the ground at ~3 m, well below the default
-/// camera height so the viewer starts above the landscape.
-const TERRAIN_BASE: i32 = 24;
-/// Maximum additional height above/below `TERRAIN_BASE` (voxels).
-/// 30 voxels = 3.75 m variation across an ~18 m wide footprint → rolling hills,
-/// not spiky mountains.
-const TERRAIN_AMP: f32 = 30.0;
 /// Cave noise threshold above which a voxel is carved to AIR.
-/// Raised from 0.55 to limit caves to rarer, more interesting formations.
 const CAVE_THRESHOLD: f64 = 0.65;
 /// Minimum absolute Y for caves (keep bedrock intact).
 const CAVE_MIN_Y: i32 = 6;
-/// Gradient magnitude threshold (in voxels/cell) below which the surface gets
-/// grass.  With TERRAIN_AMP ≈ 30 over a 16-cell chunk, gentle slopes are 0–2,
-/// steep limestone faces are 3–6, so 1.8 gives ample grass on flat areas.
-const GRASS_SLOPE_MAX: f32 = 1.8;
 /// Hash-based vegetation density (lower = more vegetation).
 const TREE_DENSITY: u64 = 5;
 const SHRUB_DENSITY: u64 = 3;
+
+// TERRAIN_BASE, TERRAIN_AMP and grass_slope_max are intentionally NOT
+// constants — they are computed at runtime from `voxels_per_block` so the
+// physical scale of the world can be tuned without recompiling.
+//
+// With vpb = 8 (the "1/8 Minecraft block scale" default):
+//   terrain_base     = 8  × 8  =  64 voxels =  8 m
+//   terrain_amp      = 10 × 8  =  80 voxels = 10 m  (→ max surface ≈ 18 m)
+//   grass_slope_max  = 1.8 × 8 = 14.4 voxels/cell
 
 // ---------------------------------------------------------------------------
 // WorldGenerator
@@ -50,6 +46,9 @@ const SHRUB_DENSITY: u64 = 3;
 /// Deterministic, seed-based procedural world generator.
 pub struct WorldGenerator {
     seed: u64,
+    /// Voxels per Minecraft block; scales terrain heights and vegetation sizes.
+    /// Set via the `voxels_per_block` field in the `world:` YAML block.
+    voxels_per_block: u32,
     /// Multi-octave SuperSimplex noise for the base heightmap.
     height_fbm: Fbm<SuperSimplex>,
     /// Secondary FBM layer for slope-driven erosion detail.
@@ -63,7 +62,7 @@ impl WorldGenerator {
     ///
     /// The `noise` crate accepts a `u32` seed, so we fold the 64-bit seed
     /// into 32 bits via XOR-fold and mix offsets for each noise layer.
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, voxels_per_block: u32) -> Self {
         let s32 = ((seed ^ (seed >> 32)) & 0xffff_ffff) as u32;
 
         let height_fbm = Fbm::<SuperSimplex>::new(s32)
@@ -86,6 +85,7 @@ impl WorldGenerator {
 
         Self {
             seed,
+            voxels_per_block,
             height_fbm,
             detail_fbm,
             cave_fbm,
@@ -95,6 +95,14 @@ impl WorldGenerator {
     /// Generate the chunk at column coordinates `(cx, cz)`.
     pub fn generate_chunk(&self, cx: i32, cz: i32) -> Box<Chunk> {
         let mut chunk = Chunk::new();
+
+        // Scale-dependent parameters derived from `voxels_per_block` (vpb).
+        // Expressing heights in Minecraft-block units and multiplying by vpb
+        // keeps the world visually consistent regardless of voxel resolution.
+        let vpb = self.voxels_per_block as f32;
+        let terrain_base: i32 = (8.0 * vpb) as i32; // 8 MC blocks above bedrock
+        let terrain_amp: f32 = 10.0 * vpb; // ±10 MC blocks amplitude
+        let grass_slope_max: f32 = 1.8 * vpb; // voxels/cell threshold for grass
 
         // ---- Step 1: build per-column heightmap and slope ----------------
         // We sample a (CHUNK_XZ+1)×(CHUNK_XZ+1) grid so we can compute
@@ -118,7 +126,7 @@ impl WorldGenerator {
                 // to give a Mediterranean eroded-limestone feel without spikes.
                 let eroded = combined.signum() * combined.abs().powf(0.85);
 
-                let surf_y = TERRAIN_BASE + (eroded as f32 * TERRAIN_AMP) as i32;
+                let surf_y = terrain_base + (eroded as f32 * terrain_amp) as i32;
                 *cell = surf_y.clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2);
             }
         }
@@ -134,7 +142,7 @@ impl WorldGenerator {
                 let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
 
                 // Determine surface material.
-                let surface_block = if slope < GRASS_SLOPE_MAX {
+                let surface_block = if slope < grass_slope_max {
                     GRASS_TYP
                 } else {
                     LIMESTONE
@@ -174,7 +182,7 @@ impl WorldGenerator {
                     //   top 5 layers → terra-rossa red soil on gentle terrain
                     //   below → limestone bedrock
                     let depth_from_surface = surface_y as usize - y;
-                    if depth_from_surface < 5 && slope < GRASS_SLOPE_MAX * 2.0 {
+                    if depth_from_surface < 5 && slope < grass_slope_max * 2.0 {
                         chunk.set(x, y, z, RED_SOIL);
                     } else {
                         chunk.set(x, y, z, LIMESTONE);
@@ -215,13 +223,13 @@ impl WorldGenerator {
                 );
 
                 // Olive tree: gentle slope only, hash-gated density.
-                if slope < 1.0 && col_hash.is_multiple_of(TREE_DENSITY) {
+                if slope < 1.0 * vpb && col_hash.is_multiple_of(TREE_DENSITY) {
                     self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
                     continue; // don't also add a shrub beneath the trunk
                 }
 
                 // Shrub: tolerates moderate slopes.
-                if slope < 2.5
+                if slope < 2.5 * vpb
                     && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
@@ -235,8 +243,8 @@ impl WorldGenerator {
 
     /// Place a small olive-style tree at `(bx, base_y, bz)`.
     fn place_tree(&self, chunk: &mut Chunk, bx: usize, base_y: usize, bz: usize, hash: u64) {
-        // Trunk height: 2–5 voxels.
-        let trunk_h = 2 + (hash % 4) as usize;
+        // Trunk height: 2–5 Minecraft blocks, scaled to voxels.
+        let trunk_h = (2 + (hash % 4) as usize) * self.voxels_per_block as usize;
         for ty in 0..trunk_h {
             let y = base_y + ty;
             if y >= CHUNK_Y {
@@ -249,7 +257,8 @@ impl WorldGenerator {
 
         // Canopy: small irregular sphere of leaves, radius 1–2 voxels.
         let canopy_y = base_y + trunk_h;
-        let radius: i32 = 1 + (hash >> 3 & 1) as i32; // 1 or 2
+        // Canopy radius: 1–2 Minecraft blocks, scaled to voxels.
+        let radius: i32 = (1 + (hash >> 3 & 1) as i32) * self.voxels_per_block as i32;
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 for dz in -radius..=radius {
@@ -296,7 +305,7 @@ mod tests {
     use crate::world::chunk::{CHUNK_XZ, CHUNK_Y};
 
     fn make_gen(seed: u64) -> WorldGenerator {
-        WorldGenerator::new(seed)
+        WorldGenerator::new(seed, 8)
     }
 
     #[test]
@@ -352,8 +361,8 @@ mod tests {
 
     #[test]
     fn different_seeds_differ() {
-        let c1 = WorldGenerator::new(1).generate_chunk(0, 0);
-        let c2 = WorldGenerator::new(2).generate_chunk(0, 0);
+        let c1 = WorldGenerator::new(1, 8).generate_chunk(0, 0);
+        let c2 = WorldGenerator::new(2, 8).generate_chunk(0, 0);
         assert_ne!(c1.blocks, c2.blocks, "different seeds produced identical chunks");
     }
 

@@ -258,10 +258,19 @@ struct WorldDesc {
     /// `view_distance = 4` → 9×9 = 81 chunks ≈ 18 m × 18 m footprint.
     #[serde(default = "default_view_distance")]
     view_distance: i32,
+    /// Voxels per Minecraft block.  Scales all terrain heights and
+    /// vegetation sizes uniformly.  Default 8 = 0.125 m per voxel ("1/8
+    /// block scale").  Set to 1 for 1:1 voxel-to-block mapping.
+    #[serde(default = "default_voxels_per_block")]
+    voxels_per_block: u32,
 }
 
 fn default_view_distance() -> i32 {
     4
+}
+
+fn default_voxels_per_block() -> u32 {
+    8
 }
 
 /// Top-level structure of a YAML scene file.
@@ -938,6 +947,7 @@ pub(crate) fn load_scene_from_str(text: &str, source: &str) -> Result<LoadedScen
     let world_config = scene.world.as_ref().map(|w| crate::world::WorldConfig {
         seed: w.seed,
         view_distance: w.view_distance,
+        voxels_per_block: w.voxels_per_block,
     });
 
     Ok(LoadedScene {

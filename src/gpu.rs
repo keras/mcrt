@@ -390,7 +390,7 @@ fn build_world_geometry(loaded: &mut crate::scene::LoadedScene) -> Option<WorldS
 
     let wc = loaded.world_config.as_ref()?.clone();
 
-    let generator = WorldGenerator::new(wc.seed);
+    let generator = WorldGenerator::new(wc.seed, wc.voxels_per_block);
     let material_map = BlockMaterialMap::from_palette(&loaded.world_material_name_to_slot);
 
     // Generate and mesh all visible chunks around the world origin.

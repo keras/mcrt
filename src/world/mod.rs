@@ -35,6 +35,13 @@ pub struct WorldConfig {
     /// Half-size of the square chunk region rendered around the world origin.
     /// `view_distance = 4` loads a 9×9 = 81 chunk area (≈ 18 m × 18 m).
     pub view_distance: i32,
+    /// Number of MCRT voxels that equal one Minecraft block.
+    ///
+    /// At `VOXEL_SIZE = 0.125 m`, one Minecraft block = 8 voxels (the
+    /// "1/8 block scale" design target).  Set to 1 for a 1:1 voxel-to-block
+    /// mapping (1 voxel = 1 m), or any positive integer in between.
+    /// All terrain heights and vegetation sizes scale proportionally.
+    pub voxels_per_block: u32,
 }
 
 impl Default for WorldConfig {
@@ -42,6 +49,7 @@ impl Default for WorldConfig {
         Self {
             seed: 0,
             view_distance: 4,
+            voxels_per_block: 8,
         }
     }
 }
