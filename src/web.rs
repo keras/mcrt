@@ -182,6 +182,32 @@ impl ApplicationHandler for WasmApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Poll the canvas CSS layout size every frame and resize the GPU surface
+        // if it has changed.  winit's ResizeObserver fires asynchronously; this
+        // polling closes the gap so the surface is always correctly sized before
+        // the next redraw — eliminating the stretched-render artefact that occurs
+        // when surface.configure() and canvas.width diverge for even one frame.
+        {
+            let canvas_size = {
+                let win = self.window_slot.borrow();
+                win.as_ref().and_then(|w| {
+                    use winit::platform::web::WindowExtWebSys as _;
+                    let canvas = w.canvas()?;
+                    let js_win = web_sys::window()?;
+                    let dpr = js_win.device_pixel_ratio();
+                    let pw = (canvas.client_width()  as f64 * dpr).round() as u32;
+                    let ph = (canvas.client_height() as f64 * dpr).round() as u32;
+                    (pw > 0 && ph > 0).then_some((pw, ph))
+                })
+            };
+            if let Some((pw, ph)) = canvas_size {
+                if let Some(state) = self.state.borrow_mut().as_mut() {
+                    if pw != state.surface_width() || ph != state.surface_height() {
+                        state.resize(pw, ph);
+                    }
+                }
+            }
+        }
         // Drive continuous rendering and WASD translation.
         if let Some(window) = self.window_slot.borrow().as_ref() {
             window.request_redraw();

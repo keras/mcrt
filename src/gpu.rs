@@ -799,6 +799,19 @@ impl GpuState {
         self.config.height = new_height;
         self.surface.configure(&self.device, &self.config);
 
+        // On WASM the HTML canvas width/height attributes must be kept in sync
+        // with the wgpu surface manually — wgpu does not write them itself.
+        // Doing it here (the single place that calls surface.configure) avoids
+        // any race between JavaScript and the GPU surface.
+        #[cfg(target_arch = "wasm32")]
+        {
+            use winit::platform::web::WindowExtWebSys as _;
+            if let Some(canvas) = self.window.canvas() {
+                canvas.set_width(new_width);
+                canvas.set_height(new_height);
+            }
+        }
+
         let (tex0, view0) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
         let (tex1, view1) = gpu_layout::create_accum_texture(&self.device, new_width, new_height);
         self.accum_textures = [tex0, tex1];

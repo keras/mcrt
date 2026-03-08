@@ -19,8 +19,9 @@
     }
     canvas {
       display: block;
-      /* Fill the viewport; the ResizeObserver below keeps the drawing-buffer
-         (canvas.width / canvas.height) in sync with the actual pixel size. */
+      /* Fill the viewport at all times.  The drawing-buffer (canvas.width /
+         canvas.height) is kept in sync from Rust via wgpu surface.configure()
+         + the per-frame size poll in web.rs about_to_wait(). */
       width: 100vw;
       height: 100vh;
     }
@@ -41,40 +42,20 @@
   <div id="loading">Loading WebGPU path tracer…</div>
 
   <script>
-    // -------------------------------------------------------------------------
-    // Dynamic canvas sizing — keep the drawing buffer in sync with the viewport.
-    //
-    // The canvas CSS is 100vw × 100vh, so the element always fills the window.
-    // We still need to update canvas.width / canvas.height (the drawing-buffer
-    // resolution) whenever the browser is resized, accounting for devicePixelRatio.
-    // winit's own ResizeObserver then detects the attribute change and fires a
-    // WindowEvent::Resized so the GPU surface is recreated at the new size.
-    // -------------------------------------------------------------------------
     const canvas = document.getElementById('canvas');
 
-    function syncCanvasSize() {
+    // Set the drawing-buffer size once before WASM loads so the canvas has
+    // the right physical resolution during the loading animation.
+    // After GPU initialisation, Rust owns canvas.width / canvas.height:
+    //   • resize() calls canvas.set_width/set_height after surface.configure()
+    //   • about_to_wait() polls client dimensions each frame as a safety net
+    // No ongoing JS resize listeners are registered — they race with the GPU
+    // surface configuration and cause the stretched-render artefact.
+    (function() {
       const dpr = window.devicePixelRatio || 1;
-      const w = Math.round(window.innerWidth  * dpr);
-      const h = Math.round(window.innerHeight * dpr);
-      if (canvas.width !== w || canvas.height !== h) {
-        canvas.width  = w;
-        canvas.height = h;
-      }
-    }
-
-    // Initial sizing before WASM starts (winit will read innerWidth/Height, but
-    // setting the attributes early avoids a blank frame at wrong resolution).
-    syncCanvasSize();
-
-    // Keep in sync whenever the viewport or DPR changes.
-    window.addEventListener('resize', syncCanvasSize);
-
-    // Also cover DPR changes (zoom, moving between monitors).
-    function watchDpr() {
-      const mq = window.matchMedia(`(resolution: ${window.devicePixelRatio}dppx)`);
-      mq.addEventListener('change', () => { syncCanvasSize(); watchDpr(); }, { once: true });
-    }
-    watchDpr();
+      canvas.width  = Math.round(window.innerWidth  * dpr);
+      canvas.height = Math.round(window.innerHeight * dpr);
+    })();
 
     // -------------------------------------------------------------------------
     // Loading overlay — hide once winit starts painting the canvas.
