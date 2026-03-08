@@ -96,8 +96,8 @@ impl WorldGenerator {
         const G: usize = CHUNK_XZ + 1;
         let mut height_grid = [[0i32; G]; G];
 
-        for gx in 0..G {
-            for gz in 0..G {
+        for (gx, row) in height_grid.iter_mut().enumerate() {
+            for (gz, cell) in row.iter_mut().enumerate() {
                 let wx = (cx * CHUNK_XZ as i32 + gx as i32) as f64 * VOXEL_SIZE as f64;
                 let wz = (cz * CHUNK_XZ as i32 + gz as i32) as f64 * VOXEL_SIZE as f64;
 
@@ -111,7 +111,7 @@ impl WorldGenerator {
                 let eroded = combined.signum() * combined.abs().powf(0.75);
 
                 let surf_y = TERRAIN_BASE + (eroded as f32 * TERRAIN_AMP) as i32;
-                height_grid[gx][gz] = surf_y.clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2);
+                *cell = surf_y.clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2);
             }
         }
 
@@ -151,7 +151,7 @@ impl WorldGenerator {
                         let glow_hash = lcg_hash(
                             self.seed ^ (cx as u64) ^ ((cz as u64) << 32) ^ y as u64,
                         );
-                        if glow_hash % 120 == 0
+                        if glow_hash.is_multiple_of(120)
                             && y < (surface_y as usize).saturating_sub(6)
                             && y > 10
                         {
@@ -208,16 +208,16 @@ impl WorldGenerator {
                 );
 
                 // Olive tree: gentle slope, high sky exposure.
-                if slope < 0.25 && sky_vis > 0.55 && col_hash % TREE_DENSITY == 0 {
+                if slope < 0.25 && sky_vis > 0.55 && col_hash.is_multiple_of(TREE_DENSITY) {
                     self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
                     continue;
                 }
 
                 // Shrub: tolerates steeper slopes, lower sky exposure.
-                if slope < 0.55 && sky_vis > 0.30 && col_hash % SHRUB_DENSITY == 1 {
-                    if surface_y as usize + 1 < CHUNK_Y {
-                        chunk.set(x, surface_y as usize + 1, z, SHRUB);
-                    }
+                if slope < 0.55 && sky_vis > 0.30 && col_hash % SHRUB_DENSITY == 1
+                    && surface_y as usize + 1 < CHUNK_Y
+                {
+                    chunk.set(x, surface_y as usize + 1, z, SHRUB);
                 }
             }
         }
