@@ -100,14 +100,12 @@ impl WorldGenerator {
         let vpb = self.voxels_per_block as f32;
         let vpb_d = self.voxels_per_block as f64;
         let terrain_base: i32 = (8.0 * vpb) as i32; // 8 MC blocks above bedrock
-        let terrain_amp: f32 = 10.0 * vpb; // ±10 MC blocks amplitude
+        let terrain_amp: f32 = 3.0 * vpb; // ±3 MC blocks amplitude → gentle rolling hills
 
         // Slope threshold in voxels-of-height per voxel-of-horizontal-distance.
-        // When noise is sampled in MC-block coords (see below), adjacent-voxel
-        // height differences scale as terrain_amp / (feature_width_voxels)
-        // = (10·vpb) / (8.3·vpb) ≈ 1.2, independent of vpb — so a constant
-        // threshold gives consistent grass/rock coverage at any resolution.
-        let grass_slope_max: f32 = 0.8;
+        // With amp=3·vpb and period≈25·vpb voxels, typical slopes are 0.1–0.35.
+        // Set threshold at 0.25 so steeper faces show rock, gentler ones grass.
+        let grass_slope_max: f32 = 0.25;
 
         // ---- Step 1: build per-column heightmap and slope ----------------
         // We sample a (CHUNK_XZ+1)×(CHUNK_XZ+1) grid so we can compute
@@ -124,15 +122,15 @@ impl WorldGenerator {
                 let mx = (cx * CHUNK_XZ as i32 + gx as i32) as f64 / vpb_d;
                 let mz = (cz * CHUNK_XZ as i32 + gz as i32) as f64 / vpb_d;
 
-                // Base FBM in [−1, +1].  Low frequency (0.12) keeps features
-                // broad relative to the viewport — no micro-spikes.
-                let h = self.height_fbm.get([mx * 0.12, mz * 0.12]);
+                // Base FBM in [−1, +1].  Low frequency (0.04 in MC-block coords)
+                // → feature period ≈ 25 MC blocks, giving broad rolling hills.
+                let h = self.height_fbm.get([mx * 0.04, mz * 0.04]);
                 // Detail layer adds gentle surface variation (reduced weight).
-                let d = self.detail_fbm.get([mx * 0.28, mz * 0.28]) * 0.08;
+                let d = self.detail_fbm.get([mx * 0.10, mz * 0.10]) * 0.08;
                 let combined = (h + d).clamp(-1.0, 1.0);
-                // Mild non-linear bias: slightly flatten peaks, deepen valleys
-                // to give a Mediterranean eroded-limestone feel without spikes.
-                let eroded = combined.signum() * combined.abs().powf(0.85);
+                // Flatten peaks (powf > 1 pulls values toward 0 → plateaus and
+                // gentle valleys rather than sharp spikes).
+                let eroded = combined.signum() * combined.abs().powf(1.4);
 
                 let surf_y = terrain_base + (eroded as f32 * terrain_amp) as i32;
                 *cell = surf_y.clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2);
@@ -233,13 +231,13 @@ impl WorldGenerator {
                 );
 
                 // Olive tree: gentle slope only, hash-gated density.
-                if slope < grass_slope_max && col_hash.is_multiple_of(TREE_DENSITY) {
+                if slope < grass_slope_max * 0.6 && col_hash.is_multiple_of(TREE_DENSITY) {
                     self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
                     continue; // don't also add a shrub beneath the trunk
                 }
 
                 // Shrub: tolerates moderate slopes.
-                if slope < grass_slope_max * 2.5
+                if slope < grass_slope_max * 1.5
                     && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
