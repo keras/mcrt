@@ -16,7 +16,7 @@
 use noise::{Fbm, MultiFractal, NoiseFn, Perlin, SuperSimplex};
 
 use super::block::*;
-use super::chunk::{CHUNK_XZ, CHUNK_Y, Chunk, VOXEL_SIZE};
+use super::chunk::{CHUNK_XZ, CHUNK_Y, Chunk};
 
 // ---------------------------------------------------------------------------
 // Terrain constants
@@ -203,11 +203,9 @@ impl WorldGenerator {
             }
         }
 
-        // ---- Step 3: vegetation -----------------------------------------
-        // Vegetation density is expressed in Minecraft blocks, not voxels.
-        // We only consider voxel columns that sit at a MC-block boundary
-        // (local_x % vpb == 0, local_z % vpb == 0).  This keeps tree/shrub
-        // counts constant regardless of voxels_per_block.
+        // ---- Step 3: trunks (this chunk only) ------------------------------
+        // Iterate at MC-block resolution; place only the wood trunk column here.
+        // Canopy is handled in step 4 with cross-chunk awareness.
         let vpb_usize = self.voxels_per_block as usize;
         for x in (0..CHUNK_XZ).step_by(vpb_usize.max(1)) {
             for z in (0..CHUNK_XZ).step_by(vpb_usize.max(1)) {
@@ -216,28 +214,24 @@ impl WorldGenerator {
                     continue;
                 }
 
-                // Slope at this column (voxel-height difference per adjacent cell).
                 let dh_dx = (height_grid[x + 1][z] - height_grid[x][z]) as f32;
                 let dh_dz = (height_grid[x][z + 1] - height_grid[x][z]) as f32;
                 let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
 
-                // Hash on MC-block world coordinates so density is vpb-independent.
                 let mc_bx = (cx * CHUNK_XZ as i32 + x as i32) / self.voxels_per_block as i32;
                 let mc_bz = (cz * CHUNK_XZ as i32 + z as i32) / self.voxels_per_block as i32;
-                let col_hash = lcg_hash(
-                    self.seed
-                        ^ ((mc_bx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
-                        ^ ((mc_bz as u64) << 32),
-                );
+                let col_hash = tree_hash(self.seed, mc_bx, mc_bz);
 
-                // Olive tree: gentle slope only, hash-gated density.
                 if slope < grass_slope_max * 0.6 && col_hash.is_multiple_of(TREE_DENSITY) {
-                    self.place_tree(&mut chunk, x, surface_y as usize + 1, z, col_hash);
-                    continue; // don't also add a shrub beneath the trunk
-                }
-
-                // Shrub: tolerates moderate slopes.
-                if slope < grass_slope_max * 1.5
+                    // Trunk only; canopy is placed in the cross-chunk step below.
+                    let trunk_h =
+                        (2 + (col_hash % 4) as usize) * self.voxels_per_block as usize;
+                    for ty in 0..trunk_h {
+                        let y = surface_y as usize + 1 + ty;
+                        if y >= CHUNK_Y { break; }
+                        chunk.set(x, y, z, WOOD);
+                    }
+                } else if slope < grass_slope_max * 1.5
                     && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
@@ -246,47 +240,110 @@ impl WorldGenerator {
             }
         }
 
-        chunk
-    }
+        // ---- Step 4: cross-chunk-aware canopy pass -------------------------
+        // Trees whose trunks sit near a chunk boundary would have their canopy
+        // clipped if we only wrote leaves within this chunk's local bounds.
+        // Instead, we iterate over every MC-block position whose canopy *could*
+        // overlap this chunk (including positions in adjacent chunks), recompute
+        // the surface height deterministically, and write only the leaf voxels
+        // that fall inside our chunk — giving fully-round canopies everywhere.
+        let vpb_i = self.voxels_per_block as i32;
+        let max_r_vox = 2 * vpb_i; // maximum canopy radius in voxels
+        let chunk_ox = cx * CHUNK_XZ as i32;
+        let chunk_oz = cz * CHUNK_XZ as i32;
 
-    /// Place a small olive-style tree at `(bx, base_y, bz)`.
-    fn place_tree(&self, chunk: &mut Chunk, bx: usize, base_y: usize, bz: usize, hash: u64) {
-        // Trunk height: 2–5 Minecraft blocks, scaled to voxels.
-        let trunk_h = (2 + (hash % 4) as usize) * self.voxels_per_block as usize;
-        for ty in 0..trunk_h {
-            let y = base_y + ty;
-            if y >= CHUNK_Y {
-                return;
-            }
-            if bx < CHUNK_XZ && bz < CHUNK_XZ {
-                chunk.set(bx, y, bz, WOOD);
+        let mc_bx_min = (chunk_ox - max_r_vox).div_euclid(vpb_i);
+        let mc_bx_max = (chunk_ox + CHUNK_XZ as i32 - 1 + max_r_vox).div_euclid(vpb_i);
+        let mc_bz_min = (chunk_oz - max_r_vox).div_euclid(vpb_i);
+        let mc_bz_max = (chunk_oz + CHUNK_XZ as i32 - 1 + max_r_vox).div_euclid(vpb_i);
+
+        for mc_bx in mc_bx_min..=mc_bx_max {
+            for mc_bz in mc_bz_min..=mc_bz_max {
+                let col_hash = tree_hash(self.seed, mc_bx, mc_bz);
+                if !col_hash.is_multiple_of(TREE_DENSITY) {
+                    continue;
+                }
+
+                // World voxel position of this tree's trunk.
+                let wvx = mc_bx * vpb_i;
+                let wvz = mc_bz * vpb_i;
+
+                // Recompute surface height and slope at this position.
+                let surf = self.surface_height_at(wvx, wvz);
+                if surf as usize >= CHUNK_Y - 10 || surf < CAVE_MIN_Y + 4 {
+                    continue;
+                }
+                let surf_px = self.surface_height_at(wvx + vpb_i, wvz);
+                let surf_pz = self.surface_height_at(wvx, wvz + vpb_i);
+                let slope = {
+                    let dx = (surf_px - surf) as f32 / vpb_i as f32;
+                    let dz = (surf_pz - surf) as f32 / vpb_i as f32;
+                    (dx * dx + dz * dz).sqrt()
+                };
+                if slope >= grass_slope_max * 0.6 {
+                    continue;
+                }
+
+                let trunk_h = (2 + (col_hash % 4) as i32) * vpb_i;
+                let canopy_wy = surf + 1 + trunk_h;
+                let radius = (1 + (col_hash >> 3 & 1) as i32) * vpb_i;
+
+                self.place_canopy_clipped(
+                    &mut chunk,
+                    chunk_ox,
+                    chunk_oz,
+                    wvx,
+                    canopy_wy,
+                    wvz,
+                    radius,
+                );
             }
         }
 
-        // Canopy: small irregular sphere of leaves, radius 1–2 voxels.
-        let canopy_y = base_y + trunk_h;
-        // Canopy radius: 1–2 Minecraft blocks, scaled to voxels.
-        let radius: i32 = (1 + (hash >> 3 & 1) as i32) * self.voxels_per_block as i32;
+        chunk
+    }
+
+    /// Compute terrain surface height at an arbitrary world voxel position.
+    /// Must match the heightmap formula in `generate_chunk` exactly.
+    fn surface_height_at(&self, wvx: i32, wvz: i32) -> i32 {
+        let vpb = self.voxels_per_block as f64;
+        let vpb_f = self.voxels_per_block as f32;
+        let mx = wvx as f64 / vpb;
+        let mz = wvz as f64 / vpb;
+        let h = self.height_fbm.get([mx * 0.04, mz * 0.04]);
+        let d = self.detail_fbm.get([mx * 0.10, mz * 0.10]) * 0.08;
+        let combined = (h + d).clamp(-1.0, 1.0) as f32;
+        let eroded = combined.signum() * combined.abs().powf(1.4);
+        let terrain_base = (8.0 * vpb_f) as i32;
+        let terrain_amp = 3.0 * vpb_f;
+        (terrain_base + (eroded * terrain_amp) as i32).clamp(CAVE_MIN_Y + 8, CHUNK_Y as i32 - 2)
+    }
+
+    /// Write the leaves of a canopy centred at world voxel `(wvx, canopy_wy, wvz)`
+    /// into `chunk`, clipping to the chunk's local bounds.  Only AIR voxels are
+    /// overwritten (trunks and terrain are preserved).
+    fn place_canopy_clipped(
+        &self,
+        chunk: &mut Chunk,
+        chunk_ox: i32,
+        chunk_oz: i32,
+        wvx: i32,
+        canopy_wy: i32,
+        wvz: i32,
+        radius: i32,
+    ) {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
                 for dz in -radius..=radius {
-                    // Rough sphere test.
                     if dx * dx + dy * dy + dz * dz > radius * radius + 1 {
                         continue;
                     }
-                    let lx = bx as i32 + dx;
-                    let ly = canopy_y as i32 + dy;
-                    let lz = bz as i32 + dz;
-                    if lx < 0
-                        || lx >= CHUNK_XZ as i32
-                        || ly < 0
-                        || ly >= CHUNK_Y as i32
-                        || lz < 0
-                        || lz >= CHUNK_XZ as i32
-                    {
-                        continue;
-                    }
-                    // Don't overwrite trunk or solid terrain.
+                    let lx = wvx + dx - chunk_ox;
+                    let ly = canopy_wy + dy;
+                    let lz = wvz + dz - chunk_oz;
+                    if lx < 0 || lx >= CHUNK_XZ as i32 { continue; }
+                    if lz < 0 || lz >= CHUNK_XZ as i32 { continue; }
+                    if ly < 0 || ly >= CHUNK_Y as i32 { continue; }
                     if chunk.get(lx as usize, ly as usize, lz as usize) == AIR {
                         chunk.set(lx as usize, ly as usize, lz as usize, LEAVES);
                     }
@@ -304,6 +361,17 @@ impl WorldGenerator {
 #[inline]
 fn lcg_hash(seed: u64) -> u64 {
     seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+}
+
+/// Deterministic hash for the tree/vegetation at MC-block position (mc_bx, mc_bz).
+/// Used by both the trunk pass (step 3) and the cross-chunk canopy pass (step 4)
+/// so that both passes agree on which MC blocks have trees.
+#[inline]
+fn tree_hash(seed: u64, mc_bx: i32, mc_bz: i32) -> u64 {
+    lcg_hash(
+        seed ^ ((mc_bx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
+            ^ ((mc_bz as u64) << 32),
+    )
 }
 
 #[cfg(test)]
