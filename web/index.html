@@ -33,35 +33,6 @@
       text-align: center;
       pointer-events: none;
     }
-    #scene-picker {
-      position: fixed;
-      top: 12px;
-      right: 12px;
-      z-index: 10;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      background: rgba(0, 0, 0, 0.55);
-      padding: 6px 10px;
-      border-radius: 6px;
-      backdrop-filter: blur(4px);
-    }
-    #scene-picker label {
-      color: #bbb;
-      font: 13px/1 monospace;
-      user-select: none;
-    }
-    #scene-picker select {
-      background: #1e1e1e;
-      color: #eee;
-      border: 1px solid #555;
-      border-radius: 4px;
-      padding: 3px 6px;
-      font: 13px/1 monospace;
-      cursor: pointer;
-      outline: none;
-    }
-    #scene-picker select:hover { border-color: #888; }
   </style>
 </head>
 <body>
@@ -69,31 +40,7 @@
   <canvas id="canvas"></canvas>
   <div id="loading">Loading WebGPU path tracer…</div>
 
-  <!-- Scene selection overlay (top-right corner) -->
-  <div id="scene-picker">
-    <label for="scene-select">Scene</label>
-    <select id="scene-select">
-      <option value="cornell-box">Cornell Box</option>
-      <option value="scene">Demo Scene</option>
-      <option value="skybox">Skybox</option>
-    </select>
-  </div>
-
   <script>
-    // -------------------------------------------------------------------------
-    // Scene picker — read current scene from ?scene= and reload on change.
-    // -------------------------------------------------------------------------
-    const sceneSelect = document.getElementById('scene-select');
-    const urlParams = new URLSearchParams(window.location.search);
-    const currentScene = urlParams.get('scene') || 'cornell-box';
-    sceneSelect.value = currentScene;
-
-    sceneSelect.addEventListener('change', () => {
-      const url = new URL(window.location.href);
-      url.searchParams.set('scene', sceneSelect.value);
-      window.location.href = url.toString();
-    });
-
     // -------------------------------------------------------------------------
     // Dynamic canvas sizing — keep the drawing buffer in sync with the viewport.
     //
