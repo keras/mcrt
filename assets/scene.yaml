@@ -1,0 +1,186 @@
+# assets/scene.yaml - declarative description of the large demo scene.
+#
+# Format (Phase 12+):
+#   camera:    optional; overrides built-in orbit-camera defaults.
+#   materials: named palette as a mapping; keys are names, values are
+#              definitions.  Indices are assigned in declaration order.
+#              Duplicate keys are a YAML parse error (uniqueness is enforced
+#              by the format itself).
+#   objects:   list of scene primitives; each entry has a type field.
+#              type: sphere  - analytic sphere
+#              type: mesh    - OBJ file (with optional scale / translate)
+#
+# The material field on an object may be:
+#   - a plain string naming a material from the palette above, or
+#   - an inline mapping with type, albedo, fuzz, ior, ... fields.
+
+# ---------------------------------------------------------------------------
+# Camera
+# ---------------------------------------------------------------------------
+camera:
+  look_from: [4.0, 3.0, 8.0]
+  look_at:   [0.0, 0.5, 0.0]
+  vfov:      40.0
+  aperture:  0.5
+
+
+materials:
+  ground:
+    type: lambertian
+    albedo: [0.5, 0.5, 0.5]
+    texture_layer: 1
+
+  green:
+    type: lambertian
+    albedo: [0.1, 0.7, 0.1]
+
+  red:
+    type: lambertian
+    albedo: [0.7, 0.1, 0.1]
+
+  gold:
+    type: metal
+    albedo: [0.8, 0.6, 0.2]
+    fuzz: 0.1
+
+  glass:
+    type: dielectric
+    ior: 1.5
+
+  bunny:
+    type: lambertian
+    albedo: [0.1, 0.1, 0.65]
+
+  # Phase 13: warm area-light sphere.
+  # albedo = emission colour, emission_strength = intensity multiplier.
+  light:
+    type: emissive
+    albedo: [1.0, 0.85, 0.7]
+    emission_strength: 1e3
+
+# ---------------------------------------------------------------------------
+# Objects
+# ---------------------------------------------------------------------------
+
+objects:
+
+  # Ground plane
+  - type: sphere
+    center: [0.0, -100.5, 0.0]
+    radius: 100.0
+    material: ground
+
+  # Phase 13 emissive area-light sphere
+  # (above and slightly to the left of the large glass sphere)
+  - type: sphere
+    center: [-2.0, 5.0, -1.0]
+    radius: 0.5
+    material: light
+
+  # Three large accent spheres
+  - type: sphere
+    center: [0.0, 2.5, 0.0]
+    radius: 1.0
+    material: glass
+
+  - type: sphere
+    center: [-4.0, 1.0, 0.0]
+    radius: 1.0
+    material: gold
+
+  - type: sphere
+    center: [4.0, 1.0, 0.0]
+    radius: 1.0
+    material: red
+
+  # 8x8 grid  (row * 3 + col) % 4 -> green/red/gold/glass
+
+  # row 0  z=-3.5
+  - { type: sphere, center: [-3.5, 0.0, -3.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-2.5, 0.0, -3.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-1.5, 0.0, -3.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-0.5, 0.0, -3.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [0.5,  0.0, -3.5], radius: 0.3, material: green }
+  - { type: sphere, center: [1.5,  0.0, -3.5], radius: 0.3, material: red }
+  - { type: sphere, center: [2.5,  0.0, -3.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [3.5,  0.0, -3.5], radius: 0.3, material: glass }
+
+  # row 1  z=-2.5
+  - { type: sphere, center: [-3.5, 0.0, -2.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-2.5, 0.0, -2.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-1.5, 0.0, -2.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-0.5, 0.0, -2.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [0.5,  0.0, -2.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [1.5,  0.0, -2.5], radius: 0.3, material: green }
+  - { type: sphere, center: [2.5,  0.0, -2.5], radius: 0.3, material: red }
+  - { type: sphere, center: [3.5,  0.0, -2.5], radius: 0.3, material: gold }
+
+  # row 2  z=-1.5
+  - { type: sphere, center: [-3.5, 0.0, -1.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-2.5, 0.0, -1.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-1.5, 0.0, -1.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-0.5, 0.0, -1.5], radius: 0.3, material: red }
+  - { type: sphere, center: [0.5,  0.0, -1.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [1.5,  0.0, -1.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [2.5,  0.0, -1.5], radius: 0.3, material: green }
+  - { type: sphere, center: [3.5,  0.0, -1.5], radius: 0.3, material: red }
+
+  # row 3  z=-0.5
+  - { type: sphere, center: [-3.5, 0.0, -0.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-2.5, 0.0, -0.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-1.5, 0.0, -0.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-0.5, 0.0, -0.5], radius: 0.3, material: green }
+  - { type: sphere, center: [0.5,  0.0, -0.5], radius: 0.3, material: red }
+  - { type: sphere, center: [1.5,  0.0, -0.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [2.5,  0.0, -0.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [3.5,  0.0, -0.5], radius: 0.3, material: green }
+
+  # row 4  z=0.5
+  - { type: sphere, center: [-3.5, 0.0, 0.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-2.5, 0.0, 0.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-1.5, 0.0, 0.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-0.5, 0.0, 0.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [0.5,  0.0, 0.5],  radius: 0.3, material: green }
+  - { type: sphere, center: [1.5,  0.0, 0.5],  radius: 0.3, material: red }
+  - { type: sphere, center: [2.5,  0.0, 0.5],  radius: 0.3, material: gold }
+  - { type: sphere, center: [3.5,  0.0, 0.5],  radius: 0.3, material: glass }
+
+  # row 5  z=1.5
+  - { type: sphere, center: [-3.5, 0.0, 1.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-2.5, 0.0, 1.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-1.5, 0.0, 1.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-0.5, 0.0, 1.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [0.5,  0.0, 1.5],  radius: 0.3, material: glass }
+  - { type: sphere, center: [1.5,  0.0, 1.5],  radius: 0.3, material: green }
+  - { type: sphere, center: [2.5,  0.0, 1.5],  radius: 0.3, material: red }
+  - { type: sphere, center: [3.5,  0.0, 1.5],  radius: 0.3, material: gold }
+
+  # row 6  z=2.5
+  - { type: sphere, center: [-3.5, 0.0, 2.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-2.5, 0.0, 2.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-1.5, 0.0, 2.5], radius: 0.3, material: green }
+  - { type: sphere, center: [-0.5, 0.0, 2.5], radius: 0.3, material: red }
+  - { type: sphere, center: [0.5,  0.0, 2.5],  radius: 0.3, material: gold }
+  - { type: sphere, center: [1.5,  0.0, 2.5],  radius: 0.3, material: glass }
+  - { type: sphere, center: [2.5,  0.0, 2.5],  radius: 0.3, material: green }
+  - { type: sphere, center: [3.5,  0.0, 2.5],  radius: 0.3, material: red }
+
+  # row 7  z=3.5
+  - { type: sphere, center: [-3.5, 0.0, 3.5], radius: 0.3, material: red }
+  - { type: sphere, center: [-2.5, 0.0, 3.5], radius: 0.3, material: gold }
+  - { type: sphere, center: [-1.5, 0.0, 3.5], radius: 0.3, material: glass }
+  - { type: sphere, center: [-0.5, 0.0, 3.5], radius: 0.3, material: green }
+  - { type: sphere, center: [0.5,  0.0, 3.5],  radius: 0.3, material: red }
+  - { type: sphere, center: [1.5,  0.0, 3.5],  radius: 0.3, material: gold }
+  - { type: sphere, center: [2.5,  0.0, 3.5],  radius: 0.3, material: glass }
+  - { type: sphere, center: [3.5,  0.0, 3.5],  radius: 0.3, material: green }
+
+  # Stanford Bunny (models/bunny.obj).
+  # Original model is ~0.15 units tall; scale=8 gives ~1.2 units.
+  # translate y by -(ymin * scale) = -(0.033 * 8) = -0.264 to sit on the ground.
+  - type: mesh
+    path: models/bunny.obj
+    material: bunny
+    transform:
+      scale: 8.0
+      translate: [0.5, -0.264, 0.0]

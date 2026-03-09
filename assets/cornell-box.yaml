@@ -1,0 +1,151 @@
+# Traditional Cornell Box scene.
+
+# ---------------------------------------------------------------------------
+# Camera — positioned outside the open front face, looking into the box
+# ---------------------------------------------------------------------------
+camera:
+  look_from: [0.0, 4.75,  8.0]
+  look_at:   [0.0, 4, 0]
+  vfov:      60.0
+  aperture:  0
+
+# ---------------------------------------------------------------------------
+# Material palette
+# ---------------------------------------------------------------------------
+materials:
+  # --- walls ----------------------------------------------------------------
+  white:
+    type: lambertian
+    albedo: [0.73, 0.73, 0.73]
+
+  red:
+    type: lambertian
+    albedo: [0.65, 0.05, 0.05]
+
+  green:
+    type: lambertian
+    albedo: [0.12, 0.45, 0.15]
+
+  # --- area light -----------------------------------------------------------
+  # Warm white emission.  emission_strength drives apparent brightness.
+  ceiling_light:
+    type: emissive
+    albedo: [1.0, 0.95, 0.85]
+    emission_strength: 80.0
+
+  # --- scene objects --------------------------------------------------------
+  glass:
+    type: dielectric
+    ior: 1.5
+
+  metal:
+    type: metal
+    albedo: [0.6, 0.6, 0.8]
+    fuzz: 0.5
+
+# ---------------------------------------------------------------------------
+# Objects
+# ---------------------------------------------------------------------------
+objects:
+  # Floor  (y = 0, normal points up)
+  - type: plane
+    normal: [0.0, 1.0, 0.0]
+    half_extents: [5, 5]
+    material: white
+    backface_culling: true
+    transform:
+      translate: [0.0, 0.0, 0]
+
+  # Ceiling  (y = 10, normal points down into the box)
+  - type: plane
+    normal: [0.0, -1.0, 0.0]
+    half_extents: [5, 5]
+    material: white
+    backface_culling: true
+    transform:
+      translate: [0.0, 10, 0]
+
+  # Back wall  (z = -5, normal points toward camera)
+  - type: plane
+    normal: [0.0, 0.0, 1.0]
+    half_extents: [5, 5]
+    material: white
+    backface_culling: true
+    transform:
+      translate: [0.0, 5, -5]
+
+  # Front wall
+  - type: plane
+    normal: [0.0, 0.0, -1.0]
+    half_extents: [5, 5]
+    material: white
+    backface_culling: true
+    transform:
+      translate: [0.0, 5, 5]
+
+  # Left wall — red  (x = -5, normal points into the box)
+  - type: plane
+    normal: [1.0, 0.0, 0.0]
+    half_extents: [5, 5]
+    material: red
+    backface_culling: true
+    transform:
+      translate: [-5, 5, 0]
+
+  # Right wall — green  (x = +5, normal points into the box)
+  - type: plane
+    normal: [-1.0, 0.0, 0.0]
+    half_extents: [5, 5]
+    material: green
+    backface_culling: true
+    transform:
+      translate: [5, 5, 0]
+
+  # ---- area light ----------------------------------------------------------
+  # Emissive plane flush with the ceiling, centred over the box.
+  - type: plane
+    normal: [0.0, -1.0, 0.0]
+    half_extents: [0.6, 0.6]
+    material: ceiling_light
+    transform:
+      translate: [0.0, 9.9, -2.75]
+      rotate: [0, 0, 90]
+
+  - type: plane
+    normal: [0.0, -1.0, 0.0]
+    half_extents: [0.7, 0.7]
+    material: white
+    transform:
+      translate: [0.1, 9.9, -2.75]
+      rotate: [0, 0, 90]
+
+  # ---- interior objects ----------------------------------------------------
+
+  # White diffuse box.
+  ## left
+  - type: box
+    half_extents: [1.2, 2, 1.2]
+    material: white
+    transform:
+      translate: [-2.2, 2, -3.2]
+      rotate: [0, 30, 0]  # rotate 30 degrees around y axis
+
+  ## right
+  - type: box
+    half_extents: [1, 1.4, 1]
+    material: white
+    transform:
+      translate: [2.2, 1.4, -0.5]
+      rotate: [0, -15, 0]  # rotate -15 degrees around y axis
+
+  # Glass sphere.
+  - type: sphere
+    center: [-1, 5.0, -2.3]
+    radius: 1.0
+    material: glass
+
+  # Metal sphere
+  - type: sphere
+    center: [2.5, 1.5, -3]
+    radius: 1.5
+    material: metal

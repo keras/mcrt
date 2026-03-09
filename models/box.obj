@@ -1,0 +1,41 @@
+# models/box.obj
+# Unit axis-aligned cube occupying [0,0,0] → [1,1,1].
+# Normals are computed geometrically by the OBJ loader from winding order.
+# Use `scale` and `translate` in the scene YAML to position and size it.
+#
+# Vertex legend (1-indexed):
+#   1: (0,0,0)  2: (1,0,0)  3: (1,1,0)  4: (0,1,0)
+#   5: (0,0,1)  6: (1,0,1)  7: (1,1,1)  8: (0,1,1)
+
+v 0.0 0.0 0.0
+v 1.0 0.0 0.0
+v 1.0 1.0 0.0
+v 0.0 1.0 0.0
+v 0.0 0.0 1.0
+v 1.0 0.0 1.0
+v 1.0 1.0 1.0
+v 0.0 1.0 1.0
+
+# -Z face  (outward normal  [0, 0,-1])
+f 1 4 3
+f 1 3 2
+
+# +Z face  (outward normal  [0, 0,+1])
+f 5 6 7
+f 5 7 8
+
+# -X face  (outward normal [-1, 0, 0])
+f 1 5 8
+f 1 8 4
+
+# +X face  (outward normal [+1, 0, 0])
+f 2 3 7
+f 2 7 6
+
+# -Y face  (outward normal  [0,-1, 0])
+f 1 2 6
+f 1 6 5
+
+# +Y face  (outward normal  [0,+1, 0])
+f 4 8 7
+f 4 7 3
