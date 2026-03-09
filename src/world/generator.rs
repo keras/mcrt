@@ -230,11 +230,22 @@ impl WorldGenerator {
                 let dh_dz = (height_grid[x][z + 1] - height_grid[x][z]) as f32;
                 let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
 
+                // Use the same MC-block-stride slope as step 4 so the two
+                // passes agree on which positions are flat enough for trees.
+                // (Step 2's 1-voxel slope above is kept only for grass/rock.)
+                let slope_mc = {
+                    let dx = (height_grid[x + vpb_usize][z] - height_grid[x][z]) as f32
+                        / vpb_usize as f32;
+                    let dz = (height_grid[x][z + vpb_usize] - height_grid[x][z]) as f32
+                        / vpb_usize as f32;
+                    (dx * dx + dz * dz).sqrt()
+                };
+
                 let mc_bx = (cx * CHUNK_XZ as i32 + x as i32) / self.voxels_per_block as i32;
                 let mc_bz = (cz * CHUNK_XZ as i32 + z as i32) / self.voxels_per_block as i32;
                 let col_hash = tree_hash(self.seed, mc_bx, mc_bz);
 
-                if slope < grass_slope_max * 0.6 && col_hash.is_multiple_of(TREE_DENSITY) {
+                if slope_mc < grass_slope_max * 0.6 && col_hash.is_multiple_of(TREE_DENSITY) {
                     // Trunk only; canopy is placed in the cross-chunk step below.
                     let trunk_h = (2 + (col_hash % 4) as usize) * self.voxels_per_block as usize;
                     for ty in 0..trunk_h {
@@ -244,7 +255,7 @@ impl WorldGenerator {
                         }
                         chunk.set(x, y, z, WOOD);
                     }
-                } else if slope < grass_slope_max * 1.5
+                } else if slope_mc < grass_slope_max * 1.5
                     && col_hash % SHRUB_DENSITY == 1
                     && surface_y as usize + 1 < CHUNK_Y
                 {
