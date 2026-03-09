@@ -90,8 +90,8 @@ impl WorldGenerator {
         // with finer octaves adding surface detail.  At vpb=8 this gives
         // variation every ~8 voxels, well below the tree radius.
         let leaf_fbm = Fbm::<Perlin>::new(s32.wrapping_add(0x2d35_9631))
-            .set_octaves(3)
-            .set_frequency(1.0)
+            .set_octaves(4)
+            .set_frequency(0.5)
             .set_lacunarity(2.0)
             .set_persistence(0.5);
 
@@ -184,9 +184,8 @@ impl WorldGenerator {
                     let cave_n = self.cave_fbm.get([mc_x * 0.5, mc_y * 0.7, mc_z * 0.5]);
                     if cave_n > CAVE_THRESHOLD && y > CAVE_MIN_Y as usize {
                         // Check for cave glow: small clusters at mid-cave height.
-                        let glow_hash = lcg_hash(
-                            self.seed ^ (cx as u64) ^ ((cz as u64) << 32) ^ y as u64,
-                        );
+                        let glow_hash =
+                            lcg_hash(self.seed ^ (cx as u64) ^ ((cz as u64) << 32) ^ y as u64);
                         if glow_hash.is_multiple_of(120)
                             && y < (surface_y as usize).saturating_sub(6)
                             && y > 10
@@ -237,11 +236,12 @@ impl WorldGenerator {
 
                 if slope < grass_slope_max * 0.6 && col_hash.is_multiple_of(TREE_DENSITY) {
                     // Trunk only; canopy is placed in the cross-chunk step below.
-                    let trunk_h =
-                        (2 + (col_hash % 4) as usize) * self.voxels_per_block as usize;
+                    let trunk_h = (2 + (col_hash % 4) as usize) * self.voxels_per_block as usize;
                     for ty in 0..trunk_h {
                         let y = surface_y as usize + 1 + ty;
-                        if y >= CHUNK_Y { break; }
+                        if y >= CHUNK_Y {
+                            break;
+                        }
                         chunk.set(x, y, z, WOOD);
                     }
                 } else if slope < grass_slope_max * 1.5
@@ -302,13 +302,7 @@ impl WorldGenerator {
                 let radius = (1 + (col_hash >> 3 & 1) as i32) * vpb_i;
 
                 self.place_canopy_clipped(
-                    &mut chunk,
-                    chunk_ox,
-                    chunk_oz,
-                    wvx,
-                    canopy_wy,
-                    wvz,
-                    radius,
+                    &mut chunk, chunk_ox, chunk_oz, wvx, canopy_wy, wvz, radius,
                 );
             }
         }
@@ -327,8 +321,7 @@ impl WorldGenerator {
         // a propagation medium.
         {
             let vol = CHUNK_XZ * CHUNK_XZ * CHUNK_Y;
-            let idx =
-                |x: usize, y: usize, z: usize| x * CHUNK_XZ * CHUNK_Y + z * CHUNK_Y + y;
+            let idx = |x: usize, y: usize, z: usize| x * CHUNK_XZ * CHUNK_Y + z * CHUNK_Y + y;
             let mut visited = vec![false; vol];
             let mut queue: std::collections::VecDeque<(usize, usize, usize)> =
                 std::collections::VecDeque::new();
@@ -337,8 +330,7 @@ impl WorldGenerator {
                 for x in 0..CHUNK_XZ {
                     for z in 0..CHUNK_XZ {
                         let b = chunk.get(x, y, z);
-                        let on_border =
-                            x == 0 || x == CHUNK_XZ - 1 || z == 0 || z == CHUNK_XZ - 1;
+                        let on_border = x == 0 || x == CHUNK_XZ - 1 || z == 0 || z == CHUNK_XZ - 1;
                         let is_seed = b == WOOD || (on_border && b == LEAVES);
                         if is_seed && !visited[idx(x, y, z)] {
                             visited[idx(x, y, z)] = true;
@@ -348,8 +340,14 @@ impl WorldGenerator {
                 }
             }
 
-            const DIRS: [(i32, i32, i32); 6] =
-                [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)];
+            const DIRS: [(i32, i32, i32); 6] = [
+                (-1, 0, 0),
+                (1, 0, 0),
+                (0, -1, 0),
+                (0, 1, 0),
+                (0, 0, -1),
+                (0, 0, 1),
+            ];
             while let Some((x, y, z)) = queue.pop_front() {
                 for (dx, dy, dz) in DIRS {
                     let nx = x as i32 + dx;
@@ -428,7 +426,7 @@ impl WorldGenerator {
         let r_max = (r * 1.40) as i32 + 1;
         // Precompute thresholds to skip the FBM call for the solid inner core
         // and the empty outer region.
-        let r_inner_sq = (r * 0.60) * (r * 0.60);
+        let r_inner_sq = (r * 0.10) * (r * 0.10);
         let r_outer_sq = (r * 1.40 + 1.0) * (r * 1.40 + 1.0);
 
         for dy in -r_max..=r_max {
@@ -436,7 +434,9 @@ impl WorldGenerator {
                 for dz in -r_max..=r_max {
                     let dist_sq = (dx * dx + dy * dy + dz * dz) as f32;
                     // Definitely outside — skip without noise lookup.
-                    if dist_sq > r_outer_sq { continue; }
+                    if dist_sq > r_outer_sq {
+                        continue;
+                    }
 
                     let place = if dist_sq <= r_inner_sq {
                         // Definitely inside — no noise needed.
@@ -447,17 +447,25 @@ impl WorldGenerator {
                         let ny = (canopy_wy + dy) as f64 / vpb;
                         let nz = (wvz + dz) as f64 / vpb;
                         let n = self.leaf_fbm.get([nx, ny, nz]) as f32;
-                        let r_eff = r * (1.0 + n * 0.40);
+                        let r_eff = r * (1.0 + n * 1.40);
                         dist_sq <= r_eff * r_eff
                     };
-                    if !place { continue; }
+                    if !place {
+                        continue;
+                    }
 
                     let lx = wvx + dx - chunk_ox;
                     let ly = canopy_wy + dy;
                     let lz = wvz + dz - chunk_oz;
-                    if lx < 0 || lx >= CHUNK_XZ as i32 { continue; }
-                    if lz < 0 || lz >= CHUNK_XZ as i32 { continue; }
-                    if ly < 0 || ly >= CHUNK_Y as i32 { continue; }
+                    if lx < 0 || lx >= CHUNK_XZ as i32 {
+                        continue;
+                    }
+                    if lz < 0 || lz >= CHUNK_XZ as i32 {
+                        continue;
+                    }
+                    if ly < 0 || ly >= CHUNK_Y as i32 {
+                        continue;
+                    }
                     if chunk.get(lx as usize, ly as usize, lz as usize) == AIR {
                         chunk.set(lx as usize, ly as usize, lz as usize, LEAVES);
                     }
@@ -474,7 +482,8 @@ impl WorldGenerator {
 /// Fast, deterministic LCG hash.  Returns a pseudo-random u64 from a seed.
 #[inline]
 fn lcg_hash(seed: u64) -> u64 {
-    seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+    seed.wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
 }
 
 /// Deterministic hash for the tree/vegetation at MC-block position (mc_bx, mc_bz).
@@ -482,10 +491,7 @@ fn lcg_hash(seed: u64) -> u64 {
 /// so that both passes agree on which MC blocks have trees.
 #[inline]
 fn tree_hash(seed: u64, mc_bx: i32, mc_bz: i32) -> u64 {
-    lcg_hash(
-        seed ^ ((mc_bx as u64).wrapping_mul(0x517c_c1b7_2722_0a95))
-            ^ ((mc_bz as u64) << 32),
-    )
+    lcg_hash(seed ^ ((mc_bx as u64).wrapping_mul(0x517c_c1b7_2722_0a95)) ^ ((mc_bz as u64) << 32))
 }
 
 #[cfg(test)]
@@ -553,7 +559,10 @@ mod tests {
     fn different_seeds_differ() {
         let c1 = WorldGenerator::new(1, 8).generate_chunk(0, 0);
         let c2 = WorldGenerator::new(2, 8).generate_chunk(0, 0);
-        assert_ne!(c1.blocks, c2.blocks, "different seeds produced identical chunks");
+        assert_ne!(
+            c1.blocks, c2.blocks,
+            "different seeds produced identical chunks"
+        );
     }
 
     #[test]
@@ -561,6 +570,9 @@ mod tests {
         let wgen = make_gen(777);
         let c1 = wgen.generate_chunk(3, -5);
         let c2 = wgen.generate_chunk(3, -5);
-        assert_eq!(c1.blocks, c2.blocks, "same chunk generated differently on second call");
+        assert_eq!(
+            c1.blocks, c2.blocks,
+            "same chunk generated differently on second call"
+        );
     }
 }
