@@ -226,10 +226,6 @@ impl WorldGenerator {
                     continue;
                 }
 
-                let dh_dx = (height_grid[x + 1][z] - height_grid[x][z]) as f32;
-                let dh_dz = (height_grid[x][z + 1] - height_grid[x][z]) as f32;
-                let slope = (dh_dx * dh_dx + dh_dz * dh_dz).sqrt();
-
                 // Use the same MC-block-stride slope as step 4 so the two
                 // passes agree on which positions are flat enough for trees.
                 // (Step 2's 1-voxel slope above is kept only for grass/rock.)
@@ -420,6 +416,7 @@ impl WorldGenerator {
     /// of the sphere is always solid; only the outer shell is noise-dependent,
     /// so the canopy stays well-connected.  Isolated floating voxels are removed
     /// by the BFS connectivity pass that runs after all vegetation is placed.
+    #[allow(clippy::too_many_arguments)]
     fn place_canopy_clipped(
         &self,
         chunk: &mut Chunk,
